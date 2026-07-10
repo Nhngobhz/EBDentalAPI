@@ -1,0 +1,38 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: store_user
+      POSTGRES_PASSWORD: store_password
+      POSTGRES_DB: store_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U store_user -d store_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Overrides .env so the API always reaches Postgres via the Docker
+      # network hostname `db`, regardless of what's in your .env for local
+      # (non-Docker) use.
+      DATABASE_URL: postgresql+psycopg2://store_user:store_password@db:5432/store_db
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./static:/app/static
+
+volumes:
+  pgdata:

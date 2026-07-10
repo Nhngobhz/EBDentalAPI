@@ -1,0 +1,16 @@
+# Pinned to the exact versions this project was built and tested against.
+# Feel free to loosen these later, but this combination is known-good.
+fastapi==0.139.0
+uvicorn[standard]==0.51.0
+sqlalchemy==2.0.51
+psycopg2-binary==2.9.12
+pydantic==2.13.4
+pydantic-settings==2.14.2
+email-validator==2.3.0
+pyjwt==2.13.0
+bcrypt==5.0.0
+python-multipart==0.0.32
+fastapi-mail==1.6.5
+httpx==0.28.1
+alembic==1.18.5
+python-dotenv==1.2.2
