@@ -25,7 +25,7 @@ logger = get_logger("telegram")
 _TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 
-async def send_telegram_message(text: str) -> None:
+async def send_telegram_message(text: str, topic_id: str | None = None) -> None:
     if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
         logger.debug("Telegram not configured - skipping notification.")
         return
@@ -39,6 +39,8 @@ async def send_telegram_message(text: str) -> None:
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
+    if topic_id:
+        payload["message_thread_id"] = int(topic_id)
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.post(url, json=payload)
@@ -57,7 +59,7 @@ async def notify_admin_login(
         f"Role: {role_title}\n"
         f"Admin-level (user_management): {'Yes' if is_admin_level else 'No'}"
     )
-    await send_telegram_message(text)
+    await send_telegram_message(text, topic_id=settings.TELEGRAM_LOGIN_TOPIC_ID)
 
 
 async def notify_error(error_type: str, message: str, path: str | None = None) -> None:
@@ -66,4 +68,4 @@ async def notify_error(error_type: str, message: str, path: str | None = None) -
         f"Type: {error_type}\n"
         f"Message: {message}\n" + (f"Path: {path}" if path else "")
     )
-    await send_telegram_message(text)
+    await send_telegram_message(text, topic_id=settings.TELEGRAM_ERROR_TOPIC_ID)

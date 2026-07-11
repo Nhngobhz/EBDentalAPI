@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     # Leave empty to disable Telegram notifications entirely.
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
+    # Optional: message_thread_id of a forum topic inside TELEGRAM_CHAT_ID.
+    # Leave empty to post to the group's General topic.
+    TELEGRAM_ERROR_TOPIC_ID: str = ""
+    TELEGRAM_LOGIN_TOPIC_ID: str = ""
 
     # --- File uploads ------------------------------------------------------
     UPLOAD_DIR: str = "static/uploads"
