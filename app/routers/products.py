@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.core.deps import get_price_visibility, get_verified_user, require_permission
 from app.core.files import save_image
 from app.database import get_db
-from app.models import Brand, Product, User
+from app.models import Brand, Category, Product, User
 from app.schemas import ProductCreate, ProductOut, ProductPriceUpdate, ProductUpdate
 
 router = APIRouter(prefix="/products", tags=["Products"])
@@ -18,7 +18,7 @@ _MASKED_PRICE = "XXXX"
 def _get_product_or_404(db: Session, product_id: int) -> Product:
     product = (
         db.query(Product)
-        .options(joinedload(Product.brand))
+        .options(joinedload(Product.brand), joinedload(Product.category))
         .filter(Product.id == product_id)
         .first()
     )
@@ -44,7 +44,8 @@ def list_products(
     skip: int = 0,
     limit: int = 50,
     brand_id: int | None = None,
-    category: str | None = None,
+    category_id: int | None = None,
+    product_type: str | None = None,
     q: str | None = None,
     can_view_price: bool = Depends(get_price_visibility),
     db: Session = Depends(get_db),
@@ -52,11 +53,13 @@ def list_products(
     """Public: product catalog browsing needs no account. Price/old_price
     are masked unless the caller is staff or a customer with
     access_permission=True."""
-    query = db.query(Product).options(joinedload(Product.brand))
+    query = db.query(Product).options(joinedload(Product.brand), joinedload(Product.category))
     if brand_id is not None:
         query = query.filter(Product.brand_id == brand_id)
-    if category:
-        query = query.filter(Product.category == category)
+    if category_id is not None:
+        query = query.filter(Product.category_id == category_id)
+    if product_type:
+        query = query.filter(Product.product_type == product_type)
     if q:
         query = query.filter(Product.product_name.ilike(f"%{q}%"))
     products = query.order_by(Product.id).offset(skip).limit(limit).all()
@@ -79,6 +82,8 @@ def create_product(
 ):
     if not db.query(Brand).filter(Brand.id == payload.brand_id).first():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="brand_id does not exist")
+    if payload.category_id is not None and not db.query(Category).filter(Category.id == payload.category_id).first():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="category_id does not exist")
 
     product = Product(**payload.model_dump())
     db.add(product)
@@ -118,6 +123,11 @@ def update_product(
 
     if "brand_id" in data and not db.query(Brand).filter(Brand.id == data["brand_id"]).first():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="brand_id does not exist")
+    if (
+        data.get("category_id") is not None
+        and not db.query(Category).filter(Category.id == data["category_id"]).first()
+    ):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="category_id does not exist")
 
     for field, value in data.items():
         setattr(product, field, value)

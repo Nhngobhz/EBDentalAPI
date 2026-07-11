@@ -9,7 +9,17 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.core.logging_conf import get_logger, setup_logging
 from app.database import Base, engine
-from app.routers import auth, brands, customer_auth, customers, manuals, products, promotions, users
+from app.routers import (
+    auth,
+    brands,
+    categories,
+    customer_auth,
+    customers,
+    manuals,
+    products,
+    promotions,
+    users,
+)
 
 setup_logging()
 logger = get_logger("main")
@@ -57,6 +67,7 @@ app.include_router(customer_auth.router)
 app.include_router(users.router)
 app.include_router(customers.router)
 app.include_router(brands.router)
+app.include_router(categories.router)
 app.include_router(products.router)
 app.include_router(manuals.router)
 app.include_router(promotions.router)

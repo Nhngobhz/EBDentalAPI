@@ -197,27 +197,64 @@ class BrandMini(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Category
+# ---------------------------------------------------------------------------
+class CategoryBase(BaseModel):
+    category_name: str = Field(..., min_length=1, max_length=150)
+
+
+class CategoryUpdate(BaseModel):
+    category_name: Optional[str] = Field(None, min_length=1, max_length=150)
+
+
+class CategoryOut(CategoryBase):
+    id: int
+    category_image: Optional[str] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CategoryMini(BaseModel):
+    """Small nested representation used inside ProductOut."""
+
+    id: int
+    category_name: str
+    category_image: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ---------------------------------------------------------------------------
 # Product
 # ---------------------------------------------------------------------------
+# ProductType values are validated here rather than with a DB-level enum,
+# so adding a new one later (e.g. "bundle") is a one-line change, not a
+# migration - see Product.product_type in app/models.py.
+ProductType = Literal["single", "combo"]
+
+
 class ProductBase(BaseModel):
     product_name: str = Field(..., min_length=1, max_length=200)
     description: Optional[str] = None
-    category: Optional[str] = Field(None, max_length=100)
     badge: Optional[str] = Field(None, max_length=50)
+    product_type: ProductType = "single"
 
 
 class ProductCreate(ProductBase):
     price: Decimal = Field(..., gt=0)
     old_price: Optional[Decimal] = Field(None, gt=0)
     brand_id: int
+    category_id: Optional[int] = None
 
 
 class ProductUpdate(BaseModel):
     product_name: Optional[str] = Field(None, min_length=1, max_length=200)
     description: Optional[str] = None
-    category: Optional[str] = Field(None, max_length=100)
     badge: Optional[str] = Field(None, max_length=50)
+    product_type: Optional[ProductType] = None
     brand_id: Optional[int] = None
+    category_id: Optional[int] = None
     # Present here so a product_management holder *can* still create a
     # product with a price, but changing price/old_price on an *existing*
     # product additionally requires the price_listing permission - enforced
@@ -240,6 +277,7 @@ class ProductOut(ProductBase):
     old_price: Optional[Union[Decimal, str]] = None
     product_image: Optional[str] = None
     brand: Optional[BrandMini] = None
+    category: Optional[CategoryMini] = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

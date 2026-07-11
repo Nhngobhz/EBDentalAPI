@@ -1,7 +1,7 @@
 # Store Management API
 
 A FastAPI + PostgreSQL backend for managing staff accounts, customers, and a
-product catalog (brands, products, manuals, promotions), with:
+product catalog (brands, categories, products, manuals, promotions), with:
 
 - Password hashing (bcrypt)
 - JWT authentication
@@ -28,7 +28,12 @@ CRUD → file upload → error handling), not just written from memory - see
    typos and mismatches (rename a brand and every product silently
    disagrees with the Brand table). The API still *returns* `brand_name`
    /`product_name` in responses (nested), you just create/update products
-   and manuals by passing `brand_id` / `product_id`.
+   and manuals by passing `brand_id` / `product_id`. The same reasoning
+   was later applied to `Product.category` (free text) → `category_id`:
+   categories are now a real `Category` table (`category_name`, optional
+   `category_image`), created/managed the same way as brands via
+   `/categories`. Unlike `brand_id`, `category_id` is optional (`null`
+   allowed) since not every product has been sorted into one.
 
 2. **Customers can now log in themselves, and `access_permission` gates
    product prices.** `POST /auth/customer/register` is public self-service
@@ -63,7 +68,7 @@ CRUD → file upload → error handling), not just written from memory - see
    6 resources):
    - `user_management` → manage User accounts (create/edit/permissions/deactivate)
    - `customer_management` → manage Customers
-   - `product_management` → manage Brands, Products (non-price fields), Manuals
+   - `product_management` → manage Brands, Categories, Products (non-price fields), Manuals
    - `price_listing` → change `price`/`old_price` on Products, and full CRUD on Promotions
    - Editing a product's price specifically requires **both**
      `product_management` AND `price_listing` via the general update
@@ -97,10 +102,20 @@ CRUD → file upload → error handling), not just written from memory - see
    alongside the API with one command.
 
 9. **Deleting things:** deleting a `User` is a soft-delete
-   (`is_active=False`, preserves login history). Deleting a `Brand` that
-   still has `Product`s attached is rejected (400) rather than cascading.
-   Deleting a `Product` cascades to its `Manual`s (a manual without its
-   product is meaningless).
+   (`is_active=False`, preserves login history). Deleting a `Brand` (or
+   `Category`) that still has `Product`s attached is rejected (400) rather
+   than cascading. Deleting a `Product` cascades to its `Manual`s (a
+   manual without its product is meaningless).
+
+10. **`Product.product_type`**: lets the catalog be sorted/filtered into
+    `"single"` items vs. `"combo"` (bundle) products, independent of
+    category - e.g. a "Portable X-ray" category contains both standalone
+    units and `"combo"` bundles that add a laptop/trolley/sensor. New
+    products default to `"single"`. Stored as a plain string rather than a
+    native Postgres enum (consistent with `badge`/`role_title` elsewhere
+    in this schema) so adding a third value later (e.g. `"bundle"`) is a
+    one-line change to `ProductType` in `app/schemas.py`, not a migration.
+    `GET /products` accepts `?product_type=combo` to filter on it.
 
 ---
 
@@ -111,7 +126,7 @@ app/
   main.py            FastAPI app, middleware, routers, global error handler
   config.py          Settings, read from .env
   database.py        SQLAlchemy engine/session
-  models.py           All 6 SQLAlchemy models
+  models.py           All 7 SQLAlchemy models
   schemas.py          All Pydantic request/response schemas
   core/
     security.py       Password hashing (bcrypt) + JWT
@@ -123,7 +138,7 @@ app/
     telegram.py        Telegram bot notification helpers
   routers/
     auth.py, customer_auth.py, users.py, customers.py, brands.py,
-    products.py, manuals.py, promotions.py
+    categories.py, products.py, manuals.py, promotions.py
 alembic/               Migrations (env.py wired to app.models / .env)
 scripts/create_admin.py   Bootstrap script for the first admin account
 scripts/seed_catalog.py   Inserts a few sample brands/products for local testing
@@ -250,11 +265,11 @@ auth flows), see [`AI_AGENT_GUIDE.md`](AI_AGENT_GUIDE.md). Summary:
 | `GET/PUT /customers/me` | Any logged-in customer | Self profile. Same email re-verification behavior as `/users/me` |
 | `POST /customers/me/change-password` | Any logged-in customer | Requires `current_password` + `new_password` (only works for self-registered customers, i.e. ones with a password) |
 | `GET/POST/PUT/DELETE /customers/...` | `customer_management` | Staff-side customer management, incl. toggling `access_permission` |
-| `GET /brands`, `/products`, `/manuals`, `/promotions` | **Public** | Catalog browsing. `products` `price` is masked as `"XXXX"` and `old_price` is omitted (`null`) unless the caller is staff or a customer with `access_permission=True` |
-| `POST /brands/` | `product_management` | `multipart/form-data`: `brand_name` plus an optional `file` to set the brand image in the same request |
+| `GET /brands`, `/categories`, `/products`, `/manuals`, `/promotions` | **Public** | Catalog browsing. `products` `price` is masked as `"XXXX"` and `old_price` is omitted (`null`) unless the caller is staff or a customer with `access_permission=True`. `GET /products` also accepts `category_id` and `product_type` filters |
+| `POST /brands/`, `POST /categories/` | `product_management` | `multipart/form-data`: `brand_name`/`category_name` plus an optional `file` to set the image in the same request |
 | `POST /manuals/` | `product_management` | `multipart/form-data`: `product_id`, optional `description`, plus an optional `file` to set the PDF in the same request |
-| `PUT/DELETE /brands/...`, `PUT/DELETE /manuals/...` | `product_management` | |
-| `POST/DELETE /products/...` | `product_management` (+`price_listing` if price included) | |
+| `PUT/DELETE /brands/...`, `PUT/DELETE /categories/...`, `PUT/DELETE /manuals/...` | `product_management` | Deleting a `Category` that still has `Product`s assigned is rejected (400), same as `Brand` |
+| `POST/DELETE /products/...` | `product_management` (+`price_listing` if price included) | `product_type` (`"single"`/`"combo"`, default `"single"`) and optional `category_id` are set here |
 | `PATCH /products/{id}/price` | `price_listing` | |
 | `POST/PUT/DELETE /promotions/...` | `price_listing` | |
 | `POST .../{id}/image`, `.../{id}/pdf` | Same permission as editing that resource | File uploads (still available for setting/replacing an image after creation) |

@@ -150,6 +150,57 @@ def test_product_requires_valid_brand(client, db_session):
     assert resp.status_code == 400
 
 
+def test_product_rejects_invalid_category_id(client, db_session):
+    make_admin(db_session, email="catalog3@example.com", password="password123")
+    headers = auth_header(client, "catalog3@example.com", "password123")
+    brand_id = client.post("/brands/", data={"brand_name": "CatTestCo"}, headers=headers).json()["id"]
+
+    resp = client.post("/products/", json={
+        "product_name": "Widget",
+        "price": "9.99",
+        "brand_id": brand_id,
+        "category_id": 9999,
+    }, headers=headers)
+    assert resp.status_code == 400
+
+
+def test_product_type_defaults_to_single_and_filters(client, db_session):
+    make_admin(db_session, email="ptype@example.com", password="password123")
+    headers = auth_header(client, "ptype@example.com", "password123")
+    brand_id = client.post("/brands/", data={"brand_name": "ComboCo"}, headers=headers).json()["id"]
+
+    single = client.post(
+        "/products/",
+        json={"product_name": "Single Item", "price": "10.00", "brand_id": brand_id},
+        headers=headers,
+    ).json()
+    assert single["product_type"] == "single"
+
+    combo = client.post(
+        "/products/",
+        json={
+            "product_name": "Combo Set",
+            "price": "50.00",
+            "brand_id": brand_id,
+            "product_type": "combo",
+        },
+        headers=headers,
+    ).json()
+    assert combo["product_type"] == "combo"
+
+    resp = client.get("/products/?product_type=combo")
+    assert resp.status_code == 200
+    assert [p["product_name"] for p in resp.json()] == ["Combo Set"]
+
+    # Not one of the allowed values (see schemas.ProductType) - rejected
+    resp = client.post(
+        "/products/",
+        json={"product_name": "Bad Type", "price": "1.00", "brand_id": brand_id, "product_type": "bogus"},
+        headers=headers,
+    )
+    assert resp.status_code == 422
+
+
 def test_full_catalog_crud_and_public_reads(client, db_session):
     make_admin(db_session, email="catalog2@example.com", password="password123")
     headers = auth_header(client, "catalog2@example.com", "password123")
@@ -157,6 +208,10 @@ def test_full_catalog_crud_and_public_reads(client, db_session):
     brand_resp = client.post("/brands/", data={"brand_name": "Acme"}, headers=headers)
     assert brand_resp.status_code == 201, brand_resp.text
     brand_id = brand_resp.json()["id"]
+
+    category_resp = client.post("/categories/", data={"category_name": "Footwear"}, headers=headers)
+    assert category_resp.status_code == 201, category_resp.text
+    category_id = category_resp.json()["id"]
 
     product_resp = client.post(
         "/products/",
@@ -166,7 +221,7 @@ def test_full_catalog_crud_and_public_reads(client, db_session):
             "price": "199.99",
             "old_price": "249.99",
             "brand_id": brand_id,
-            "category": "Footwear",
+            "category_id": category_id,
             "badge": "New",
         },
         headers=headers,
@@ -174,6 +229,7 @@ def test_full_catalog_crud_and_public_reads(client, db_session):
     assert product_resp.status_code == 201, product_resp.text
     product = product_resp.json()
     assert product["brand"]["brand_name"] == "Acme"
+    assert product["category"]["category_name"] == "Footwear"
 
     manual_resp = client.post(
         "/manuals/",
@@ -190,17 +246,25 @@ def test_full_catalog_crud_and_public_reads(client, db_session):
     public_brand_resp = client.get(f"/brands/{brand_id}")
     assert public_brand_resp.status_code == 200
 
+    public_category_resp = client.get(f"/categories/{category_id}")
+    assert public_category_resp.status_code == 200
+
     # Deleting a brand that still has a product should be rejected (RESTRICT)
     del_resp = client.delete(f"/brands/{brand_id}", headers=headers)
     assert del_resp.status_code == 400
+
+    # Same RESTRICT behavior for a category that still has a product
+    del_cat_resp = client.delete(f"/categories/{category_id}", headers=headers)
+    assert del_cat_resp.status_code == 400
 
     # Deleting the product cascades to its manual
     del_product_resp = client.delete(f"/products/{product['id']}", headers=headers)
     assert del_product_resp.status_code == 204
     assert client.get(f"/manuals/{manual_resp.json()['id']}").status_code == 404
 
-    # Now the (now product-less) brand can be deleted
+    # Now the (now product-less) brand/category can be deleted
     assert client.delete(f"/brands/{brand_id}", headers=headers).status_code == 204
+    assert client.delete(f"/categories/{category_id}", headers=headers).status_code == 204
 
 
 def test_price_listing_permission_required_for_price_changes(client, db_session):
@@ -641,6 +705,50 @@ def test_create_brand_with_image_in_one_request(client, db_session):
     resp = client.post("/brands/", data={"brand_name": "NoImageCo"}, headers=headers)
     assert resp.status_code == 201, resp.text
     assert resp.json()["brand_image"] is None
+
+
+def test_category_image_upload(client, db_session):
+    make_admin(db_session, email="catuploader@example.com", password="password123")
+    headers = auth_header(client, "catuploader@example.com", "password123")
+    category_id = client.post(
+        "/categories/", data={"category_name": "UploadCat"}, headers=headers
+    ).json()["id"]
+
+    fake_png = b"\x89PNG\r\n\x1a\n" + b"0" * 100
+    resp = client.post(
+        f"/categories/{category_id}/image",
+        files={"file": ("logo.png", fake_png, "image/png")},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["category_image"].startswith("/static/uploads/categories/")
+
+    resp = client.post(
+        f"/categories/{category_id}/image",
+        files={"file": ("logo.txt", b"not an image", "text/plain")},
+        headers=headers,
+    )
+    assert resp.status_code == 400
+
+
+def test_create_category_with_image_in_one_request(client, db_session):
+    make_admin(db_session, email="catuploader2@example.com", password="password123")
+    headers = auth_header(client, "catuploader2@example.com", "password123")
+
+    fake_png = b"\x89PNG\r\n\x1a\n" + b"0" * 100
+    resp = client.post(
+        "/categories/",
+        data={"category_name": "OneShotCat"},
+        files={"file": ("logo.png", fake_png, "image/png")},
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["category_image"].startswith("/static/uploads/categories/")
+
+    # Image is optional: creating without one still works
+    resp = client.post("/categories/", data={"category_name": "NoImageCat"}, headers=headers)
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["category_image"] is None
 
 
 def test_create_manual_with_pdf_in_one_request(client, db_session):

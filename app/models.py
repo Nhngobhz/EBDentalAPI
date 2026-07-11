@@ -101,6 +101,27 @@ class Brand(Base):
     products = relationship("Product", back_populates="brand")
 
 
+class Category(Base):
+    """Product category (e.g. "Curing Light", "Trolley"). Same shape/role as
+    Brand - a proper table instead of a free-text column, for the same
+    reason brand_name became brand_id (see README)."""
+
+    __tablename__ = "categories"
+
+    id = Column(Integer, primary_key=True, index=True)
+    category_name = Column(String(150), unique=True, nullable=False, index=True)
+    category_image = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # passive_deletes=True: category_id is nullable (unlike brand_id), so
+    # without this SQLAlchemy would silently UPDATE ... SET category_id =
+    # NULL on referencing products before deleting the category instead of
+    # letting the DB's ON DELETE RESTRICT reject it - defeating the "can't
+    # delete a category still in use" rule that Brand gets "for free" only
+    # because brand_id happens to be NOT NULL.
+    products = relationship("Product", back_populates="category", passive_deletes=True)
+
+
 class Product(Base):
     __tablename__ = "products"
 
@@ -114,12 +135,24 @@ class Product(Base):
     # "Product.brand_name -> brand_id".
     brand_id = Column(Integer, ForeignKey("brands.id", ondelete="RESTRICT"), nullable=False)
 
-    category = Column(String(100), nullable=True, index=True)
+    # Changed from a raw `category` string to a foreign key, same reasoning
+    # as brand_id. Nullable (unlike brand_id) since not every product has
+    # been sorted into a category yet.
+    category_id = Column(Integer, ForeignKey("categories.id", ondelete="RESTRICT"), nullable=True)
+
+    # Lets the catalog be sorted/filtered into single items vs. bundled
+    # combos (e.g. "single", "combo"), independent of category. Plain
+    # string rather than a DB-level enum (matches badge/role_title
+    # elsewhere in this schema) so new values don't need a migration -
+    # allowed values are validated in ProductBase.product_type instead.
+    product_type = Column(String(20), nullable=False, server_default="single", index=True)
+
     badge = Column(String(50), nullable=True)
     product_image = Column(String(500), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     brand = relationship("Brand", back_populates="products")
+    category = relationship("Category", back_populates="products")
     manuals = relationship("Manual", back_populates="product", cascade="all, delete-orphan")
 
 

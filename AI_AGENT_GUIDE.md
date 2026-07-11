@@ -31,9 +31,9 @@ confusing (not obviously wrong) results.
   and `POST /products/` use a trailing slash; item-scoped paths like
   `GET /products/{id}` do not. This is standard FastAPI router behavior,
   not a typo - use the exact paths in section 6.
-- **All 6 "physical" entities**: `User` (staff), `Customer`, `Brand`,
-  `Product`, `Manual`, `Promotion`. There is no `Order`/`Cart` model in
-  this API - it's a catalog + account management backend, not a
+- **All 7 "physical" entities**: `User` (staff), `Customer`, `Brand`,
+  `Category`, `Product`, `Manual`, `Promotion`. There is no `Order`/`Cart`
+  model in this API - it's a catalog + account management backend, not a
   checkout/POS system.
 
 ---
@@ -133,7 +133,7 @@ row, checked directly:
 |---|---|
 | `user_management` | Create/edit/deactivate staff (`User`) accounts, view the staff list |
 | `customer_management` | Full CRUD on `Customer` records, including toggling `access_permission` |
-| `product_management` | CRUD on `Brand`, `Product` (non-price fields), `Manual` |
+| `product_management` | CRUD on `Brand`, `Category`, `Product` (non-price fields), `Manual` |
 | `price_listing` | Set `price`/`old_price` on `Product`, full CRUD on `Promotion` |
 
 Notes an agent should know before assuming a 403 is a bug:
@@ -173,11 +173,12 @@ sending JSON to them will fail:
 |---|---|---|
 | `POST /auth/login`, `POST /auth/customer/login` | `application/x-www-form-urlencoded` | OAuth2 password-grant spec |
 | `POST /brands/` | `multipart/form-data` (`brand_name` field + optional `file`) | Lets you set the brand image in the same request that creates it |
+| `POST /categories/` | `multipart/form-data` (`category_name` field + optional `file`) | Same reasoning, for the category image |
 | `POST /manuals/` | `multipart/form-data` (`product_id`, optional `description`, optional `file`) | Same reasoning, for the manual's PDF |
-| `POST .../{id}/image`, `POST .../{id}/pdf` (on users, customers, brands, products, manuals) | `multipart/form-data` (single `file` field) | Direct file upload |
+| `POST .../{id}/image`, `POST .../{id}/pdf` (on users, customers, brands, categories, products, manuals) | `multipart/form-data` (single `file` field) | Direct file upload |
 
-Everything else - including `PUT /brands/{id}` (metadata-only update,
-image unchanged) - is plain JSON.
+Everything else - including `PUT /brands/{id}` / `PUT /categories/{id}`
+(metadata-only update, image unchanged) - is plain JSON.
 
 File upload constraints (`app/core/files.py`): images must be
 `image/jpeg`, `image/png`, `image/webp`, or `image/gif` and ≤5MB;
@@ -319,12 +320,22 @@ record only.
 | `POST /brands/{id}/image` | `product_management` | multipart `file` |
 | `DELETE /brands/{id}` | `product_management` | `400` if any `Product` still references this brand (FK restrict, not cascade) |
 
+### Categories - `/categories`
+| Method & path | Auth | Body / notes |
+|---|---|---|
+| `GET /categories/` | Public | query `skip`, `limit` |
+| `GET /categories/{id}` | Public | - |
+| `POST /categories/` | `product_management` | multipart: `category_name` (form field) + optional `file` |
+| `PUT /categories/{id}` | `product_management` | JSON `{"category_name": "..."}`; does not touch the image |
+| `POST /categories/{id}/image` | `product_management` | multipart `file` |
+| `DELETE /categories/{id}` | `product_management` | `400` if any `Product` still references this category (FK restrict, not cascade) |
+
 ### Products - `/products`
 | Method & path | Auth | Body / notes |
 |---|---|---|
-| `GET /products/` | Public | query `skip`, `limit`, `brand_id`, `category`, `q` (name substring); price masking applies, see section 4 |
+| `GET /products/` | Public | query `skip`, `limit`, `brand_id`, `category_id`, `product_type` (`"single"`/`"combo"`), `q` (name substring); price masking applies, see section 4 |
 | `GET /products/{id}` | Public | same masking |
-| `POST /products/` | `product_management` | JSON `ProductCreate` (`product_name`, `description?`, `category?`, `badge?`, `price` >0, `old_price?` >0, `brand_id` - must reference an existing brand or `400`) |
+| `POST /products/` | `product_management` | JSON `ProductCreate` (`product_name`, `description?`, `badge?`, `product_type?` - `"single"`/`"combo"`, defaults `"single"` -, `price` >0, `old_price?` >0, `brand_id` - must reference an existing brand or `400`, `category_id?` - must reference an existing category or `400`) |
 | `PUT /products/{id}` | `product_management`, **+`price_listing` if the body includes `price` or `old_price`** | JSON `ProductUpdate`, all fields optional |
 | `PATCH /products/{id}/price` | `price_listing` only | JSON `{"price"?, "old_price"?}` - use this instead of `PUT` if the caller only has `price_listing` |
 | `POST /products/{id}/image` | `product_management` | multipart `file` |
@@ -377,9 +388,13 @@ same masking rule from section 4 applies here.
 - `Promotion.end_date` must be strictly after `start_date`, enforced both
   in the schema (on create) and again in the router (on update, against
   whichever of the two values ends up in effect).
-- IDs (`brand_id`, `product_id`) referenced in create/update payloads are
-  checked for existence server-side and rejected with `400` if dangling -
-  don't pre-validate them client-side beyond that.
+- IDs (`brand_id`, `category_id`, `product_id`) referenced in create/update
+  payloads are checked for existence server-side and rejected with `400`
+  if dangling - don't pre-validate them client-side beyond that.
+  `category_id` is the exception that's optional (`null` allowed).
+- `Product.product_type` only accepts `"single"` or `"combo"` (see
+  `ProductType` in `app/schemas.py`) - anything else is a `422`, not a
+  `400`, since it's a schema-level literal check rather than a DB lookup.
 
 ---
 

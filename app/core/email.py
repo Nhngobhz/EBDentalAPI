@@ -14,6 +14,10 @@ from app.core.logging_conf import get_logger
 
 logger = get_logger("email")
 
+_ACCENT_START = "#095799"
+_ACCENT_END = "#45d3f7"
+_ACCENT_GRADIENT = f"linear-gradient(135deg, {_ACCENT_START}, {_ACCENT_END})"
+
 _conf = ConnectionConfig(
     MAIL_USERNAME=settings.MAIL_USERNAME or "no-reply@example.com",
     MAIL_PASSWORD=settings.MAIL_PASSWORD or "placeholder",
@@ -51,7 +55,7 @@ def _button_email(heading: str, intro: str, button_text: str, link: str, footnot
     <div style="background-color:#f4f5f7;padding:32px 16px;font-family:'Segoe UI',Helvetica,Arial,sans-serif;">
       <div style="max-width:480px;margin:0 auto;background-color:#ffffff;border-radius:12px;
                   overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.06);">
-        <div style="background-color:#0f6e5f;padding:28px 24px;text-align:center;">
+        <div style="background-color:{_ACCENT_START};background:{_ACCENT_GRADIENT};padding:28px 24px;text-align:center;">
           <span style="color:#ffffff;font-size:20px;font-weight:600;letter-spacing:0.2px;">
             {settings.APP_NAME}
           </span>
@@ -60,7 +64,7 @@ def _button_email(heading: str, intro: str, button_text: str, link: str, footnot
           <h1 style="margin:0 0 12px;font-size:22px;color:#1a1a1a;">{heading}</h1>
           <p style="margin:0 0 28px;font-size:15px;line-height:1.5;color:#4a4a4a;">{intro}</p>
           <a href="{link}"
-             style="display:inline-block;padding:14px 36px;background-color:#0f6e5f;color:#ffffff;
+             style="display:inline-block;padding:14px 36px;background-color:{_ACCENT_START};background:{_ACCENT_GRADIENT};color:#ffffff;
                     text-decoration:none;font-size:16px;font-weight:600;border-radius:8px;">
             {button_text}
           </a>

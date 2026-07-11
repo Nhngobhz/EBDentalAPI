@@ -6,9 +6,10 @@
 -- PostgreSQL database dump
 --
 
+\restrict UFhKC6dX8lLcJuHd3600mRfqXdRUbT8JndDsQ5V3kLbc9jsohXPGwn0YxbKLOHv
 
--- Dumped from database version 16.14 (Ubuntu 16.14-0ubuntu0.24.04.1)
--- Dumped by pg_dump version 16.14 (Ubuntu 16.14-0ubuntu0.24.04.1)
+-- Dumped from database version 16.14
+-- Dumped by pg_dump version 16.14
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -67,6 +68,38 @@ ALTER SEQUENCE public.brands_id_seq OWNED BY public.brands.id;
 
 
 --
+-- Name: categories; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.categories (
+    id integer NOT NULL,
+    category_name character varying(150) NOT NULL,
+    category_image character varying(500),
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: categories_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.categories_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: categories_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.categories_id_seq OWNED BY public.categories.id;
+
+
+--
 -- Name: customers; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -80,8 +113,8 @@ CREATE TABLE public.customers (
     access_permission boolean NOT NULL,
     creation_date timestamp with time zone DEFAULT now(),
     hashed_password character varying(255),
-    is_active boolean NOT NULL,
-    is_verified boolean NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    is_verified boolean DEFAULT false NOT NULL,
     verification_token character varying(255),
     verification_token_expires timestamp with time zone,
     reset_token character varying(255),
@@ -155,10 +188,11 @@ CREATE TABLE public.products (
     old_price numeric(10,2),
     price numeric(10,2) NOT NULL,
     brand_id integer NOT NULL,
-    category character varying(100),
     badge character varying(50),
     product_image character varying(500),
-    created_at timestamp with time zone DEFAULT now()
+    created_at timestamp with time zone DEFAULT now(),
+    category_id integer,
+    product_type character varying(20) DEFAULT 'single'::character varying NOT NULL
 );
 
 
@@ -274,6 +308,13 @@ ALTER TABLE ONLY public.brands ALTER COLUMN id SET DEFAULT nextval('public.brand
 
 
 --
+-- Name: categories id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.categories ALTER COLUMN id SET DEFAULT nextval('public.categories_id_seq'::regclass);
+
+
+--
 -- Name: customers id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -322,6 +363,14 @@ ALTER TABLE ONLY public.alembic_version
 
 ALTER TABLE ONLY public.brands
     ADD CONSTRAINT brands_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: categories categories_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.categories
+    ADD CONSTRAINT categories_pkey PRIMARY KEY (id);
 
 
 --
@@ -379,6 +428,20 @@ CREATE INDEX ix_brands_id ON public.brands USING btree (id);
 
 
 --
+-- Name: ix_categories_category_name; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ix_categories_category_name ON public.categories USING btree (category_name);
+
+
+--
+-- Name: ix_categories_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_categories_id ON public.categories USING btree (id);
+
+
+--
 -- Name: ix_customers_customer_name; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -421,10 +484,10 @@ CREATE INDEX ix_manuals_id ON public.manuals USING btree (id);
 
 
 --
--- Name: ix_products_category; Type: INDEX; Schema: public; Owner: -
+-- Name: ix_products_category_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX ix_products_category ON public.products USING btree (category);
+CREATE INDEX ix_products_category_id ON public.products USING btree (category_id);
 
 
 --
@@ -439,6 +502,13 @@ CREATE INDEX ix_products_id ON public.products USING btree (id);
 --
 
 CREATE INDEX ix_products_product_name ON public.products USING btree (product_name);
+
+
+--
+-- Name: ix_products_product_type; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_products_product_type ON public.products USING btree (product_type);
 
 
 --
@@ -500,7 +570,16 @@ ALTER TABLE ONLY public.products
 
 
 --
+-- Name: products products_category_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.products
+    ADD CONSTRAINT products_category_id_fkey FOREIGN KEY (category_id) REFERENCES public.categories(id) ON DELETE RESTRICT;
+
+
+--
 -- PostgreSQL database dump complete
 --
 
+\unrestrict UFhKC6dX8lLcJuHd3600mRfqXdRUbT8JndDsQ5V3kLbc9jsohXPGwn0YxbKLOHv
 

@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.core.email import send_customer_password_reset_email, send_customer_verification_email
 from app.core.logging_conf import get_logger
-from app.core.pages import render_status_page
+from app.core.pages import render_reset_password_form, render_status_page
 from app.core.security import (
     create_access_token,
     generate_url_safe_token,
@@ -181,6 +181,37 @@ async def forgot_password(
         db.commit()
         background_tasks.add_task(send_customer_password_reset_email, customer.email, token)
     return {"detail": "If that email exists, a password reset link has been sent."}
+
+
+@router.get("/reset-password", response_class=HTMLResponse)
+def reset_password_form(token: str, db: Session = Depends(get_db)):
+    """Opened directly by the user's browser from the link in the reset
+    email, so it returns an HTML form (that posts to POST /auth/customer/reset-password)
+    rather than JSON."""
+    customer = db.query(Customer).filter(Customer.reset_token == token).first()
+    if not customer:
+        return HTMLResponse(
+            render_status_page(
+                success=False,
+                heading="Reset failed",
+                message="This password reset link is invalid.",
+            ),
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+    if customer.reset_token_expires and customer.reset_token_expires < datetime.now(timezone.utc):
+        return HTMLResponse(
+            render_status_page(
+                success=False,
+                heading="Link expired",
+                message="This password reset link has expired. Please request a new one.",
+            ),
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+    return HTMLResponse(
+        render_reset_password_form(
+            token=token, submit_url=f"{settings.BASE_URL}/auth/customer/reset-password"
+        )
+    )
 
 
 @router.post("/reset-password", response_model=Message)
