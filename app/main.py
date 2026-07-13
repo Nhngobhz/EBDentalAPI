@@ -1,7 +1,7 @@
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -74,7 +74,12 @@ app.include_router(promotions.router)
 
 
 @app.get("/health", tags=["Health"])
-def health_check():
+def health_check(x_telegram_bot_token: str | None = Header(default=None)):
+    # Only the Telegram bot's /check command should be able to hit this -
+    # it sends the bot token back as a header. Anyone else gets a 404 so the
+    # endpoint's existence isn't even revealed.
+    if not settings.TELEGRAM_BOT_TOKEN or x_telegram_bot_token != settings.TELEGRAM_BOT_TOKEN:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return {"status": "ok"}
 
 

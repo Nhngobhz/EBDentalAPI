@@ -1,12 +1,22 @@
 from datetime import datetime, timedelta, timezone
 
+from app.config import settings
 from tests.conftest import auth_header, customer_auth_header, make_admin, make_customer
 
 
-def test_health(client):
+def test_health_requires_telegram_bot_token(client):
     resp = client.get("/health")
+    assert resp.status_code == 404
+
+
+def test_health(client, monkeypatch):
+    monkeypatch.setattr(settings, "TELEGRAM_BOT_TOKEN", "test-bot-token")
+    resp = client.get("/health", headers={"X-Telegram-Bot-Token": "test-bot-token"})
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
+
+    resp = client.get("/health", headers={"X-Telegram-Bot-Token": "wrong-token"})
+    assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------
