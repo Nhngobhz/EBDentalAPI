@@ -26,9 +26,10 @@ from app.models import Brand, Category, Customer, Manual, Product, Promotion, Us
 
 BRANDS = ["Woodpecker", "YouJoy"]
 
-# Every entry below carries "brand_id": 1 - a 1-based position in BRANDS
-# (all of them are Woodpecker), not a real database id. main() resolves it
-# positionally, the same way brand_by_name resolves brand_name elsewhere.
+# Every entry below carries a "brand_id" that is a 1-based position in
+# BRANDS (1 = Woodpecker, 2 = YouJoy), not a real database id. main()
+# resolves it positionally, the same way brand_by_name resolves brand_name
+# elsewhere.
 PRODUCTS = [
   {"product_name": "LX16-PLUS", "description": "Multi-purpose dental diode laser for soft tissue, perio, endo, implant, surgery, and pain therapy.", "category": "Diode Laser System", "badge": "Item", "price": 3200, "new_price": 3480, "brand_id": 1},
   {"product_name": "KP SmileScan", "description": "High-precision intraoral scanner with full-arch imaging, AI-enhanced accuracy, and seamless lab integration.", "category": "Intraoral Scanner", "badge": "Item", "price": 3372.5, "new_price": 3550, "brand_id": 1},
@@ -136,7 +137,39 @@ PRODUCTS = [
   {"product_name": "Smart Ray Pro Set Core i5 (Woodpecker)", "description": "Smart Ray Pro set including laptop (Core i5), H2 sensor, radiation apron, trolley, mouse and mouse pad.", "category": "X Ray sensor Package", "badge": "Item", "price": 2030, "new_price": 2194, "brand_id": 1},
   {"product_name": "Smart Ray Pro Set Core i3 (Woodpecker)", "description": "Smart Ray Pro set including laptop (Core i3), H2 sensor, radiation apron, trolley, mouse and mouse pad.", "category": "X Ray sensor Package", "badge": "Item", "price": 1930, "new_price": 2054, "brand_id": 1},
   {"product_name": "Smart Ray Pro Set Core i5", "description": "Smart Ray Pro set including laptop (Core i5), H2 sensor, radiation apron, trolley, mouse and mouse pad.", "category": "X Ray sensor Package", "badge": "Item", "price": 1990, "new_price": 2154, "brand_id": 1},
-  {"product_name": "Smart Ray Pro Set Core i3", "description": "Smart Ray Pro set including laptop (Core i3), H2 sensor, radiation apron, trolley, mouse and mouse pad.", "category": "X Ray sensor Package", "badge": "Item", "price": 1890, "new_price": 2024, "brand_id": 1}
+  {"product_name": "Smart Ray Pro Set Core i3", "description": "Smart Ray Pro set including laptop (Core i3), H2 sensor, radiation apron, trolley, mouse and mouse pad.", "category": "X Ray sensor Package", "badge": "Item", "price": 1890, "new_price": 2024, "brand_id": 1},
+
+  # --- YouJoy products (extracted from the YouJoy Product Catalog PDF) ---
+  {"product_name": "OMNI", "description": "Youjoy Omni Color Shade Detector for fast, accurate shade matching in crown, veneer, and restoration work.", "category": "Color Shade Detector", "badge": "Item", "price": 266, "new_price": 280, "brand_id": 2},
+  {"product_name": "SCAN11", "description": "Youjoy Scan11 Intraoral Scanner - fast 3D intraoral scanning with cloud functions for easy data storage and transfer.", "category": "Intraoral Scanner", "badge": "Item", "price": 2950, "new_price": None, "brand_id": 2},
+
+  {"product_name": "BES 22L-CLASS-B-LCD (Autoclave)", "description": "Youjoy BES-22L Class B LCD Autoclave sterilizer with clear LCD display for accurate, safe, and internationally compliant sterilization.", "category": "Autoclave", "badge": "Item", "price": 1580, "new_price": None, "brand_id": 2},
+  {"product_name": "BES 23L-CLASS-B-LCD", "description": "Youjoy BES-23L Class B LCD Autoclave sterilizer with clear LCD display for accurate, safe, and internationally compliant sterilization.", "category": "Autoclave", "badge": "Item", "price": 1650, "new_price": None, "brand_id": 2},
+  {"product_name": "BES 23L-CLASS-B-LED", "description": "Youjoy BES-23L Class B LED Autoclave sterilizer with LED display for accurate, safe, and internationally compliant sterilization.", "category": "Autoclave", "badge": "Item", "price": 1550, "new_price": None, "brand_id": 2},
+
+  {"product_name": "UC-01", "description": "Youjoy Ultrasonic Cleaner UC-01 for fast, effective, and safe ultrasonic cleaning of dental instruments, jewelry, and medical tools. Capacity: 3 L.", "category": "Ultrasonic Cleaner", "badge": "Item", "price": 179.55, "new_price": 189, "brand_id": 2},
+  {"product_name": "CLEAN-02", "description": "Youjoy Ultrasonic Cleaner UC-02, an advanced ultrasonic cleaner for dental instruments, jewelry, and medical tools. Capacity: 6 L.", "category": "Ultrasonic Cleaner", "badge": "Item", "price": 280.25, "new_price": 295, "brand_id": 2},
+  {"product_name": "CLEAN-03", "description": "Youjoy Ultrasonic Cleaner UC-03, a high-performance ultrasonic cleaner for dental instruments, jewelry, and medical tools. Capacity: 7.5 L.", "category": "Ultrasonic Cleaner", "badge": "Item", "price": 418, "new_price": 440, "brand_id": 2},
+
+  {"product_name": "R2", "description": "Youjoy Sensor R2, a digital dental sensor for dental X-ray imaging.", "category": "Dental Sensor", "badge": "Item", "price": 655.5, "new_price": 690, "brand_id": 2},
+
+  {"product_name": "DRINK (Water Distiller)", "description": "Youjoy Water Distiller (Model DRINK), a high-efficiency water distiller designed for dental clinics, medical offices, and laboratory use.", "category": "Water Distiller", "badge": "Item", "price": 114, "new_price": 120, "brand_id": 2},
+
+  {"product_name": "YOUJOY98P", "description": "Youjoy 98P Portable Dental X-Ray for diagnosis, implant, and endo work, offering clear imaging and precise, easy-to-use portable operation. Tube voltage 70KV+-10%, tube current 2mA+-20%, focus 0.4mm, exposure time range 0.04s-2.0s, machine weight 1.9kg.", "category": "Portable X-ray", "badge": "Item", "price": 560.5, "new_price": 590, "brand_id": 2},
+  {"product_name": "SUPER05", "description": "Youjoy Super05 Portable X-Ray, a high-performance portable dental X-ray for diagnosis, endo, and implant planning. Tube voltage 70KV+-10%, tube current 2mA+-20%, focus 0.4mm, exposure time range 0.04s-2.0s, machine weight 1.7kg.", "category": "Portable X-ray", "badge": "Item", "price": 655.5, "new_price": 690, "brand_id": 2},
+
+  {"product_name": "SEAL120", "description": "Youjoy SEAL120 Sealing Machine, a reliable sterilization pouch sealing machine designed for dental and medical clinics.", "category": "Sealing Machine", "badge": "Item", "price": 152, "new_price": 160, "brand_id": 2},
+  {"product_name": "SEAL120 WITH RACK", "description": "Youjoy SEAL120 with rack Sealing Machine, a reliable sterilization pouch sealing machine designed for dental and medical clinics, including a rack.", "category": "Sealing Machine", "badge": "Item", "price": 170.05, "new_price": 179, "brand_id": 2},
+
+  {"product_name": "GIANT30", "description": "Runyes Giant-30 compact oil-free dental 100% dry air supply system designed for stable and hygienic airflow. Capacity 25 L, 1400 RPM, 0.6 rated power (KVA), supports 1 chair.", "category": "Air Compressor", "badge": "Item", "price": 522.5, "new_price": 550, "brand_id": 2},
+  {"product_name": "GIANT35", "description": "Runyes Giant-35 Air Compressor, a powerful dual-pump oil-free dental 100% dry air system for 1-2 chairs. Capacity 50 L, 1400 RPM, 1.2 rated power (KVA), supports 2 chairs.", "category": "Air Compressor", "badge": "Item", "price": 845.5, "new_price": 890, "brand_id": 2},
+  {"product_name": "GIANT40", "description": "Runyes Giant-40 Air Compressor, a high-capacity oil-free dental 100% dry air system for up to 3 chairs. Capacity 60 L, 1400 RPM, 1.54 rated power (KVA), supports 3 chairs.", "category": "Air Compressor", "badge": "Item", "price": 997.5, "new_price": 1050, "brand_id": 2},
+  {"product_name": "GIANT45", "description": "Runyes Giant-45 Air Compressor, a high-output oil-free dental 100% dry air system built for busy clinics. Capacity 70 L, 1400 RPM, 2.2 rated power (KVA), supports 5 chairs.", "category": "Air Compressor", "badge": "Item", "price": 1282.5, "new_price": 1350, "brand_id": 2},
+  {"product_name": "GIANT50", "description": "Runyes Giant-50 powerhouse oil-free 100% dry air compressor built for busy dental clinics. Capacity 135 L, 1400 RPM, 3.1 rated power (KVA), supports 8 chairs.", "category": "Air Compressor", "badge": "Item", "price": 2185, "new_price": 2300, "brand_id": 2},
+  {"product_name": "GIANT55", "description": "Runyes Giant-55 powerhouse oil-free 100% dry air compressor built for busy dental clinics. Capacity 210 L, 1400 RPM, 4.7 rated power (KVA), supports 12 chairs.", "category": "Air Compressor", "badge": "Item", "price": 2755, "new_price": 2900, "brand_id": 2},
+
+  {"product_name": "MOBILE CART TR/7A", "description": "TR-7A All-In-One Mobile Dental Cart, a sleek and versatile mobile workstation for digital dentistry with adjustable height, 3-layer tray design, 360-degree lockable wheels, and a built-in shelf for a laptop or scanner.", "category": "Mobile Cart", "badge": "Item", "price": 266, "new_price": 280, "brand_id": 2},
+  {"product_name": "TR/7A WORKSTATION CART", "description": "TR-7A All-In-One Mobile Dental Cart, a sleek and versatile mobile workstation for digital dentistry with adjustable height, 3-layer tray design, 360-degree lockable wheels, and a dedicated VESA-compatible monitor mount for a screen or digital scanner.", "category": "Mobile Cart", "badge": "Item", "price": 370.5, "new_price": 390, "brand_id": 2},
 ]
 
 # category_id is a real FK now (Product.category_id -> categories.id), so

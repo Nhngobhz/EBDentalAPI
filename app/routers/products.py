@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.deps import get_price_visibility, get_verified_user, require_permission
-from app.core.files import save_image
+from app.core.files import save_named_image
 from app.database import get_db
 from app.models import Brand, Category, Product, User
 from app.schemas import ProductCreate, ProductOut, ProductPriceUpdate, ProductUpdate
@@ -160,7 +160,7 @@ async def upload_product_image(
     product = db.query(Product).filter(Product.id == product_id).first()
     if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
-    product.product_image = await save_image(file, "products")
+    product.product_image = await save_named_image(file, "products", product.product_name)
     db.commit()
     return _get_product_or_404(db, product_id)
 

@@ -355,16 +355,15 @@ record only.
 ### Promotions - `/promotions`
 | Method & path | Auth | Body / notes |
 |---|---|---|
-| `GET /promotions/` | Public | query `skip`, `limit`, `active_only` (bool - filters to `start_date <= now <= end_date`) |
-| `GET /promotions/{id}` | Public | - |
+| `GET /promotions/` | Public | query `skip`, `limit`, `active_only` (bool - filters to `start_date <= now <= end_date`); price masking applies, see section 4 |
+| `GET /promotions/{id}` | Public | price masking applies, see section 4 |
 | `POST /promotions/` | `price_listing` | JSON `PromotionCreate` (`promotion_name`, `description?`, `price` >0, `old_price?` >0, `start_date`, `end_date` - must be after `start_date` or `422`) |
 | `PUT /promotions/{id}` | `price_listing` | JSON `PromotionUpdate`, all optional; if you change only one of `start_date`/`end_date`, the other's current value is still validated against it |
 | `DELETE /promotions/{id}` | `price_listing` | - |
 
-**Note**: `Promotion.price`/`old_price` are **not** masked by
-`access_permission` the way `Product` prices are - promotions are always
-returned with real numbers to any caller, public or not. Don't assume the
-same masking rule from section 4 applies here.
+**Note**: `Promotion.price`/`old_price` are masked the same way as
+`Product` prices - unauthenticated/unentitled callers get `price` as the
+literal string `"XXXX"` and `old_price` as `null`; see section 4.
 
 ### Misc
 | Method & path | Auth | Notes |
