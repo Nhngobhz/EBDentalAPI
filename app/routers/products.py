@@ -29,13 +29,13 @@ def _get_product_or_404(db: Session, product_id: int) -> Product:
 
 def _serialize_product(product: Product, can_view_price: bool) -> dict:
     """Only staff and customers with access_permission=True (see
-    get_price_visibility) get the real price/old_price. Everyone else gets
-    "XXXX" in place of price, and old_price left out entirely (None) -
+    get_price_visibility) get the real price/discount. Everyone else gets
+    "XXXX" in place of price, and discount left out entirely (None) -
     unauthorized viewers shouldn't learn a discount even exists."""
     data = ProductOut.model_validate(product).model_dump()
     if not can_view_price:
         data["price"] = _MASKED_PRICE
-        data["old_price"] = None
+        data["discount"] = None
     return data
 
 
@@ -50,7 +50,7 @@ def list_products(
     can_view_price: bool = Depends(get_price_visibility),
     db: Session = Depends(get_db),
 ):
-    """Public: product catalog browsing needs no account. Price/old_price
+    """Public: product catalog browsing needs no account. Price/discount
     are masked unless the caller is staff or a customer with
     access_permission=True."""
     query = db.query(Product).options(joinedload(Product.brand), joinedload(Product.category))
@@ -100,11 +100,11 @@ def update_product(
     db: Session = Depends(get_db),
 ):
     """General product update. Requires product_management for any field.
-    If price/old_price are included in the payload, price_listing is ALSO
+    If price/discount are included in the payload, price_listing is ALSO
     required (use PATCH /products/{id}/price if you only need to touch
     price and don't have product_management)."""
     data = payload.model_dump(exclude_unset=True)
-    touches_price = "price" in data or "old_price" in data
+    touches_price = "price" in data or "discount" in data
 
     if not current_user.product_management:
         raise HTTPException(
@@ -114,7 +114,7 @@ def update_product(
     if touches_price and not current_user.price_listing:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Changing price/old_price also requires the 'price_listing' permission",
+            detail="Changing price/discount also requires the 'price_listing' permission",
         )
 
     product = db.query(Product).filter(Product.id == product_id).first()

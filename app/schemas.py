@@ -6,6 +6,7 @@ Naming convention used throughout:
   *Update        -> payload to update an existing record (all fields optional)
   *Out           -> what gets returned to the client
 """
+import re
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Literal, Optional, Union
@@ -233,6 +234,17 @@ class CategoryMini(BaseModel):
 # migration - see Product.product_type in app/models.py.
 ProductType = Literal["single", "combo"]
 
+# discount is a free-form label, not a number, so it's checked against this
+# pattern instead of a numeric Field constraint - "10%" or "5$" only, no
+# other units.
+_DISCOUNT_PATTERN = re.compile(r"^\d+(\.\d+)?(%|\$)$")
+
+
+def _check_discount_format(value: Optional[str]) -> Optional[str]:
+    if value is not None and not _DISCOUNT_PATTERN.fullmatch(value):
+        raise ValueError('discount must look like "10%" or "10$"')
+    return value
+
 
 class ProductBase(BaseModel):
     product_name: str = Field(..., min_length=1, max_length=200)
@@ -243,9 +255,11 @@ class ProductBase(BaseModel):
 
 class ProductCreate(ProductBase):
     price: Decimal = Field(..., gt=0)
-    old_price: Optional[Decimal] = Field(None, gt=0)
+    discount: Optional[str] = Field(None, max_length=20)
     brand_id: int
     category_id: Optional[int] = None
+
+    _validate_discount = field_validator("discount")(_check_discount_format)
 
 
 class ProductUpdate(BaseModel):
@@ -256,16 +270,20 @@ class ProductUpdate(BaseModel):
     brand_id: Optional[int] = None
     category_id: Optional[int] = None
     # Present here so a product_management holder *can* still create a
-    # product with a price, but changing price/old_price on an *existing*
+    # product with a price, but changing price/discount on an *existing*
     # product additionally requires the price_listing permission - enforced
     # in the router, not here.
     price: Optional[Decimal] = Field(None, gt=0)
-    old_price: Optional[Decimal] = Field(None, gt=0)
+    discount: Optional[str] = Field(None, max_length=20)
+
+    _validate_discount = field_validator("discount")(_check_discount_format)
 
 
 class ProductPriceUpdate(BaseModel):
     price: Optional[Decimal] = Field(None, gt=0)
-    old_price: Optional[Decimal] = Field(None, gt=0)
+    discount: Optional[str] = Field(None, max_length=20)
+
+    _validate_discount = field_validator("discount")(_check_discount_format)
 
 
 class ProductOut(ProductBase):
@@ -274,7 +292,9 @@ class ProductOut(ProductBase):
     # app.core.deps.get_price_visibility) get back the literal string
     # "XXXX" instead of the real value.
     price: Union[Decimal, str]
-    old_price: Optional[Union[Decimal, str]] = None
+    # Masked to None for the same viewers, same reasoning as price - see
+    # app.routers.products._serialize_product.
+    discount: Optional[str] = None
     product_image: Optional[str] = None
     brand: Optional[BrandMini] = None
     category: Optional[CategoryMini] = None
@@ -346,8 +366,11 @@ class PromotionUpdate(BaseModel):
 
 class PromotionOut(PromotionBase):
     id: int
-    price: Decimal
-    old_price: Optional[Decimal] = None
+    # Union[Decimal, str]: same masking as ProductOut.price - viewers
+    # without price access get "XXXX" instead of the real value, see
+    # app.routers.promotions._serialize_promotion.
+    price: Union[Decimal, str]
+    old_price: Optional[Union[Decimal, str]] = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

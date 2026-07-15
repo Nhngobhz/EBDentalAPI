@@ -128,8 +128,12 @@ class Product(Base):
     id = Column(Integer, primary_key=True, index=True)
     product_name = Column(String(200), nullable=False, index=True)
     description = Column(Text, nullable=True)
-    old_price = Column(Numeric(10, 2), nullable=True)
     price = Column(Numeric(10, 2), nullable=False)
+
+    # Free-form discount label shown alongside price, e.g. "10%" or "5$" -
+    # replaces a separate old_price column (see ProductBase.discount for the
+    # format validation). Not a value derived from anything else stored.
+    discount = Column(String(20), nullable=True)
 
     # Changed from a raw `brand_name` string to a foreign key. See README:
     # "Product.brand_name -> brand_id".

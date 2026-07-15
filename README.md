@@ -43,10 +43,12 @@ CRUD → file upload → error handling), not just written from memory - see
    with `access_permission=False`; only a `customer_management` staff
    member flipping it (via `PUT /customers/{id}`) unlocks prices for them.
    Concretely: `GET /products` and `GET /products/{id}` mask `price` as
-   the literal string `"XXXX"`, and omit `old_price` entirely (`null`),
+   the literal string `"XXXX"`, and omit `discount` entirely (`null`),
    for anyone who isn't (a) an active staff user or (b) a customer with
    `access_permission=True` - see `get_price_visibility` in
-   `app/core/deps.py`. Customer records
+   `app/core/deps.py`. `GET /promotions` and `GET /promotions/{id}` apply
+   the exact same masking to `price`/`old_price` (Promotion keeps its own
+   separate `old_price` column - see point 11). Customer records
    created directly by staff (`POST /customers/`) still have no password
    and can't log in - only self-registration sets one. Both principals
    share the JWT scheme but carry a `"type": "user"` / `"type":
@@ -69,7 +71,7 @@ CRUD → file upload → error handling), not just written from memory - see
    - `user_management` → manage User accounts (create/edit/permissions/deactivate)
    - `customer_management` → manage Customers
    - `product_management` → manage Brands, Categories, Products (non-price fields), Manuals
-   - `price_listing` → change `price`/`old_price` on Products, and full CRUD on Promotions
+   - `price_listing` → change `price`/`discount` on Products, and full CRUD on Promotions
    - Editing a product's price specifically requires **both**
      `product_management` AND `price_listing` via the general update
      endpoint, OR just `price_listing` via the dedicated
@@ -116,6 +118,16 @@ CRUD → file upload → error handling), not just written from memory - see
     in this schema) so adding a third value later (e.g. `"bundle"`) is a
     one-line change to `ProductType` in `app/schemas.py`, not a migration.
     `GET /products` accepts `?product_type=combo` to filter on it.
+
+11. **`Product.old_price` → `discount`.** Rather than storing a second
+    absolute price to derive a markdown from, `Product` stores `price`
+    (the real price) plus a free-form `discount` label - either a
+    percentage (`"10%"`) or a flat amount off (`"5$"`), validated against
+    that exact shape in `app/schemas.py`. `discount` follows the same
+    permission/masking rules `old_price` had (`price_listing` to change
+    it, hidden alongside `price` for viewers without price access).
+    Promotion's own `price`/`old_price` pair is unchanged - it's a
+    separate, unrelated feature.
 
 ---
 
@@ -265,7 +277,7 @@ auth flows), see [`AI_AGENT_GUIDE.md`](AI_AGENT_GUIDE.md). Summary:
 | `GET/PUT /customers/me` | Any logged-in customer | Self profile. Same email re-verification behavior as `/users/me` |
 | `POST /customers/me/change-password` | Any logged-in customer | Requires `current_password` + `new_password` (only works for self-registered customers, i.e. ones with a password) |
 | `GET/POST/PUT/DELETE /customers/...` | `customer_management` | Staff-side customer management, incl. toggling `access_permission` |
-| `GET /brands`, `/categories`, `/products`, `/manuals`, `/promotions` | **Public** | Catalog browsing. `products` `price` is masked as `"XXXX"` and `old_price` is omitted (`null`) unless the caller is staff or a customer with `access_permission=True`. `GET /products` also accepts `category_id` and `product_type` filters |
+| `GET /brands`, `/categories`, `/products`, `/manuals`, `/promotions` | **Public** | Catalog browsing. `products` `price` is masked as `"XXXX"` and `discount` is omitted (`null`) unless the caller is staff or a customer with `access_permission=True`. `GET /products` also accepts `category_id` and `product_type` filters |
 | `POST /brands/`, `POST /categories/` | `product_management` | `multipart/form-data`: `brand_name`/`category_name` plus an optional `file` to set the image in the same request |
 | `POST /manuals/` | `product_management` | `multipart/form-data`: `product_id`, optional `description`, plus an optional `file` to set the PDF in the same request |
 | `PUT/DELETE /brands/...`, `PUT/DELETE /categories/...`, `PUT/DELETE /manuals/...` | `product_management` | Deleting a `Category` that still has `Product`s assigned is rejected (400), same as `Brand` |
@@ -298,4 +310,3 @@ validation, file upload validation, and the global error handler.
 - Rate limiting / lockout on repeated failed logins
 - Cloud storage (S3/GCS) instead of local disk for uploads
 - Row-level/territory-based access instead of global permissions
-- Promotion prices are NOT masked by `access_permission` - only `Product.price`/`old_price` are, per the assumption above. Ask if promotions should follow the same rule.

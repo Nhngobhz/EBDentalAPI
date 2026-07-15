@@ -13,10 +13,16 @@ email, ...) and skipped if it already exists, so this won't create
 duplicates on a second run.
 
 Seeded login credentials (dev only - never use these in production):
-    admin@store.local        / Admin@12345       (all 4 permissions)
-    staff@store.local        / Staff@12345        (price_listing + product_management)
-    customer@store.local     / Customer@12345     (access_permission=False, sees no prices)
-    vip.customer@store.local / VipCustomer@12345  (access_permission=True, sees prices)
+    admin@store.dev        / Admin@12345       (all 4 permissions)
+    staff@store.dev        / Staff@12345        (price_listing + product_management)
+    customer@store.dev     / Customer@12345     (access_permission=False, sees no prices)
+    vip.customer@store.dev / VipCustomer@12345  (access_permission=True, sees prices)
+
+    NOTE: ".local" was originally used here but is rejected by pydantic's
+    EmailStr (email-validator treats it as a reserved special-use TLD, see
+    RFC 6762) - that only shows up once you try to actually log in with a
+    seeded account, not in the test suite (which uses .example.com
+    addresses), so ".dev" is used instead.
 """
 from datetime import datetime, timedelta, timezone
 
@@ -182,7 +188,7 @@ CATEGORIES = list(dict.fromkeys(item["category"] for item in PRODUCTS if item.ge
 USERS = [
     {
         "user_name": "Admin User",
-        "email": "admin@store.local",
+        "email": "admin@store.dev",
         "password": "Admin@12345",
         "role_title": "Admin",
         "user_management": True,
@@ -192,7 +198,7 @@ USERS = [
     },
     {
         "user_name": "Staff User",
-        "email": "staff@store.local",
+        "email": "staff@store.dev",
         "password": "Staff@12345",
         "role_title": "Staff",
         "user_management": False,
@@ -205,13 +211,13 @@ USERS = [
 CUSTOMERS = [
     {
         "customer_name": "Sample Customer",
-        "email": "customer@store.local",
+        "email": "customer@store.dev",
         "password": "Customer@12345",
         "access_permission": False,
     },
     {
         "customer_name": "VIP Customer",
-        "email": "vip.customer@store.local",
+        "email": "vip.customer@store.dev",
         "password": "VipCustomer@12345",
         "access_permission": True,
     },
@@ -268,6 +274,16 @@ def seed_categories(db) -> dict[str, Category]:
     return category_by_name
 
 
+def _discount_label(price: float, new_price: float | None) -> str | None:
+    """new_price (the pre-discount figure) minus price, as a "$" amount -
+    matches the Product.discount format ("X%" or "XX$")."""
+    if new_price is None or new_price <= price:
+        return None
+    off = round(new_price - price, 2)
+    off = int(off) if off == int(off) else off
+    return f"{off}$"
+
+
 def seed_products(db, brand_by_name: dict[str, Brand], category_by_name: dict[str, Category]) -> None:
     brands_by_position = [brand_by_name[name] for name in BRANDS]
 
@@ -283,7 +299,7 @@ def seed_products(db, brand_by_name: dict[str, Brand], category_by_name: dict[st
             product_name=item["product_name"],
             description=item.get("description"),
             price=item["price"],
-            old_price=item.get("new_price"),
+            discount=_discount_label(item["price"], item.get("new_price")),
             brand_id=brands_by_position[item["brand_id"] - 1].id,
             category_id=category.id if category else None,
             badge=item.get("badge"),

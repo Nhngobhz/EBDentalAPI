@@ -113,7 +113,7 @@ def get_verified_customer(current_customer: Customer = Depends(get_current_custo
 def get_price_visibility(
     token: str | None = Depends(_optional_oauth2_scheme), db: Session = Depends(get_db)
 ) -> bool:
-    """Whether the caller may see real product price/old_price values:
+    """Whether the caller may see real product price/discount values:
     any active staff user, or a customer with access_permission=True.
     Anonymous callers and customers without access_permission get masked
     prices - see ProductOut and app.routers.products._serialize_product.

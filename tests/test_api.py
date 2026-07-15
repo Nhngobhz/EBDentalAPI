@@ -229,7 +229,7 @@ def test_full_catalog_crud_and_public_reads(client, db_session):
             "product_name": "Rocket Skates",
             "description": "Fast.",
             "price": "199.99",
-            "old_price": "249.99",
+            "discount": "20%",
             "brand_id": brand_id,
             "category_id": category_id,
             "badge": "New",
@@ -566,7 +566,7 @@ def test_product_price_masked_until_access_permission_granted(client, db_session
         json={
             "product_name": "Locked Widget",
             "price": "42.00",
-            "old_price": "50.00",
+            "discount": "8$",
             "brand_id": brand_id,
         },
         headers=admin_headers,
@@ -575,16 +575,16 @@ def test_product_price_masked_until_access_permission_granted(client, db_session
 
     # Staff (mutation response) sees the real price
     assert product["price"] == "42.00"
-    assert product["old_price"] == "50.00"
+    assert product["discount"] == "8$"
 
-    # Anonymous callers get a masked price and no old_price at all
+    # Anonymous callers get a masked price and no discount at all
     anon_list = client.get("/products/").json()
     assert anon_list[0]["price"] == "XXXX"
-    assert anon_list[0]["old_price"] is None
+    assert anon_list[0]["discount"] is None
 
     anon_detail = client.get(f"/products/{product_id}").json()
     assert anon_detail["price"] == "XXXX"
-    assert anon_detail["old_price"] is None
+    assert anon_detail["discount"] is None
 
     # An authenticated staff user browsing the public catalog sees real prices
     staff_view = client.get("/products/", headers=admin_headers).json()
@@ -595,7 +595,7 @@ def test_product_price_masked_until_access_permission_granted(client, db_session
     customer_headers = customer_auth_header(client, "locked@example.com", "password123")
     resp = client.get("/products/", headers=customer_headers).json()
     assert resp[0]["price"] == "XXXX"
-    assert resp[0]["old_price"] is None
+    assert resp[0]["discount"] is None
 
     # Staff grants access_permission
     grant_resp = client.put(
@@ -608,7 +608,7 @@ def test_product_price_masked_until_access_permission_granted(client, db_session
     # now sees the real price
     resp = client.get("/products/", headers=customer_headers).json()
     assert resp[0]["price"] == "42.00"
-    assert resp[0]["old_price"] == "50.00"
+    assert resp[0]["discount"] == "8$"
 
     resp = client.get(f"/products/{product_id}", headers=customer_headers).json()
     assert resp["price"] == "42.00"
