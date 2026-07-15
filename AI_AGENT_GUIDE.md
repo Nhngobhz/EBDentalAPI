@@ -134,14 +134,14 @@ row, checked directly:
 | `user_management` | Create/edit/deactivate staff (`User`) accounts, view the staff list |
 | `customer_management` | Full CRUD on `Customer` records, including toggling `access_permission` |
 | `product_management` | CRUD on `Brand`, `Category`, `Product` (non-price fields), `Manual` |
-| `price_listing` | Set `price`/`old_price` on `Product`, full CRUD on `Promotion` |
+| `price_listing` | Set `price`/`discount` on `Product`, full CRUD on `Promotion` |
 
 Notes an agent should know before assuming a 403 is a bug:
 
 - These flags are **independent**, not a hierarchy - `user_management`
   does not imply the other three. A user with all four `true` is a
   de-facto super-admin; there is no separate `is_superuser` flag.
-- Changing an **existing** product's `price`/`old_price` via the general
+- Changing an **existing** product's `price`/`discount` via the general
   `PUT /products/{id}` requires **both** `product_management` AND
   `price_listing`. A caller with only `price_listing` must instead use
   `PATCH /products/{id}/price`.
@@ -199,7 +199,7 @@ it:
 - **Not entitled** (anonymous, unverified, or `access_permission: false`
   customer): `price` comes back as the **literal string `"XXXX"`** (not
   `null`, not omitted - a string in a field that's normally a number), and
-  `old_price` is omitted entirely (`null`), so an unauthorized viewer
+  `discount` is omitted entirely (`null`), so an unauthorized viewer
   can't even infer a discount exists.
 
 Implication for an agent: **do not treat `"XXXX"` as a parse error or a
@@ -335,9 +335,9 @@ record only.
 |---|---|---|
 | `GET /products/` | Public | query `skip`, `limit`, `brand_id`, `category_id`, `product_type` (`"single"`/`"combo"`), `q` (name substring); price masking applies, see section 4 |
 | `GET /products/{id}` | Public | same masking |
-| `POST /products/` | `product_management` | JSON `ProductCreate` (`product_name`, `description?`, `badge?`, `product_type?` - `"single"`/`"combo"`, defaults `"single"` -, `price` >0, `old_price?` >0, `brand_id` - must reference an existing brand or `400`, `category_id?` - must reference an existing category or `400`) |
-| `PUT /products/{id}` | `product_management`, **+`price_listing` if the body includes `price` or `old_price`** | JSON `ProductUpdate`, all fields optional |
-| `PATCH /products/{id}/price` | `price_listing` only | JSON `{"price"?, "old_price"?}` - use this instead of `PUT` if the caller only has `price_listing` |
+| `POST /products/` | `product_management` | JSON `ProductCreate` (`product_name`, `description?`, `badge?`, `product_type?` - `"single"`/`"combo"`, defaults `"single"` -, `product_code?` (SKU, must be globally unique or `400`), `uom?` (unit of measure, free text e.g. `"pcs"`/`"box"`), `price` >0, `discount?` (integer percent, `0`-`100`, defaults `0`), `brand_id` - must reference an existing brand or `400`, `category_id?` - must reference an existing category or `400`) |
+| `PUT /products/{id}` | `product_management`, **+`price_listing` if the body includes `price` or `discount`** | JSON `ProductUpdate`, all fields optional |
+| `PATCH /products/{id}/price` | `price_listing` only | JSON `{"price"?, "discount"?}` - use this instead of `PUT` if the caller only has `price_listing` |
 | `POST /products/{id}/image` | `product_management` | multipart `file` |
 | `DELETE /products/{id}` | `product_management` | cascades: deletes the product's `Manual`s too |
 
@@ -382,8 +382,10 @@ literal string `"XXXX"` and `old_price` as `null`; see section 4.
   reserved test TLDs (`.test`, `.example`, `.invalid`, `.localhost`) are
   **rejected** by the validator. Use a realistic-looking domain even for
   throwaway test data.
-- `price` / `old_price` on `Product` and `Promotion`: must be `> 0` (not
-  `>= 0`) wherever settable - a free/zero-price item isn't representable.
+- `price` on `Product` and `Promotion`, and `Promotion.old_price`: must be
+  `> 0` (not `>= 0`) wherever settable - a free/zero-price item isn't
+  representable. `Product.discount` is a `0`-`100` integer percent instead,
+  not a price.
 - `Promotion.end_date` must be strictly after `start_date`, enforced both
   in the schema (on create) and again in the router (on update, against
   whichever of the two values ends up in effect).

@@ -121,13 +121,27 @@ CRUD → file upload → error handling), not just written from memory - see
 
 11. **`Product.old_price` → `discount`.** Rather than storing a second
     absolute price to derive a markdown from, `Product` stores `price`
-    (the real price) plus a free-form `discount` label - either a
-    percentage (`"10%"`) or a flat amount off (`"5$"`), validated against
-    that exact shape in `app/schemas.py`. `discount` follows the same
-    permission/masking rules `old_price` had (`price_listing` to change
-    it, hidden alongside `price` for viewers without price access).
-    Promotion's own `price`/`old_price` pair is unchanged - it's a
-    separate, unrelated feature.
+    (the real price) plus a `discount` percentage (integer `0`-`100`,
+    defaults to `0`), validated as a numeric range in `app/schemas.py`.
+    `discount` follows the same permission/masking rules `old_price` had
+    (`price_listing` to change it, hidden alongside `price` for viewers
+    without price access). Promotion's own `price`/`old_price` pair is
+    unchanged - it's a separate, unrelated feature.
+
+12. **`Product.product_code` / `Product.uom`** (added on request): 
+    `product_code` is the product's SKU, `String(50)`, **unique** once set
+    (same nullable+unique shape as `reset_token`/`verification_token`
+    elsewhere in this schema - any number of `null`s are allowed through a
+    unique index, but two products can't share a code). Creating or
+    updating a product with a `product_code` already in use gets a `400`
+    (`"product_code already in use"`), checked in `app/routers/products.py`
+    before the insert/update rather than left to surface as a raw
+    constraint-violation `500`. `uom` (unit of measure - e.g. `"pcs"`,
+    `"box"`, `"set"`) is free text, `String(20)`, no fixed vocabulary
+    since none was specified. Both are optional (`null` allowed) since all
+    existing products predate the fields, same reasoning as `category_id`.
+    Neither is masked for price visibility (see point 2) since neither is
+    pricing data.
 
 ---
 

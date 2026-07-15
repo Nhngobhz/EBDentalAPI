@@ -274,14 +274,12 @@ def seed_categories(db) -> dict[str, Category]:
     return category_by_name
 
 
-def _discount_label(price: float, new_price: float | None) -> str | None:
-    """new_price (the pre-discount figure) minus price, as a "$" amount -
-    matches the Product.discount format ("X%" or "XX$")."""
+def _discount_percent(price: float, new_price: float | None) -> int:
+    """new_price (the pre-discount figure) vs. price, as a percentage off -
+    matches the Product.discount format (integer 0-100)."""
     if new_price is None or new_price <= price:
-        return None
-    off = round(new_price - price, 2)
-    off = int(off) if off == int(off) else off
-    return f"{off}$"
+        return 0
+    return round((new_price - price) / new_price * 100)
 
 
 def seed_products(db, brand_by_name: dict[str, Brand], category_by_name: dict[str, Category]) -> None:
@@ -299,7 +297,7 @@ def seed_products(db, brand_by_name: dict[str, Brand], category_by_name: dict[st
             product_name=item["product_name"],
             description=item.get("description"),
             price=item["price"],
-            discount=_discount_label(item["price"], item.get("new_price")),
+            discount=_discount_percent(item["price"], item.get("new_price")),
             brand_id=brands_by_position[item["brand_id"] - 1].id,
             category_id=category.id if category else None,
             badge=item.get("badge"),

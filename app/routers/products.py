@@ -84,6 +84,8 @@ def create_product(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="brand_id does not exist")
     if payload.category_id is not None and not db.query(Category).filter(Category.id == payload.category_id).first():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="category_id does not exist")
+    if payload.product_code and db.query(Product).filter(Product.product_code == payload.product_code).first():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="product_code already in use")
 
     product = Product(**payload.model_dump())
     db.add(product)
@@ -128,6 +130,13 @@ def update_product(
         and not db.query(Category).filter(Category.id == data["category_id"]).first()
     ):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="category_id does not exist")
+    if (
+        data.get("product_code")
+        and db.query(Product)
+        .filter(Product.product_code == data["product_code"], Product.id != product_id)
+        .first()
+    ):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="product_code already in use")
 
     for field, value in data.items():
         setattr(product, field, value)

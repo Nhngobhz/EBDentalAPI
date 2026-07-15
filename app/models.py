@@ -130,10 +130,10 @@ class Product(Base):
     description = Column(Text, nullable=True)
     price = Column(Numeric(10, 2), nullable=False)
 
-    # Free-form discount label shown alongside price, e.g. "10%" or "5$" -
-    # replaces a separate old_price column (see ProductBase.discount for the
-    # format validation). Not a value derived from anything else stored.
-    discount = Column(String(20), nullable=True)
+    # Percentage off price, 0-100 - replaces a separate old_price column
+    # (see ProductBase.discount for the range validation). Not a value
+    # derived from anything else stored.
+    discount = Column(Integer, nullable=False, server_default="0")
 
     # Changed from a raw `brand_name` string to a foreign key. See README:
     # "Product.brand_name -> brand_id".
@@ -150,6 +150,16 @@ class Product(Base):
     # elsewhere in this schema) so new values don't need a migration -
     # allowed values are validated in ProductBase.product_type instead.
     product_type = Column(String(20), nullable=False, server_default="single", index=True)
+
+    # SKU / manufacturer code. Unique once set (see products.py router for
+    # the pre-insert/update duplicate check - the DB constraint alone would
+    # otherwise surface as a raw 500), but nullable since existing products
+    # predate this field and not all of them have a code assigned yet.
+    product_code = Column(String(50), unique=True, nullable=True, index=True)
+
+    # Unit of measure the product is sold/counted in (e.g. "pcs", "box",
+    # "set"). Free text like badge - no fixed vocabulary requested.
+    uom = Column(String(20), nullable=True)
 
     badge = Column(String(50), nullable=True)
     product_image = Column(String(500), nullable=True)

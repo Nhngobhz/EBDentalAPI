@@ -229,7 +229,7 @@ def test_full_catalog_crud_and_public_reads(client, db_session):
             "product_name": "Rocket Skates",
             "description": "Fast.",
             "price": "199.99",
-            "discount": "20%",
+            "discount": 20,
             "brand_id": brand_id,
             "category_id": category_id,
             "badge": "New",
@@ -566,7 +566,7 @@ def test_product_price_masked_until_access_permission_granted(client, db_session
         json={
             "product_name": "Locked Widget",
             "price": "42.00",
-            "discount": "8$",
+            "discount": 8,
             "brand_id": brand_id,
         },
         headers=admin_headers,
@@ -575,7 +575,7 @@ def test_product_price_masked_until_access_permission_granted(client, db_session
 
     # Staff (mutation response) sees the real price
     assert product["price"] == "42.00"
-    assert product["discount"] == "8$"
+    assert product["discount"] == 8
 
     # Anonymous callers get a masked price and no discount at all
     anon_list = client.get("/products/").json()
@@ -608,7 +608,7 @@ def test_product_price_masked_until_access_permission_granted(client, db_session
     # now sees the real price
     resp = client.get("/products/", headers=customer_headers).json()
     assert resp[0]["price"] == "42.00"
-    assert resp[0]["discount"] == "8$"
+    assert resp[0]["discount"] == 8
 
     resp = client.get(f"/products/{product_id}", headers=customer_headers).json()
     assert resp["price"] == "42.00"

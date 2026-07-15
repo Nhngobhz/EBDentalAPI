@@ -6,7 +6,6 @@ Naming convention used throughout:
   *Update        -> payload to update an existing record (all fields optional)
   *Out           -> what gets returned to the client
 """
-import re
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Literal, Optional, Union
@@ -234,32 +233,20 @@ class CategoryMini(BaseModel):
 # migration - see Product.product_type in app/models.py.
 ProductType = Literal["single", "combo"]
 
-# discount is a free-form label, not a number, so it's checked against this
-# pattern instead of a numeric Field constraint - "10%" or "5$" only, no
-# other units.
-_DISCOUNT_PATTERN = re.compile(r"^\d+(\.\d+)?(%|\$)$")
-
-
-def _check_discount_format(value: Optional[str]) -> Optional[str]:
-    if value is not None and not _DISCOUNT_PATTERN.fullmatch(value):
-        raise ValueError('discount must look like "10%" or "10$"')
-    return value
-
-
 class ProductBase(BaseModel):
     product_name: str = Field(..., min_length=1, max_length=200)
     description: Optional[str] = None
     badge: Optional[str] = Field(None, max_length=50)
     product_type: ProductType = "single"
+    product_code: Optional[str] = Field(None, max_length=50)
+    uom: Optional[str] = Field(None, max_length=20)
 
 
 class ProductCreate(ProductBase):
     price: Decimal = Field(..., gt=0)
-    discount: Optional[str] = Field(None, max_length=20)
+    discount: int = Field(0, ge=0, le=100)
     brand_id: int
     category_id: Optional[int] = None
-
-    _validate_discount = field_validator("discount")(_check_discount_format)
 
 
 class ProductUpdate(BaseModel):
@@ -267,6 +254,8 @@ class ProductUpdate(BaseModel):
     description: Optional[str] = None
     badge: Optional[str] = Field(None, max_length=50)
     product_type: Optional[ProductType] = None
+    product_code: Optional[str] = Field(None, max_length=50)
+    uom: Optional[str] = Field(None, max_length=20)
     brand_id: Optional[int] = None
     category_id: Optional[int] = None
     # Present here so a product_management holder *can* still create a
@@ -274,16 +263,12 @@ class ProductUpdate(BaseModel):
     # product additionally requires the price_listing permission - enforced
     # in the router, not here.
     price: Optional[Decimal] = Field(None, gt=0)
-    discount: Optional[str] = Field(None, max_length=20)
-
-    _validate_discount = field_validator("discount")(_check_discount_format)
+    discount: Optional[int] = Field(None, ge=0, le=100)
 
 
 class ProductPriceUpdate(BaseModel):
     price: Optional[Decimal] = Field(None, gt=0)
-    discount: Optional[str] = Field(None, max_length=20)
-
-    _validate_discount = field_validator("discount")(_check_discount_format)
+    discount: Optional[int] = Field(None, ge=0, le=100)
 
 
 class ProductOut(ProductBase):
@@ -294,7 +279,7 @@ class ProductOut(ProductBase):
     price: Union[Decimal, str]
     # Masked to None for the same viewers, same reasoning as price - see
     # app.routers.products._serialize_product.
-    discount: Optional[str] = None
+    discount: Optional[int] = None
     product_image: Optional[str] = None
     brand: Optional[BrandMini] = None
     category: Optional[CategoryMini] = None

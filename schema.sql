@@ -6,7 +6,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict UFhKC6dX8lLcJuHd3600mRfqXdRUbT8JndDsQ5V3kLbc9jsohXPGwn0YxbKLOHv
+\restrict gmTQZX5CBHW2ueHrrnG8TWyzAx4Ibt9T5A9XxuG82vbLD6jIeFSYWa4o4ttGWz3
 
 -- Dumped from database version 16.14
 -- Dumped by pg_dump version 16.14
@@ -185,14 +185,16 @@ CREATE TABLE public.products (
     id integer NOT NULL,
     product_name character varying(200) NOT NULL,
     description text,
-    old_price numeric(10,2),
     price numeric(10,2) NOT NULL,
     brand_id integer NOT NULL,
     badge character varying(50),
     product_image character varying(500),
     created_at timestamp with time zone DEFAULT now(),
     category_id integer,
-    product_type character varying(20) DEFAULT 'single'::character varying NOT NULL
+    product_type character varying(20) DEFAULT 'single'::character varying NOT NULL,
+    discount integer DEFAULT 0 NOT NULL,
+    product_code character varying(50),
+    uom character varying(20)
 );
 
 
@@ -498,6 +500,13 @@ CREATE INDEX ix_products_id ON public.products USING btree (id);
 
 
 --
+-- Name: ix_products_product_code; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ix_products_product_code ON public.products USING btree (product_code);
+
+
+--
 -- Name: ix_products_product_name; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -581,5 +590,5 @@ ALTER TABLE ONLY public.products
 -- PostgreSQL database dump complete
 --
 
-\unrestrict UFhKC6dX8lLcJuHd3600mRfqXdRUbT8JndDsQ5V3kLbc9jsohXPGwn0YxbKLOHv
+\unrestrict gmTQZX5CBHW2ueHrrnG8TWyzAx4Ibt9T5A9XxuG82vbLD6jIeFSYWa4o4ttGWz3
 
