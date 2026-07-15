@@ -36,15 +36,15 @@ class TelegramErrorHandler(logging.Handler):
         try:
             url = _TELEGRAM_URL.format(token=settings.TELEGRAM_BOT_TOKEN)
             text = f"\U0001F6A8 <b>{level}</b>\n<pre>{message[:3500]}</pre>"
+            payload = {
+                "chat_id": settings.TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+            }
+            if settings.TELEGRAM_ERROR_TOPIC_ID:
+                payload["message_thread_id"] = int(settings.TELEGRAM_ERROR_TOPIC_ID)
             with httpx.Client(timeout=5) as client:
-                client.post(
-                    url,
-                    json={
-                        "chat_id": settings.TELEGRAM_CHAT_ID,
-                        "text": text,
-                        "parse_mode": "HTML",
-                    },
-                )
+                client.post(url, json=payload)
         except Exception:
             # A broken notification must never take down the app.
             pass
