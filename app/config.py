@@ -68,6 +68,33 @@ class Settings(BaseSettings):
     MAX_IMAGE_SIZE_MB: int = 5
     MAX_PDF_SIZE_MB: int = 20
 
+    # --- File storage (Cloudflare R2) ---------------------------------------
+    # Leave R2_ACCESS_KEY_ID empty to run in "local disk" mode: uploads are
+    # written under UPLOAD_DIR and served via the /static mount instead of
+    # R2. Useful for local development without R2 credentials, the same way
+    # MAIL_USERNAME being empty puts outbound email in dry-run mode.
+    R2_ACCOUNT_ID: str = ""
+    R2_ACCESS_KEY_ID: str = ""
+    R2_SECRET_ACCESS_KEY: str = ""
+    R2_BUCKET_NAME: str = ""
+    # Public URL uploads are served from, e.g. https://pub-xxxx.r2.dev or a
+    # custom domain mapped to the bucket. No trailing slash.
+    R2_PUBLIC_BASE_URL: str = ""
+
+    @property
+    def r2_configured(self) -> bool:
+        return bool(
+            self.R2_ACCOUNT_ID
+            and self.R2_ACCESS_KEY_ID
+            and self.R2_SECRET_ACCESS_KEY
+            and self.R2_BUCKET_NAME
+            and self.R2_PUBLIC_BASE_URL
+        )
+
+    @property
+    def r2_endpoint_url(self) -> str:
+        return f"https://{self.R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )

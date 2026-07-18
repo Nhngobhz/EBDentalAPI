@@ -1,13 +1,15 @@
 """
 Shared helper for handling image/PDF uploads.
 
-Every *_image / pdf field in the schema is stored as a plain string (a
-path such as /static/uploads/products/<uuid>.jpg). You can either:
+Every *_image / pdf field in the schema is stored as a plain string - a
+Cloudflare R2 URL such as https://pub-xxxx.r2.dev/products/<uuid>.jpg (or a
+local /static/uploads/... path when R2 isn't configured, see
+app/core/storage.py). You can either:
   (a) PUT/POST the JSON field directly with a URL you already host
       elsewhere, or
   (b) use the dedicated `POST .../{id}/image` (or `/pdf`) upload endpoint,
-      which saves the file locally under static/uploads/<category>/ and
-      stores the resulting path for you.
+      which uploads the file to storage under <category>/ and stores the
+      resulting URL/path for you.
 """
 import io
 import os
@@ -18,6 +20,7 @@ from fastapi import HTTPException, UploadFile, status
 from PIL import Image, UnidentifiedImageError
 
 from app.config import settings
+from app.core.storage import save_object
 
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 ALLOWED_PDF_TYPES = {"application/pdf"}
@@ -52,17 +55,9 @@ async def save_upload(
 
     ext = os.path.splitext(file.filename or "")[1].lower() or ".bin"
     filename = f"{uuid.uuid4().hex}{ext}"
+    key = f"{category}/{filename}"
 
-    directory = os.path.join(settings.UPLOAD_DIR, category)
-    os.makedirs(directory, exist_ok=True)
-    full_path = os.path.join(directory, filename)
-
-    with open(full_path, "wb") as f:
-        f.write(contents)
-
-    # Stored/returned as a web-servable path (see static mount in main.py) -
-    # always forward slashes, regardless of the OS path separator used above.
-    return "/" + full_path.replace(os.sep, "/")
+    return save_object(key, contents, file.content_type)
 
 
 async def save_image(file: UploadFile, category: str) -> str:
@@ -105,14 +100,12 @@ async def save_named_image(file: UploadFile, category: str, name: str) -> str:
 
     safe_name = _UNSAFE_FILENAME_CHARS.sub("-", name).strip() or "untitled"
     filename = f"{safe_name} image.JPEG"
+    key = f"{category}/{filename}"
 
-    directory = os.path.join(settings.UPLOAD_DIR, category)
-    os.makedirs(directory, exist_ok=True)
-    full_path = os.path.join(directory, filename)
+    buffer = io.BytesIO()
+    image.save(buffer, "JPEG", quality=IMAGE_JPEG_QUALITY, optimize=True)
 
-    image.save(full_path, "JPEG", quality=IMAGE_JPEG_QUALITY, optimize=True)
-
-    return "/" + full_path.replace(os.sep, "/")
+    return save_object(key, buffer.getvalue(), "image/jpeg")
 
 
 async def save_pdf(file: UploadFile, category: str) -> str:

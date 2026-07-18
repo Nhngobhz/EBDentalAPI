@@ -186,6 +186,14 @@ PDFs must be `application/pdf` and ≤20MB. A rejected upload returns `400`
 with the reason in `detail`, not a generic validation error - check the
 file's actual `Content-Type` header if this happens unexpectedly.
 
+Uploaded files are stored in Cloudflare R2 (`app/core/storage.py`); the
+`*_image`/`pdf` fields returned in responses are full `https://` URLs
+pointing at the R2 bucket's public domain. If R2 isn't configured (no
+`R2_ACCESS_KEY_ID` set, e.g. in local dev), uploads fall back to local disk
+under `static/uploads/<category>/` and are returned as `/static/...` paths
+instead - either way, treat the field as an opaque URL/path to display or
+link to, not something to construct yourself.
+
 ---
 
 ## 4. Product price masking - read before querying `/products`
