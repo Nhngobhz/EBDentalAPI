@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.core.deps import require_permission
 from app.core.files import save_image, save_pdf
+from app.core.query import OptionalInt
 from app.database import get_db
 from app.models import Manual, Product, User
 from app.schemas import ManualOut, ManualUpdate
@@ -30,7 +31,7 @@ def _get_manual_or_404(db: Session, manual_id: int) -> Manual:
 def list_manuals(
     skip: int = 0,
     limit: int = 50,
-    product_id: int | None = None,
+    product_id: OptionalInt = None,
     db: Session = Depends(get_db),
 ):
     """Public: support documentation should be reachable without an account."""

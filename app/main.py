@@ -16,6 +16,7 @@ from app.routers import (
     customer_auth,
     customers,
     manuals,
+    orders,
     products,
     promotions,
     users,
@@ -71,6 +72,7 @@ app.include_router(categories.router)
 app.include_router(products.router)
 app.include_router(manuals.router)
 app.include_router(promotions.router)
+app.include_router(orders.router)
 
 
 @app.get("/health", tags=["Health"])

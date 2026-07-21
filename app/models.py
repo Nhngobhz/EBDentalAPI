@@ -197,4 +197,72 @@ class Promotion(Base):
     old_price = Column(Numeric(10, 2), nullable=True)  # fixed: old-price -> old_price
     start_date = Column(DateTime(timezone=True), nullable=False)
     end_date = Column(DateTime(timezone=True), nullable=False)
+    promotion_image = Column(String(500), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class Order(Base):
+    """A finalized storefront quote (see partials/quote_drawer.html on the frontend).
+    Created only through the order-creation endpoint, which snapshots each line item's
+    product data server-side - never from client-submitted prices (see OrderItem)."""
+
+    __tablename__ = "orders"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_number = Column(String(20), unique=True, nullable=False, index=True)
+
+    # Nullable: an order may belong to a registered Customer, be recorded by a staff
+    # member on a walk-in clinic's behalf with no account, or both.
+    customer_id = Column(Integer, ForeignKey("customers.id", ondelete="SET NULL"), nullable=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
+    # Free-text snapshot of the quote drawer's info form - describes a specific
+    # clinic/contact at a point in time, not a live-linked record (same reasoning as
+    # badge/role_title being free text elsewhere in this schema).
+    clinic_name = Column(String(200), nullable=True)
+    contact_person = Column(String(150), nullable=True)
+    phone = Column(String(30), nullable=True)
+    address = Column(String(255), nullable=True)
+    payment_term = Column(String(100), nullable=True)
+    salesperson = Column(String(150), nullable=True)
+    install_term = Column(String(150), nullable=True)
+
+    cash_discount = Column(Numeric(10, 2), nullable=False, server_default="0")
+    subtotal = Column(Numeric(10, 2), nullable=False)
+    grand_total = Column(Numeric(10, 2), nullable=False)
+
+    # Free text, same pattern as Product.badge/User.role_title - no fixed workflow was
+    # requested. Defaults to "pending"; staff can update it via PUT /orders/{id}.
+    status = Column(String(30), nullable=False, server_default="pending")
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    customer = relationship("Customer")
+    created_by = relationship("User")
+    items = relationship(
+        "OrderItem", back_populates="order", cascade="all, delete-orphan", order_by="OrderItem.id"
+    )
+
+
+class OrderItem(Base):
+    __tablename__ = "order_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("orders.id", ondelete="CASCADE"), nullable=False)
+
+    # SET NULL (not RESTRICT): deleting a product must never block or corrupt historical
+    # orders - the snapshot fields below are what actually matters once an order exists.
+    product_id = Column(Integer, ForeignKey("products.id", ondelete="SET NULL"), nullable=True)
+
+    # Snapshotted at order-creation time from the Product row - never re-derived later,
+    # so a historical order stays accurate even if the product's price/name/code changes
+    # or the product itself is deleted.
+    product_name = Column(String(200), nullable=False)
+    product_code = Column(String(50), nullable=True)
+    uom = Column(String(20), nullable=True)
+    unit_price = Column(Numeric(10, 2), nullable=False)
+    discount = Column(Integer, nullable=False, server_default="0")
+    qty = Column(Integer, nullable=False)
+    line_amount = Column(Numeric(10, 2), nullable=False)
+
+    order = relationship("Order", back_populates="items")

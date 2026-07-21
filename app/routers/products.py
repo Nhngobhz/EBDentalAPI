@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.core.deps import get_price_visibility, get_verified_user, require_permission
 from app.core.files import save_named_image
+from app.core.query import OptionalInt
 from app.database import get_db
 from app.models import Brand, Category, Product, User
 from app.schemas import ProductCreate, ProductOut, ProductPriceUpdate, ProductUpdate
@@ -43,8 +44,8 @@ def _serialize_product(product: Product, can_view_price: bool) -> dict:
 def list_products(
     skip: int = 0,
     limit: int = 50,
-    brand_id: int | None = None,
-    category_id: int | None = None,
+    brand_id: OptionalInt = None,
+    category_id: OptionalInt = None,
     product_type: str | None = None,
     q: str | None = None,
     can_view_price: bool = Depends(get_price_visibility),

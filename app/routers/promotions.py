@@ -1,9 +1,10 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_price_visibility, require_permission
+from app.core.files import save_named_image
 from app.database import get_db
 from app.models import Promotion, User
 from app.schemas import PromotionCreate, PromotionOut, PromotionUpdate
@@ -86,6 +87,19 @@ def update_promotion(
 
     for field, value in data.items():
         setattr(promotion, field, value)
+    db.commit()
+    db.refresh(promotion)
+    return promotion
+
+
+@router.post("/{promotion_id}/image", response_model=PromotionOut)
+async def upload_promotion_image(
+    promotion_id: int, file: UploadFile, _: User = _perm, db: Session = Depends(get_db)
+):
+    promotion = db.query(Promotion).filter(Promotion.id == promotion_id).first()
+    if not promotion:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Promotion not found")
+    promotion.promotion_image = await save_named_image(file, "promotions", promotion.promotion_name)
     db.commit()
     db.refresh(promotion)
     return promotion

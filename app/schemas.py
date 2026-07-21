@@ -356,6 +356,73 @@ class PromotionOut(PromotionBase):
     # app.routers.promotions._serialize_promotion.
     price: Union[Decimal, str]
     old_price: Optional[Union[Decimal, str]] = None
+    promotion_image: Optional[str] = None
     created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ---------------------------------------------------------------------------
+# Order (a finalized storefront quote - see partials/quote_drawer.html)
+# ---------------------------------------------------------------------------
+class OrderItemCreate(BaseModel):
+    """Only product_id + qty are ever accepted from the client - price/discount/name
+    are always looked up and snapshotted server-side, see routers/orders.py."""
+
+    product_id: int
+    qty: int = Field(..., gt=0)
+
+
+class OrderCreate(BaseModel):
+    clinic_name: Optional[str] = Field(None, max_length=200)
+    contact_person: Optional[str] = Field(None, max_length=150)
+    phone: Optional[str] = Field(None, max_length=30)
+    address: Optional[str] = Field(None, max_length=255)
+    payment_term: Optional[str] = Field(None, max_length=100)
+    salesperson: Optional[str] = Field(None, max_length=150)
+    install_term: Optional[str] = Field(None, max_length=150)
+    cash_discount: Decimal = Field(0, ge=0)
+    items: list[OrderItemCreate] = Field(..., min_length=1)
+
+
+class OrderUpdate(BaseModel):
+    """The only thing staff can change after the fact - everything else is an
+    immutable record of what was actually quoted/sold."""
+
+    status: Optional[str] = Field(None, max_length=30)
+
+
+class OrderItemOut(BaseModel):
+    id: int
+    product_id: Optional[int] = None
+    product_name: str
+    product_code: Optional[str] = None
+    uom: Optional[str] = None
+    unit_price: Decimal
+    discount: int
+    qty: int
+    line_amount: Decimal
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class OrderOut(BaseModel):
+    id: int
+    order_number: str
+    customer_id: Optional[int] = None
+    created_by_user_id: Optional[int] = None
+    clinic_name: Optional[str] = None
+    contact_person: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    payment_term: Optional[str] = None
+    salesperson: Optional[str] = None
+    install_term: Optional[str] = None
+    cash_discount: Decimal
+    subtotal: Decimal
+    grand_total: Decimal
+    status: str
+    created_at: datetime
+    items: list[OrderItemOut] = []
 
     model_config = ConfigDict(from_attributes=True)
