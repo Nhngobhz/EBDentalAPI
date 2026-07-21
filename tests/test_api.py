@@ -803,6 +803,224 @@ def test_create_manual_with_pdf_in_one_request(client, db_session):
 
 
 # ---------------------------------------------------------------------------
+# Admin set-password
+# ---------------------------------------------------------------------------
+def test_admin_can_set_another_staff_members_password(client, db_session):
+    make_admin(db_session, email="pwadmin@example.com", password="password123")
+    admin_headers = auth_header(client, "pwadmin@example.com", "password123")
+
+    resp = client.post(
+        "/users/",
+        json={
+            "user_name": "Target Staff",
+            "email": "target@example.com",
+            "password": "originalpass1",
+        },
+        headers=admin_headers,
+    )
+    user_id = resp.json()["id"]
+
+    resp = client.put(
+        f"/users/{user_id}/password", json={"new_password": "brandnewpass1"}, headers=admin_headers
+    )
+    assert resp.status_code == 200, resp.text
+
+    # Old password no longer works, new one does (once verified/activated - reuse the
+    # admin-created-staff verify flow already exercised elsewhere in this file).
+    from app.models import User
+
+    target = db_session.query(User).filter(User.id == user_id).first()
+    target.is_verified = True
+    db_session.commit()
+
+    resp = client.post("/auth/login", data={"username": "target@example.com", "password": "originalpass1"})
+    assert resp.status_code == 401
+
+    resp = client.post("/auth/login", data={"username": "target@example.com", "password": "brandnewpass1"})
+    assert resp.status_code == 200
+
+
+def test_admin_set_password_requires_user_management(client, db_session):
+    from app.models import User
+    from app.core.security import hash_password
+
+    limited = User(
+        user_name="No Perms",
+        email="noperms@example.com",
+        hashed_password=hash_password("password123"),
+        is_active=True,
+        is_verified=True,
+    )
+    db_session.add(limited)
+    db_session.commit()
+    limited_headers = auth_header(client, "noperms@example.com", "password123")
+
+    admin = make_admin(db_session, email="pwadmin2@example.com", password="password123")
+
+    resp = client.put(
+        f"/users/{admin.id}/password", json={"new_password": "whatever123"}, headers=limited_headers
+    )
+    assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Orders (quotes)
+# ---------------------------------------------------------------------------
+def _make_order_product(client, headers, name="Quoted Widget", price="100.00", product_type="single"):
+    brand_id = client.post("/brands/", data={"brand_name": f"OrderCo-{name}"}, headers=headers).json()["id"]
+    return client.post(
+        "/products/",
+        json={"product_name": name, "price": price, "brand_id": brand_id, "product_type": product_type},
+        headers=headers,
+    ).json()
+
+
+def _order_payload(product_id, **overrides):
+    payload = {
+        "clinic_name": "Test Clinic",
+        "phone": "012345678",
+        "address": "123 Test St",
+        "items": [{"product_id": product_id, "qty": 2}],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_order_requires_clinic_phone_address(client, db_session):
+    admin = make_admin(db_session, email="orderadmin1@example.com", password="password123")
+    headers = auth_header(client, "orderadmin1@example.com", "password123")
+    product = _make_order_product(client, headers)
+
+    resp = client.post("/orders/", json={"items": [{"product_id": product["id"], "qty": 1}]}, headers=headers)
+    assert resp.status_code == 422
+
+
+def test_order_salesperson_and_user_are_server_derived(client, db_session):
+    admin = make_admin(db_session, email="orderadmin2@example.com", password="password123")
+    headers = auth_header(client, "orderadmin2@example.com", "password123")
+    product = _make_order_product(client, headers, name="Widget2")
+
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(product["id"], salesperson="Ignored Name"),
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["salesperson"] == "Admin User"
+    assert body["quoted_by_name"] == "Admin User"
+    assert body["quote_code"]
+    assert body["order_number"]
+
+    customer = make_customer(db_session, email="ordercust@example.com", password="customerpass1", access_permission=True)
+    cust_headers = customer_auth_header(client, "ordercust@example.com", "customerpass1")
+    resp = client.post("/orders/", json=_order_payload(product["id"]), headers=cust_headers)
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["salesperson"] == "Website"
+    assert body["quoted_by_name"] == "Test Customer"
+
+
+def test_order_percent_discount_open_to_any_quoting_principal(client, db_session):
+    from app.models import User
+    from app.core.security import hash_password
+
+    pricing_only = User(
+        user_name="Pricing Only",
+        email="pricingonly@example.com",
+        hashed_password=hash_password("password123"),
+        is_active=True,
+        is_verified=True,
+        price_listing=True,
+    )
+    db_session.add(pricing_only)
+    db_session.commit()
+
+    admin_headers = auth_header(client, "pricingonly@example.com", "password123")
+    make_admin(db_session, email="orderadmin3@example.com", password="password123")
+    creator_headers = auth_header(client, "orderadmin3@example.com", "password123")
+    product = _make_order_product(client, creator_headers, name="Widget3", price="100.00")
+
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(product["id"], discount_type="percent", discount_value=10),
+        headers=admin_headers,
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["subtotal"] == "200.00"
+    assert body["discount_amount"] == "20.00"
+    assert body["grand_total"] == "180.00"
+
+
+def test_order_cash_discount_requires_product_management(client, db_session):
+    from app.models import User
+    from app.core.security import hash_password
+
+    pricing_only = User(
+        user_name="Pricing Only 2",
+        email="pricingonly2@example.com",
+        hashed_password=hash_password("password123"),
+        is_active=True,
+        is_verified=True,
+        price_listing=True,
+    )
+    db_session.add(pricing_only)
+    db_session.commit()
+    pricing_headers = auth_header(client, "pricingonly2@example.com", "password123")
+
+    admin = make_admin(db_session, email="orderadmin4@example.com", password="password123")
+    admin_headers = auth_header(client, "orderadmin4@example.com", "password123")
+    product = _make_order_product(client, admin_headers, name="Widget4", price="100.00")
+
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(product["id"], discount_type="cash", discount_value=15),
+        headers=pricing_headers,
+    )
+    assert resp.status_code == 403
+
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(product["id"], discount_type="cash", discount_value=15),
+        headers=admin_headers,
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["discount_amount"] == "15.00"
+    assert body["grand_total"] == "185.00"
+
+
+def test_promotional_product_excluded_from_discount_base(client, db_session):
+    admin = make_admin(db_session, email="orderadmin5@example.com", password="password123")
+    headers = auth_header(client, "orderadmin5@example.com", "password123")
+
+    regular = _make_order_product(client, headers, name="Regular5", price="100.00", product_type="single")
+    promo = _make_order_product(client, headers, name="Promo5", price="50.00", product_type="promotional")
+
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(
+            None,
+            discount_type="percent",
+            discount_value=10,
+            items=[
+                {"product_id": regular["id"], "qty": 1},
+                {"product_id": promo["id"], "qty": 1},
+            ],
+        ),
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    # subtotal = 100 + 50 = 150; only the $100 regular line is discountable -> 10% of
+    # that ($10), not 10% of the full $150 subtotal.
+    assert body["subtotal"] == "150.00"
+    assert body["discount_amount"] == "10.00"
+    assert body["grand_total"] == "140.00"
+
+
+# ---------------------------------------------------------------------------
 # Global error handler
 # ---------------------------------------------------------------------------
 def test_unhandled_exception_returns_generic_500():

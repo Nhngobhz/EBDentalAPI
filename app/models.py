@@ -211,6 +211,11 @@ class Order(Base):
     id = Column(Integer, primary_key=True, index=True)
     order_number = Column(String(20), unique=True, nullable=False, index=True)
 
+    # "C. Code" on the paper quotation form - randomly generated server-side per quote
+    # (see _generate_quote_code in routers/orders.py), distinct from order_number (which
+    # is sequential). Never client-supplied.
+    quote_code = Column(String(20), unique=True, nullable=False, index=True)
+
     # Nullable: an order may belong to a registered Customer, be recorded by a staff
     # member on a walk-in clinic's behalf with no account, or both.
     customer_id = Column(Integer, ForeignKey("customers.id", ondelete="SET NULL"), nullable=True)
@@ -218,16 +223,36 @@ class Order(Base):
 
     # Free-text snapshot of the quote drawer's info form - describes a specific
     # clinic/contact at a point in time, not a live-linked record (same reasoning as
-    # badge/role_title being free text elsewhere in this schema).
-    clinic_name = Column(String(200), nullable=True)
+    # badge/role_title being free text elsewhere in this schema). Clinic/phone/address are
+    # required (unlike contact_person) - see OrderCreate.
+    clinic_name = Column(String(200), nullable=False)
     contact_person = Column(String(150), nullable=True)
-    phone = Column(String(30), nullable=True)
-    address = Column(String(255), nullable=True)
+    phone = Column(String(30), nullable=False)
+    address = Column(String(255), nullable=False)
     payment_term = Column(String(100), nullable=True)
+
+    # "Salesperson" on the paper form - always server-derived, never typed in: the acting
+    # staff member's name, or "Website" for a customer placing their own order (see
+    # _get_ordering_principal / create_order in routers/orders.py).
     salesperson = Column(String(150), nullable=True)
+
+    # "User" on the paper form - the display name of whoever was actually logged in when
+    # the quote was placed (staff user_name or customer_name). Distinct from salesperson:
+    # this one is never overridden to "Website" for a customer.
+    quoted_by_name = Column(String(150), nullable=True)
+
     install_term = Column(String(150), nullable=True)
 
-    cash_discount = Column(Numeric(10, 2), nullable=False, server_default="0")
+    # Order-level discount: either a percentage or a flat cash amount, per discount_type.
+    # discount_value is the raw number the admin entered; discount_amount is the actual
+    # computed $ figure subtracted from subtotal, persisted so printing/auditing never has
+    # to recompute the math (and so a later change to how % is calculated can't silently
+    # change what a historical order's PDF shows). Replaces the old flat-cash-only
+    # cash_discount column.
+    discount_type = Column(String(10), nullable=False, server_default="cash")
+    discount_value = Column(Numeric(10, 2), nullable=False, server_default="0")
+    discount_amount = Column(Numeric(10, 2), nullable=False, server_default="0")
+
     subtotal = Column(Numeric(10, 2), nullable=False)
     grand_total = Column(Numeric(10, 2), nullable=False)
 

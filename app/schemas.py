@@ -68,6 +68,14 @@ class ChangePassword(BaseModel):
     new_password: str = Field(..., min_length=8, max_length=72)
 
 
+class UserAdminSetPassword(BaseModel):
+    """Used by a user_management admin to directly set another staff member's password -
+    unlike ChangePassword (self-service), there's no current_password check since the
+    caller isn't the account owner. See PUT /users/{id}/password."""
+
+    new_password: str = Field(..., min_length=8, max_length=72)
+
+
 class UserUpdateByAdmin(BaseModel):
     user_name: Optional[str] = Field(None, min_length=2, max_length=100)
     address: Optional[str] = Field(None, max_length=255)
@@ -230,8 +238,10 @@ class CategoryMini(BaseModel):
 # ---------------------------------------------------------------------------
 # ProductType values are validated here rather than with a DB-level enum,
 # so adding a new one later (e.g. "bundle") is a one-line change, not a
-# migration - see Product.product_type in app/models.py.
-ProductType = Literal["single", "combo"]
+# migration - see Product.product_type in app/models.py. "promotional" products carry a
+# fixed price that order-level quote discounts never apply to - see
+# routers/orders.py::create_order's discountable_subtotal calculation.
+ProductType = Literal["single", "combo", "promotional"]
 
 class ProductBase(BaseModel):
     product_name: str = Field(..., min_length=1, max_length=200)
@@ -373,16 +383,33 @@ class OrderItemCreate(BaseModel):
     qty: int = Field(..., gt=0)
 
 
+DiscountType = Literal["percent", "cash"]
+
+
 class OrderCreate(BaseModel):
-    clinic_name: Optional[str] = Field(None, max_length=200)
+    # Clinic/phone/address are required on the paper quotation form; contact_person is not.
+    clinic_name: str = Field(..., min_length=1, max_length=200)
     contact_person: Optional[str] = Field(None, max_length=150)
-    phone: Optional[str] = Field(None, max_length=30)
-    address: Optional[str] = Field(None, max_length=255)
+    phone: str = Field(..., min_length=1, max_length=30)
+    address: str = Field(..., min_length=1, max_length=255)
     payment_term: Optional[str] = Field(None, max_length=100)
-    salesperson: Optional[str] = Field(None, max_length=150)
     install_term: Optional[str] = Field(None, max_length=150)
-    cash_discount: Decimal = Field(0, ge=0)
+
+    # salesperson/quoted_by_name are NOT accepted here - both are derived server-side from
+    # whoever is actually calling (see _get_ordering_principal in routers/orders.py), never
+    # trusted from the client.
+
+    discount_type: DiscountType = "cash"
+    discount_value: Decimal = Field(0, ge=0)
+
     items: list[OrderItemCreate] = Field(..., min_length=1)
+
+    @field_validator("discount_value")
+    @classmethod
+    def _percent_within_100(cls, discount_value, info):
+        if info.data.get("discount_type") == "percent" and discount_value > 100:
+            raise ValueError("A percent discount cannot exceed 100")
+        return discount_value
 
 
 class OrderUpdate(BaseModel):
@@ -409,16 +436,20 @@ class OrderItemOut(BaseModel):
 class OrderOut(BaseModel):
     id: int
     order_number: str
+    quote_code: str
     customer_id: Optional[int] = None
     created_by_user_id: Optional[int] = None
-    clinic_name: Optional[str] = None
+    clinic_name: str
     contact_person: Optional[str] = None
-    phone: Optional[str] = None
-    address: Optional[str] = None
+    phone: str
+    address: str
     payment_term: Optional[str] = None
     salesperson: Optional[str] = None
+    quoted_by_name: Optional[str] = None
     install_term: Optional[str] = None
-    cash_discount: Decimal
+    discount_type: DiscountType
+    discount_value: Decimal
+    discount_amount: Decimal
     subtotal: Decimal
     grand_total: Decimal
     status: str

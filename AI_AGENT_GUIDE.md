@@ -31,10 +31,13 @@ confusing (not obviously wrong) results.
   and `POST /products/` use a trailing slash; item-scoped paths like
   `GET /products/{id}` do not. This is standard FastAPI router behavior,
   not a typo - use the exact paths in section 6.
-- **All 7 "physical" entities**: `User` (staff), `Customer`, `Brand`,
-  `Category`, `Product`, `Manual`, `Promotion`. There is no `Order`/`Cart`
-  model in this API - it's a catalog + account management backend, not a
-  checkout/POS system.
+- **9 "physical" entities**: `User` (staff), `Customer`, `Brand`,
+  `Category`, `Product`, `Manual`, `Promotion`, `Order`, `OrderItem`. An
+  `Order` is a finalized storefront **quote** (see the EB Web Project
+  frontend's `quote_drawer.html`/`QuoteCart`), not a checkout/POS
+  transaction - there's no cart/payment/shipping concept, just a
+  server-priced snapshot of a quote once it's placed. See section 6's
+  Orders table.
 
 ---
 
@@ -298,6 +301,7 @@ record only.
 | `GET /users/{id}` | `user_management` | - |
 | `POST /users/` | `user_management` | JSON `UserCreateByAdmin` (name/email/address/phone/password/role_title + 4 permission booleans); new account still needs email confirmation before login |
 | `PUT /users/{id}` | `user_management` | JSON `UserUpdateByAdmin`; you cannot set `user_management: false` on your own account (self-lockout guard) |
+| `PUT /users/{id}/password` | `user_management` | JSON `{"new_password"}`; an admin directly setting **another** staff member's password - no `current_password` check (unlike `POST /users/me/change-password`), since the caller isn't the account owner |
 | `DELETE /users/{id}` | `user_management` | soft-delete (`is_active=false`), not a real row deletion; you cannot deactivate your own account |
 
 ### Customer self-service - `/customers/me`
@@ -373,6 +377,48 @@ record only.
 `Product` prices - unauthenticated/unentitled callers get `price` as the
 literal string `"XXXX"` and `old_price` as `null`; see section 4.
 
+### Orders - `/orders`
+An `Order` is a finalized storefront **quote** - it only ever accepts
+`product_id`+`qty` per line; every other value (price, discount,
+`salesperson`, `quoted_by_name`, `quote_code`, the computed discount) is
+derived/priced server-side and never trusted from the request body.
+
+| Method & path | Auth | Body / notes |
+|---|---|---|
+| `POST /orders/` | `Any user` with `price_listing` or `product_management`, OR `Any customer` with `access_permission` | JSON `OrderCreate` (`clinic_name`, `phone`, `address` - all **required**; `contact_person?`, `payment_term?`, `install_term?`; `discount_type`: `"percent"`\|`"cash"`, default `"cash"`; `discount_value` ≥0, default `0`; `items`: list of `{product_id, qty}`, at least 1). See notes below. |
+| `GET /orders/` | `price_listing` | query `skip`, `limit`, `status`, `customer_id` |
+| `GET /orders/{id}` | `price_listing` | - |
+| `PUT /orders/{id}` | `price_listing` | JSON `{"status"}` - the only thing editable after creation; everything else is an immutable record of what was actually quoted |
+| `DELETE /orders/{id}` | `price_listing` | hard delete, cascades to `OrderItem` rows |
+
+Notes an agent should know before calling this:
+- **`salesperson`/`quoted_by_name` are never accepted from the client** -
+  `OrderCreate` doesn't even have those fields. They're derived from
+  whoever's bearer token is calling: a staff `User` → their `user_name`
+  for both; a `Customer` → `"Website"` for `salesperson`, but their own
+  `customer_name` for `quoted_by_name` (that one's never overridden).
+- **`quote_code`** ("C. Code" on the paper quotation form) is randomly
+  generated server-side on every create (2 letters + 6 digits, e.g.
+  `"QT483920"`) - distinct from the sequential `order_number`.
+- **A cash discount (`discount_type: "cash"`, `discount_value > 0`)
+  requires `product_management` specifically**, not just
+  `price_listing`/`access_permission` - a `403` here doesn't mean the
+  caller can't place the order at all, just that they can't apply a cash
+  discount to it (a percent discount is fine for anyone who can already
+  place an order). Read the `detail` message to tell the two apart.
+- **Promotional products (`Product.product_type == "promotional"`) are
+  excluded from the discount calculation entirely** - both percent and
+  cash discounts are computed only against the subtotal of non-promotional
+  lines, then subtracted from the full order subtotal. A quote mixing a
+  promotional and a regular product will show a smaller discount than
+  `discount_value`% of the full subtotal would suggest - that's expected,
+  not a bug.
+- `discount_amount` in the response is the actual computed $ figure
+  already subtracted (`grand_total = subtotal - discount_amount`) - don't
+  recompute it client-side from `discount_type`/`discount_value`, the
+  server-persisted value is authoritative (and is what a re-print of an
+  old order should always display).
+
 ### Misc
 | Method & path | Auth | Notes |
 |---|---|---|
@@ -401,9 +447,17 @@ literal string `"XXXX"` and `old_price` as `null`; see section 4.
   payloads are checked for existence server-side and rejected with `400`
   if dangling - don't pre-validate them client-side beyond that.
   `category_id` is the exception that's optional (`null` allowed).
-- `Product.product_type` only accepts `"single"` or `"combo"` (see
-  `ProductType` in `app/schemas.py`) - anything else is a `422`, not a
-  `400`, since it's a schema-level literal check rather than a DB lookup.
+- `Product.product_type` only accepts `"single"`, `"combo"`, or
+  `"promotional"` (see `ProductType` in `app/schemas.py`) - anything else
+  is a `422`, not a `400`, since it's a schema-level literal check rather
+  than a DB lookup. `"promotional"` products carry a fixed price that
+  order-level quote discounts never apply to - see the Orders section
+  above.
+- `OrderCreate.discount_value` must be ≤100 when `discount_type ==
+  "percent"` (checked by a `field_validator`, so this is also a `422` not
+  a `400`) - there's no such cap when `discount_type == "cash"`, since a
+  cash amount just gets clamped to the discountable subtotal instead of
+  rejected (see the Orders section).
 
 ---
 

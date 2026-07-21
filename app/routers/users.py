@@ -13,6 +13,7 @@ from app.models import User
 from app.schemas import (
     ChangePassword,
     Message,
+    UserAdminSetPassword,
     UserCreateByAdmin,
     UserOut,
     UserUpdateByAdmin,
@@ -173,6 +174,26 @@ def update_user(
     db.commit()
     db.refresh(user)
     return user
+
+
+@router.put("/{user_id}/password", response_model=Message)
+def admin_set_user_password(
+    user_id: int,
+    payload: UserAdminSetPassword,
+    _: User = Depends(require_permission("user_management")),
+    db: Session = Depends(get_db),
+):
+    """An admin directly sets another staff member's password - no current_password
+    check, unlike POST /users/me/change-password, since the caller isn't the account
+    owner. Intended for "I forgot my password" support without wiring up an email-reset
+    flow for staff accounts."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    user.hashed_password = hash_password(payload.new_password)
+    db.commit()
+    return {"detail": "Password updated successfully"}
 
 
 @router.delete("/{user_id}", response_model=UserOut)

@@ -15,6 +15,8 @@ calling must also meet the same "can place an order" bar the frontend enforces b
 even showing the quote-cart UI: staff need price_listing or product_management,
 customers need access_permission. This is enforced here too, not just hidden in the UI.
 """
+import secrets
+import string
 from decimal import Decimal
 
 import jwt
@@ -38,10 +40,12 @@ _perm = Depends(require_permission("price_listing"))
 
 def _get_ordering_principal(
     token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)
-) -> tuple[int | None, int | None]:
-    """Returns (customer_id, created_by_user_id) - exactly one is set. Raises 401 for a
-    missing/invalid token, 403 for a deactivated/unverified account or one that doesn't
-    meet the order-placing bar described above."""
+) -> tuple[Customer | None, User | None]:
+    """Returns (customer, user) - exactly one is set. Raises 401 for a missing/invalid
+    token, 403 for a deactivated/unverified account or one that doesn't meet the
+    order-placing bar described above. Returning the full row (not just an id) lets
+    create_order derive salesperson/quoted_by_name and the cash-discount permission check
+    without a second query."""
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -73,7 +77,7 @@ def _get_ordering_principal(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Placing an order requires the 'price_listing' or 'product_management' permission",
             )
-        return None, user.id
+        return None, user
 
     customer = db.query(Customer).filter(Customer.id == int(sub)).first()
     if not customer:
@@ -90,7 +94,7 @@ def _get_ordering_principal(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Placing an order requires price-visible account access",
         )
-    return customer.id, None
+    return customer, None
 
 
 def _next_order_number(db: Session) -> str:
@@ -98,16 +102,55 @@ def _next_order_number(db: Session) -> str:
     return f"{(last.id + 1) if last else 1:06d}"
 
 
+_QUOTE_CODE_ALPHABET = string.ascii_uppercase
+_QUOTE_CODE_DIGITS = string.digits
+
+
+def _generate_quote_code(db: Session) -> str:
+    """Random "C. Code" - 2 letters + 6 digits, e.g. "QT483920". Looped with a uniqueness
+    check (collisions are astronomically unlikely at this alphabet size, but a quote code
+    silently colliding with an older quote would be a real, confusing bug if it ever
+    happened)."""
+    for _ in range(10):
+        code = "".join(secrets.choice(_QUOTE_CODE_ALPHABET) for _ in range(2)) + "".join(
+            secrets.choice(_QUOTE_CODE_DIGITS) for _ in range(6)
+        )
+        if not db.query(Order).filter(Order.quote_code == code).first():
+            return code
+    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not generate a unique quote code")
+
+
 @router.post("/", response_model=OrderOut, status_code=status.HTTP_201_CREATED)
 def create_order(
     payload: OrderCreate,
-    principal: tuple[int | None, int | None] = Depends(_get_ordering_principal),
+    principal: tuple[Customer | None, User | None] = Depends(_get_ordering_principal),
     db: Session = Depends(get_db),
 ):
-    customer_id, created_by_user_id = principal
+    customer, user = principal
+
+    # Salesperson/quoted_by_name are always derived here, never trusted from the client
+    # (see OrderCreate - it doesn't even accept them). A customer placing their own order
+    # is recorded as "Website" for salesperson but keeps their own name for quoted_by_name.
+    if user is not None:
+        salesperson = user.user_name
+        quoted_by_name = user.user_name
+    else:
+        salesperson = "Website"
+        quoted_by_name = customer.customer_name
+
+    # A cash discount is a real reduction staff hand out at their own discretion - gated to
+    # product_management specifically (a customer, or a price_listing-only staffer, can
+    # still apply a percent discount, just not a cash one).
+    if payload.discount_type == "cash" and payload.discount_value > 0:
+        if user is None or not user.product_management:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="A cash discount requires the 'product_management' permission",
+            )
 
     items: list[OrderItem] = []
     subtotal = Decimal("0")
+    discountable_subtotal = Decimal("0")
     for line in payload.items:
         product = db.query(Product).filter(Product.id == line.product_id).first()
         if not product:
@@ -129,21 +172,34 @@ def create_order(
             )
         )
         subtotal += line_amount
+        # Promotional products carry a fixed promo price - the order-level discount below
+        # never applies to them, so they're excluded from the base it's computed against.
+        if product.product_type != "promotional":
+            discountable_subtotal += line_amount
 
-    grand_total = max(Decimal("0"), subtotal - payload.cash_discount)
+    if payload.discount_type == "percent":
+        discount_amount = discountable_subtotal * payload.discount_value / Decimal("100")
+    else:
+        discount_amount = min(payload.discount_value, discountable_subtotal)
+
+    grand_total = max(Decimal("0"), subtotal - discount_amount)
 
     order = Order(
         order_number=_next_order_number(db),
-        customer_id=customer_id,
-        created_by_user_id=created_by_user_id,
+        quote_code=_generate_quote_code(db),
+        customer_id=customer.id if customer else None,
+        created_by_user_id=user.id if user else None,
         clinic_name=payload.clinic_name,
         contact_person=payload.contact_person,
         phone=payload.phone,
         address=payload.address,
         payment_term=payload.payment_term,
-        salesperson=payload.salesperson,
+        salesperson=salesperson,
+        quoted_by_name=quoted_by_name,
         install_term=payload.install_term,
-        cash_discount=payload.cash_discount,
+        discount_type=payload.discount_type,
+        discount_value=payload.discount_value,
+        discount_amount=discount_amount,
         subtotal=subtotal,
         grand_total=grand_total,
         items=items,
