@@ -130,10 +130,12 @@ class Product(Base):
     description = Column(Text, nullable=True)
     price = Column(Numeric(10, 2), nullable=False)
 
-    # Percentage off price, 0-100 - replaces a separate old_price column
-    # (see ProductBase.discount for the range validation). Not a value
-    # derived from anything else stored.
-    discount = Column(Integer, nullable=False, server_default="0")
+    # Either a percentage (0-100) or a flat $ amount off price, per discount_type -
+    # replaces a separate old_price column (see ProductBase.discount for range
+    # validation). Not a value derived from anything else stored; Numeric (not Integer)
+    # so a cash discount can hold cents.
+    discount_type = Column(String(10), nullable=False, server_default="percent")
+    discount = Column(Numeric(10, 2), nullable=False, server_default="0")
 
     # Changed from a raw `brand_name` string to a foreign key. See README:
     # "Product.brand_name -> brand_id".
@@ -286,7 +288,12 @@ class OrderItem(Base):
     product_code = Column(String(50), nullable=True)
     uom = Column(String(20), nullable=True)
     unit_price = Column(Numeric(10, 2), nullable=False)
-    discount = Column(Integer, nullable=False, server_default="0")
+    # Snapshotted from Product.discount/discount_type at quote time (see
+    # routers/orders.py::create_order) - same percent-or-cash shape as the product it
+    # came from, so the printed quote's "Discount" column stays meaningful even after the
+    # product's own discount later changes.
+    discount_type = Column(String(10), nullable=False, server_default="percent")
+    discount = Column(Numeric(10, 2), nullable=False, server_default="0")
     qty = Column(Integer, nullable=False)
     line_amount = Column(Numeric(10, 2), nullable=False)
 

@@ -243,6 +243,12 @@ class CategoryMini(BaseModel):
 # routers/orders.py::create_order's discountable_subtotal calculation.
 ProductType = Literal["single", "combo", "promotional"]
 
+# Shared by Product and Order - either a percentage (0-100) or a flat $ amount off,
+# depending on context. Declared once here (rather than separately near OrderCreate)
+# since ProductBase needs it first in file order.
+DiscountType = Literal["percent", "cash"]
+
+
 class ProductBase(BaseModel):
     product_name: str = Field(..., min_length=1, max_length=200)
     description: Optional[str] = None
@@ -254,9 +260,20 @@ class ProductBase(BaseModel):
 
 class ProductCreate(ProductBase):
     price: Decimal = Field(..., gt=0)
-    discount: int = Field(0, ge=0, le=100)
+    discount_type: DiscountType = "percent"
+    # Decimal("0") not bare 0 - Pydantic v2 doesn't validate/coerce field defaults unless
+    # asked to, so a bare int default would reach the DB as a Python int on a Numeric
+    # column (harmless in Postgres, but produces a serializer warning on the way back out).
+    discount: Decimal = Field(Decimal("0"), ge=0)
     brand_id: int
     category_id: Optional[int] = None
+
+    @field_validator("discount")
+    @classmethod
+    def _percent_within_100(cls, discount, info):
+        if info.data.get("discount_type") == "percent" and discount > 100:
+            raise ValueError("A percent discount cannot exceed 100")
+        return discount
 
 
 class ProductUpdate(BaseModel):
@@ -273,12 +290,28 @@ class ProductUpdate(BaseModel):
     # product additionally requires the price_listing permission - enforced
     # in the router, not here.
     price: Optional[Decimal] = Field(None, gt=0)
-    discount: Optional[int] = Field(None, ge=0, le=100)
+    discount_type: Optional[DiscountType] = None
+    discount: Optional[Decimal] = Field(None, ge=0)
+
+    @field_validator("discount")
+    @classmethod
+    def _percent_within_100(cls, discount, info):
+        if discount is not None and info.data.get("discount_type") == "percent" and discount > 100:
+            raise ValueError("A percent discount cannot exceed 100")
+        return discount
 
 
 class ProductPriceUpdate(BaseModel):
     price: Optional[Decimal] = Field(None, gt=0)
-    discount: Optional[int] = Field(None, ge=0, le=100)
+    discount_type: Optional[DiscountType] = None
+    discount: Optional[Decimal] = Field(None, ge=0)
+
+    @field_validator("discount")
+    @classmethod
+    def _percent_within_100(cls, discount, info):
+        if discount is not None and info.data.get("discount_type") == "percent" and discount > 100:
+            raise ValueError("A percent discount cannot exceed 100")
+        return discount
 
 
 class ProductOut(ProductBase):
@@ -287,9 +320,10 @@ class ProductOut(ProductBase):
     # app.core.deps.get_price_visibility) get back the literal string
     # "XXXX" instead of the real value.
     price: Union[Decimal, str]
+    discount_type: DiscountType = "percent"
     # Masked to None for the same viewers, same reasoning as price - see
     # app.routers.products._serialize_product.
-    discount: Optional[int] = None
+    discount: Optional[Decimal] = None
     product_image: Optional[str] = None
     brand: Optional[BrandMini] = None
     category: Optional[CategoryMini] = None
@@ -383,9 +417,6 @@ class OrderItemCreate(BaseModel):
     qty: int = Field(..., gt=0)
 
 
-DiscountType = Literal["percent", "cash"]
-
-
 class OrderCreate(BaseModel):
     # Clinic/phone/address are required on the paper quotation form; contact_person is not.
     clinic_name: str = Field(..., min_length=1, max_length=200)
@@ -400,7 +431,8 @@ class OrderCreate(BaseModel):
     # trusted from the client.
 
     discount_type: DiscountType = "cash"
-    discount_value: Decimal = Field(0, ge=0)
+    # Decimal("0") not bare 0 - see the identical comment on ProductCreate.discount.
+    discount_value: Decimal = Field(Decimal("0"), ge=0)
 
     items: list[OrderItemCreate] = Field(..., min_length=1)
 
@@ -426,7 +458,8 @@ class OrderItemOut(BaseModel):
     product_code: Optional[str] = None
     uom: Optional[str] = None
     unit_price: Decimal
-    discount: int
+    discount_type: DiscountType = "percent"
+    discount: Decimal
     qty: int
     line_amount: Decimal
 

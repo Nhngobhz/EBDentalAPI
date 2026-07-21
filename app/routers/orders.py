@@ -166,6 +166,7 @@ def create_order(
                 product_code=product.product_code,
                 uom=product.uom,
                 unit_price=product.price,
+                discount_type=product.discount_type,
                 discount=product.discount,
                 qty=line.qty,
                 line_amount=line_amount,

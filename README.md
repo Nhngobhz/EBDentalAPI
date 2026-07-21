@@ -193,8 +193,6 @@ Then, in a separate terminal, create your first admin account:
 ```bash
 docker compose exec api python -m scripts.create_admin
 
-docker compose exec api python -m scripts.seed_catalog
-
 ```
 
 Optionally, seed a few sample brands/products to have something to look

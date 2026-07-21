@@ -575,7 +575,7 @@ def test_product_price_masked_until_access_permission_granted(client, db_session
 
     # Staff (mutation response) sees the real price
     assert product["price"] == "42.00"
-    assert product["discount"] == 8
+    assert product["discount"] == "8.00"
 
     # Anonymous callers get a masked price and no discount at all
     anon_list = client.get("/products/").json()
@@ -608,7 +608,7 @@ def test_product_price_masked_until_access_permission_granted(client, db_session
     # now sees the real price
     resp = client.get("/products/", headers=customer_headers).json()
     assert resp[0]["price"] == "42.00"
-    assert resp[0]["discount"] == 8
+    assert resp[0]["discount"] == "8.00"
 
     resp = client.get(f"/products/{product_id}", headers=customer_headers).json()
     assert resp["price"] == "42.00"
@@ -1018,6 +1018,83 @@ def test_promotional_product_excluded_from_discount_base(client, db_session):
     assert body["subtotal"] == "150.00"
     assert body["discount_amount"] == "10.00"
     assert body["grand_total"] == "140.00"
+
+
+# ---------------------------------------------------------------------------
+# Product discount type (percent vs cash)
+# ---------------------------------------------------------------------------
+def test_product_cash_discount_create_and_snapshot_onto_order_item(client, db_session):
+    admin = make_admin(db_session, email="proddiscount1@example.com", password="password123")
+    headers = auth_header(client, "proddiscount1@example.com", "password123")
+    brand_id = client.post("/brands/", data={"brand_name": "CashDiscountCo"}, headers=headers).json()["id"]
+
+    resp = client.post(
+        "/products/",
+        json={
+            "product_name": "Cash Discount Widget",
+            "price": "100.00",
+            "discount_type": "cash",
+            "discount": "15.00",
+            "brand_id": brand_id,
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    product = resp.json()
+    assert product["discount_type"] == "cash"
+    assert product["discount"] == "15.00"
+
+    resp = client.post(
+        "/orders/",
+        json={
+            "clinic_name": "Clinic", "phone": "011", "address": "Addr",
+            "items": [{"product_id": product["id"], "qty": 1}],
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    item = resp.json()["items"][0]
+    assert item["discount_type"] == "cash"
+    assert item["discount"] == "15.00"
+
+
+def test_product_cash_discount_cannot_exceed_price(client, db_session):
+    admin = make_admin(db_session, email="proddiscount2@example.com", password="password123")
+    headers = auth_header(client, "proddiscount2@example.com", "password123")
+    brand_id = client.post("/brands/", data={"brand_name": "CashDiscountCo2"}, headers=headers).json()["id"]
+
+    resp = client.post(
+        "/products/",
+        json={
+            "product_name": "Overdiscounted Widget",
+            "price": "50.00",
+            "discount_type": "cash",
+            "discount": "50.00",
+            "brand_id": brand_id,
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 400
+    assert "price" in resp.json()["detail"]
+
+
+def test_product_percent_discount_still_capped_at_100(client, db_session):
+    admin = make_admin(db_session, email="proddiscount3@example.com", password="password123")
+    headers = auth_header(client, "proddiscount3@example.com", "password123")
+    brand_id = client.post("/brands/", data={"brand_name": "PercentDiscountCo"}, headers=headers).json()["id"]
+
+    resp = client.post(
+        "/products/",
+        json={
+            "product_name": "Overdiscounted Percent Widget",
+            "price": "50.00",
+            "discount_type": "percent",
+            "discount": "150",
+            "brand_id": brand_id,
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 422
 
 
 # ---------------------------------------------------------------------------
