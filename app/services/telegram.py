@@ -8,8 +8,8 @@ Things get pushed to the configured Telegram chat:
   2. Unhandled application errors - see notify_error() and, for anything
      logged with logger.error()/logger.critical() anywhere in the app,
      app/core/logging_conf.py's TelegramErrorHandler.
-  3. Every new order - see send_order_alert(), called from
-     routers/orders.py::create_order. Includes the invoice PDF and inline
+  3. Every new order - see deliver_order_alert(), called from
+     routers/orders.py::create_order. Includes the quotation PDF and inline
      Delivered/Cancelled buttons; button presses land on the webhook in
      routers/telegram_webhook.py.
 
@@ -20,7 +20,18 @@ without a Telegram bot connected.
 To set this up: message @BotFather on Telegram to create a bot and get a
 token, then message your bot (or add it to a group) and use
 https://api.telegram.org/bot<token>/getUpdates to find the chat_id.
+
+**Quotation PDF source (added 2026-07-22)**: the document customers actually see is
+built client-side (EB Web Project's main.js, QuoteCart.buildPrintTemplate/exportPDF via
+html2canvas) - server-side app/services/invoice_pdf.py is only ever an approximation of
+that (fpdf2 can't reproduce an arbitrary HTML/CSS layout exactly). Rather than keep
+chasing pixel-parity, deliver_order_alert() briefly waits for the browser to hand over
+its real rendered PDF (POST /orders/{id}/quotation-pdf, called right after
+QuoteCart.confirmPurchase() builds it) and uses that if it arrives in time, falling
+back to the fpdf2 approximation only if it doesn't (browser closed/crashed/offline) -
+exactly one Telegram alert always goes out, never zero and never two.
 """
+import asyncio
 import json
 from typing import TYPE_CHECKING
 
@@ -31,6 +42,51 @@ if TYPE_CHECKING:
     from app.schemas import OrderOut
 
 logger = get_logger("telegram")
+
+# How long deliver_order_alert() waits for the browser's real PDF upload before giving
+# up and falling back to the server-rendered approximation. Long enough for a normal
+# html2canvas render + upload round-trip, short enough that staff never wait long for
+# their notification.
+_QUOTATION_PDF_WAIT_SECONDS = 20.0
+
+# Single-process in-memory handoff between deliver_order_alert() (waiting) and
+# routers/orders.py's POST /{id}/quotation-pdf (resolving) - store-api runs as one
+# Uvicorn worker (see entrypoint.sh), so this doesn't need to survive a restart or be
+# visible across processes; it only needs to live for the few seconds between an order
+# being created and its alert being sent.
+_pending_quotation_pdfs: dict[int, "asyncio.Future[bytes]"] = {}
+
+
+def register_pending_quotation_pdf(order_id: int) -> "asyncio.Future[bytes]":
+    future = asyncio.get_event_loop().create_future()
+    _pending_quotation_pdfs[order_id] = future
+    return future
+
+
+def resolve_pending_quotation_pdf(order_id: int, pdf_bytes: bytes) -> None:
+    """Called from the upload endpoint. A no-op if nothing is waiting (the alert
+    already timed out and fell back, or already fired for some other reason) - the
+    endpoint always reports success to the browser either way, since the upload itself
+    genuinely succeeded regardless of whether it made it into the alert."""
+    future = _pending_quotation_pdfs.get(order_id)
+    if future is not None and not future.done():
+        future.set_result(pdf_bytes)
+
+
+async def deliver_order_alert(order: "OrderOut") -> None:
+    future = register_pending_quotation_pdf(order.id)
+    try:
+        pdf_bytes = await asyncio.wait_for(future, timeout=_QUOTATION_PDF_WAIT_SECONDS)
+    except asyncio.TimeoutError:
+        pdf_bytes = None
+        logger.info(
+            "No client quotation PDF uploaded for order %s within %.0fs - "
+            "falling back to the server-rendered PDF.", order.id, _QUOTATION_PDF_WAIT_SECONDS,
+        )
+    finally:
+        _pending_quotation_pdfs.pop(order.id, None)
+    await send_order_alert(order, pdf_bytes=pdf_bytes)
+
 
 _API_BASE = "https://api.telegram.org/bot{token}/{method}"
 
@@ -84,19 +140,23 @@ async def notify_error(error_type: str, message: str, path: str | None = None) -
     await send_telegram_message(text, topic_id=settings.TELEGRAM_ERROR_TOPIC_ID)
 
 
-async def send_order_alert(order: "OrderOut") -> None:
-    """Posts a new order to Telegram with its invoice PDF attached and
+async def send_order_alert(order: "OrderOut", pdf_bytes: bytes | None = None) -> None:
+    """Posts a new order to Telegram with its quotation PDF attached and
     Delivered/Cancelled buttons. Button presses come back on
     routers/telegram_webhook.py, which updates order.status directly and
     edits this message to remove the buttons - see
-    edit_order_alert_after_decision() below."""
+    edit_order_alert_after_decision() below.
+
+    `pdf_bytes`, when given (see deliver_order_alert), is the real client-rendered PDF
+    the customer downloaded - otherwise the server's fpdf2 approximation
+    (build_invoice_pdf) is generated and used instead. Exposed as a direct parameter
+    (rather than always calling deliver_order_alert) so tests/other callers can still
+    send an alert synchronously without the wait."""
     if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
         logger.debug("Telegram not configured - skipping order alert.")
         return
 
     import httpx
-
-    from app.services.invoice_pdf import build_invoice_pdf
 
     caption = (
         f"\U0001F6CD <b>New order</b>\n"
@@ -121,8 +181,11 @@ async def send_order_alert(order: "OrderOut") -> None:
         data["message_thread_id"] = settings.TELEGRAM_ORDER_TOPIC_ID
 
     try:
-        pdf_bytes = build_invoice_pdf(order)
-        files = {"document": (f"invoice-{order.order_number}.pdf", pdf_bytes, "application/pdf")}
+        if pdf_bytes is None:
+            from app.services.invoice_pdf import build_invoice_pdf
+
+            pdf_bytes = build_invoice_pdf(order)
+        files = {"document": (f"EB-Dental-Quotation-{order.quote_code}.pdf", pdf_bytes, "application/pdf")}
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(_api_url("sendDocument"), data=data, files=files)
             resp.raise_for_status()

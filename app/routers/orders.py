@@ -19,15 +19,17 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 import jwt
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session, joinedload
 
+from app.config import settings
 from app.core.deps import oauth2_scheme, require_permission
+from app.core.files import ALLOWED_PDF_TYPES
 from app.core.security import decode_access_token
 from app.database import get_db
 from app.models import Customer, Order, OrderItem, Product, User
 from app.schemas import OrderCreate, OrderOut, OrderUpdate
-from app.services.telegram import send_order_alert
+from app.services.telegram import deliver_order_alert, resolve_pending_quotation_pdf
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
@@ -213,9 +215,50 @@ def create_order(
     # background task - the task runs after this request's db session may already be
     # torn down, so a lazy-loaded relationship access there would raise
     # DetachedInstanceError. OrderOut.model_validate() reads everything needed (incl.
-    # items) right now, while the session is still live.
-    background_tasks.add_task(send_order_alert, OrderOut.model_validate(order))
+    # items) right now, while the session is still live. deliver_order_alert() briefly
+    # waits for the browser to upload its real rendered PDF (see
+    # POST /{order_id}/quotation-pdf below) before falling back to a server-rendered one.
+    background_tasks.add_task(deliver_order_alert, OrderOut.model_validate(order))
     return order
+
+
+@router.post("/{order_id}/quotation-pdf", status_code=status.HTTP_204_NO_CONTENT)
+async def upload_quotation_pdf(
+    order_id: int,
+    file: UploadFile = File(...),
+    principal: tuple[Customer | None, User | None] = Depends(_get_ordering_principal),
+    db: Session = Depends(get_db),
+):
+    """Hands over the REAL client-rendered quotation PDF (QuoteCart.confirmPurchase() ->
+    exportPDF() in main.js, built with html2canvas right after this order was placed) so
+    its Telegram alert can include the exact document the customer received instead of
+    the server's fpdf2 approximation - see deliver_order_alert/resolve_pending_quotation_pdf
+    in services/telegram.py. Gated to the same principal who placed the order, so one
+    account can't attach an arbitrary PDF to somebody else's order alert. A 404/403 here
+    still means the order was placed fine - this is a best-effort enhancement to its
+    Telegram alert, never something the purchase flow itself depends on."""
+    customer, user = principal
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    owns_order = (customer is not None and order.customer_id == customer.id) or (
+        user is not None and order.created_by_user_id == user.id
+    )
+    if not owns_order:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your order")
+
+    if file.content_type not in ALLOWED_PDF_TYPES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File must be a PDF")
+    contents = await file.read()
+    max_bytes = settings.MAX_PDF_SIZE_MB * 1024 * 1024
+    if len(contents) > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File too large. Maximum size is {settings.MAX_PDF_SIZE_MB} MB.",
+        )
+
+    resolve_pending_quotation_pdf(order.id, contents)
+    return None
 
 
 @router.get("/", response_model=list[OrderOut])

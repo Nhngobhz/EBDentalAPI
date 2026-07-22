@@ -390,6 +390,7 @@ derived/priced server-side and never trusted from the request body.
 | `GET /orders/{id}` | `price_listing` | - |
 | `PUT /orders/{id}` | `price_listing` | JSON `{"status"}` - the only thing editable after creation; everything else is an immutable record of what was actually quoted |
 | `DELETE /orders/{id}` | `price_listing` | hard delete, cascades to `OrderItem` rows |
+| `POST /orders/{id}/quotation-pdf` | Same principal who placed the order | `multipart/form-data`, field `file` (a PDF) - see notes below |
 
 Notes an agent should know before calling this:
 - **`salesperson`/`quoted_by_name` are never accepted from the client** -
@@ -419,6 +420,16 @@ Notes an agent should know before calling this:
   recompute it client-side from `discount_type`/`discount_value`, the
   server-persisted value is authoritative (and is what a re-print of an
   old order should always display).
+- **`POST /orders/{id}/quotation-pdf` is how the browser hands over the real,
+  client-rendered quotation PDF** (built by `main.js`'s
+  `QuoteCart.buildPrintTemplate`/`exportPDF` via html2canvas, right after `POST
+  /orders/` succeeds) so the Telegram order alert can carry the exact document the
+  customer received. `create_order`'s background task
+  (`deliver_order_alert` in `services/telegram.py`) waits up to ~20s for this call
+  before falling back to a server-rendered approximation
+  (`services/invoice_pdf.py`) - so this endpoint is best-effort: a slow/missing call
+  never fails the purchase itself, it just means the Telegram alert uses the
+  fallback PDF instead of the real one.
 
 ### Misc
 | Method & path | Auth | Notes |
