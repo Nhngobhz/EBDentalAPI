@@ -1,13 +1,17 @@
 """
 Telegram bot notifications.
 
-Two things get pushed to the configured Telegram chat:
+Things get pushed to the configured Telegram chat:
   1. Every successful staff (User) login - see notify_admin_login().
      "Admin-level" logins (user_management=True) are flagged distinctly
      from regular staff logins so admins stand out in the chat.
   2. Unhandled application errors - see notify_error() and, for anything
      logged with logger.error()/logger.critical() anywhere in the app,
      app/core/logging_conf.py's TelegramErrorHandler.
+  3. Every new order - see send_order_alert(), called from
+     routers/orders.py::create_order. Includes the invoice PDF and inline
+     Delivered/Cancelled buttons; button presses land on the webhook in
+     routers/telegram_webhook.py.
 
 If TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are not configured, these
 functions are no-ops (logged at debug level) so the app works fully
@@ -17,12 +21,22 @@ To set this up: message @BotFather on Telegram to create a bot and get a
 token, then message your bot (or add it to a group) and use
 https://api.telegram.org/bot<token>/getUpdates to find the chat_id.
 """
+import json
+from typing import TYPE_CHECKING
+
 from app.config import settings
 from app.core.logging_conf import get_logger
 
+if TYPE_CHECKING:
+    from app.schemas import OrderOut
+
 logger = get_logger("telegram")
 
-_TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
+_API_BASE = "https://api.telegram.org/bot{token}/{method}"
+
+
+def _api_url(method: str) -> str:
+    return _API_BASE.format(token=settings.TELEGRAM_BOT_TOKEN, method=method)
 
 
 async def send_telegram_message(text: str, topic_id: str | None = None) -> None:
@@ -32,7 +46,6 @@ async def send_telegram_message(text: str, topic_id: str | None = None) -> None:
 
     import httpx  # local import keeps startup fast when Telegram is unused
 
-    url = _TELEGRAM_URL.format(token=settings.TELEGRAM_BOT_TOKEN)
     payload = {
         "chat_id": settings.TELEGRAM_CHAT_ID,
         "text": text[:4000],
@@ -43,7 +56,7 @@ async def send_telegram_message(text: str, topic_id: str | None = None) -> None:
         payload["message_thread_id"] = int(topic_id)
     try:
         async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.post(url, json=payload)
+            resp = await client.post(_api_url("sendMessage"), json=payload)
             resp.raise_for_status()
     except Exception as exc:
         logger.warning("Failed to send Telegram notification: %s", exc)
@@ -69,3 +82,128 @@ async def notify_error(error_type: str, message: str, path: str | None = None) -
         f"Message: {message}\n" + (f"Path: {path}" if path else "")
     )
     await send_telegram_message(text, topic_id=settings.TELEGRAM_ERROR_TOPIC_ID)
+
+
+async def send_order_alert(order: "OrderOut") -> None:
+    """Posts a new order to Telegram with its invoice PDF attached and
+    Delivered/Cancelled buttons. Button presses come back on
+    routers/telegram_webhook.py, which updates order.status directly and
+    edits this message to remove the buttons - see
+    edit_order_alert_after_decision() below."""
+    if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
+        logger.debug("Telegram not configured - skipping order alert.")
+        return
+
+    import httpx
+
+    from app.services.invoice_pdf import build_invoice_pdf
+
+    caption = (
+        f"\U0001F6CD <b>New order</b>\n"
+        f"Order No: {order.order_number} (Code: {order.quote_code})\n"
+        f"Clinic: {order.clinic_name}\n"
+        f"Salesperson: {order.salesperson or '-'}\n"
+        f"Grand Total: $ {order.grand_total:.2f}"
+    )
+    reply_markup = {
+        "inline_keyboard": [[
+            {"text": "✅ Delivered", "callback_data": f"order:{order.id}:delivered"},
+            {"text": "❌ Cancelled", "callback_data": f"order:{order.id}:cancelled"},
+        ]]
+    }
+    data = {
+        "chat_id": settings.TELEGRAM_CHAT_ID,
+        "caption": caption,
+        "parse_mode": "HTML",
+        "reply_markup": json.dumps(reply_markup),
+    }
+    if settings.TELEGRAM_ORDER_TOPIC_ID:
+        data["message_thread_id"] = settings.TELEGRAM_ORDER_TOPIC_ID
+
+    try:
+        pdf_bytes = build_invoice_pdf(order)
+        files = {"document": (f"invoice-{order.order_number}.pdf", pdf_bytes, "application/pdf")}
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(_api_url("sendDocument"), data=data, files=files)
+            resp.raise_for_status()
+    except Exception as exc:
+        logger.warning("Failed to send Telegram order alert: %s", exc)
+
+
+async def answer_callback_query(callback_query_id: str, text: str) -> None:
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(
+                _api_url("answerCallbackQuery"),
+                json={"callback_query_id": callback_query_id, "text": text},
+            )
+    except Exception as exc:
+        logger.warning("Failed to answer Telegram callback query: %s", exc)
+
+
+async def register_webhook() -> None:
+    """Called once from app/main.py's lifespan on startup. Points Telegram at
+    POST /telegram/webhook/<TELEGRAM_WEBHOOK_SECRET> so button presses on order alerts
+    reach telegram_webhook.py. Skipped (logged, non-fatal) unless the bot token, webhook
+    secret, and a real public BASE_URL are all configured - same "optional integration"
+    pattern as the rest of this module. Local dev needs a tunnel (ngrok/cloudflared)
+    pointed at this app, with BASE_URL set to that tunnel's URL, for Telegram to
+    actually be able to reach it."""
+    if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_WEBHOOK_SECRET:
+        logger.debug("Telegram webhook not configured - skipping setWebhook.")
+        return
+    if settings.BASE_URL.startswith("http://localhost") or settings.BASE_URL.startswith("http://127.0.0.1"):
+        logger.info("BASE_URL is localhost - skipping Telegram setWebhook (use a tunnel for local testing).")
+        return
+
+    import httpx
+
+    webhook_url = f"{settings.BASE_URL.rstrip('/')}/telegram/webhook/{settings.TELEGRAM_WEBHOOK_SECRET}"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                _api_url("setWebhook"),
+                json={
+                    "url": webhook_url,
+                    "secret_token": settings.TELEGRAM_WEBHOOK_SECRET,
+                    "allowed_updates": ["callback_query"],
+                },
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            if not body.get("ok"):
+                logger.warning("Telegram setWebhook responded with an error: %s", body)
+            else:
+                logger.info("Telegram webhook registered at %s", webhook_url)
+    except Exception as exc:
+        logger.warning("Failed to register Telegram webhook: %s", exc)
+
+
+async def clear_order_alert_buttons(chat_id: int, message_id: int, new_caption: str) -> None:
+    """Removes the Delivered/Cancelled buttons and updates the caption after one of
+    them has been pressed, so the decision can't be made twice."""
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(
+                _api_url("editMessageCaption"),
+                json={
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "caption": new_caption,
+                    "parse_mode": "HTML",
+                },
+            )
+            await client.post(
+                _api_url("editMessageReplyMarkup"),
+                json={
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "reply_markup": json.dumps({"inline_keyboard": []}),
+                },
+            )
+    except Exception as exc:
+        logger.warning("Failed to clear Telegram order alert buttons: %s", exc)

@@ -62,6 +62,11 @@ class Settings(BaseSettings):
     # Leave empty to post to the group's General topic.
     TELEGRAM_ERROR_TOPIC_ID: str = ""
     TELEGRAM_LOGIN_TOPIC_ID: str = ""
+    TELEGRAM_ORDER_TOPIC_ID: str = ""
+    # Shared secret this app requires in the webhook URL/header Telegram calls back on
+    # (see app/routers/telegram_webhook.py) - anyone who doesn't know it gets a 404/403.
+    # Generate a random string for this, e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+    TELEGRAM_WEBHOOK_SECRET: str = ""
 
     # --- File uploads ------------------------------------------------------
     UPLOAD_DIR: str = "static/uploads"

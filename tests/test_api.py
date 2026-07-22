@@ -921,7 +921,7 @@ def test_order_salesperson_and_user_are_server_derived(client, db_session):
     assert body["quoted_by_name"] == "Test Customer"
 
 
-def test_order_percent_discount_open_to_any_quoting_principal(client, db_session):
+def test_order_percent_discount_requires_product_management(client, db_session):
     from app.models import User
     from app.core.security import hash_password
 
@@ -936,10 +936,18 @@ def test_order_percent_discount_open_to_any_quoting_principal(client, db_session
     db_session.add(pricing_only)
     db_session.commit()
 
-    admin_headers = auth_header(client, "pricingonly@example.com", "password123")
-    make_admin(db_session, email="orderadmin3@example.com", password="password123")
-    creator_headers = auth_header(client, "orderadmin3@example.com", "password123")
-    product = _make_order_product(client, creator_headers, name="Widget3", price="100.00")
+    pricing_headers = auth_header(client, "pricingonly@example.com", "password123")
+    admin = make_admin(db_session, email="orderadmin3@example.com", password="password123")
+    admin_headers = auth_header(client, "orderadmin3@example.com", "password123")
+    product = _make_order_product(client, admin_headers, name="Widget3", price="100.00")
+
+    # price_listing alone is not enough to apply any discount - only product_management is.
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(product["id"], discount_type="percent", discount_value=10),
+        headers=pricing_headers,
+    )
+    assert resp.status_code == 403
 
     resp = client.post(
         "/orders/",

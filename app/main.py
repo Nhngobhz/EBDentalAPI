@@ -19,8 +19,10 @@ from app.routers import (
     orders,
     products,
     promotions,
+    telegram_webhook,
     users,
 )
+from app.services.telegram import register_webhook
 
 setup_logging()
 logger = get_logger("main")
@@ -34,6 +36,7 @@ async def lifespan(app: FastAPI):
         logger.info("AUTO_CREATE_TABLES=true - running Base.metadata.create_all()")
         Base.metadata.create_all(bind=engine)
     logger.info("%s started (environment=%s)", settings.APP_NAME, settings.ENVIRONMENT)
+    await register_webhook()
     yield
 
 
@@ -73,6 +76,7 @@ app.include_router(products.router)
 app.include_router(manuals.router)
 app.include_router(promotions.router)
 app.include_router(orders.router)
+app.include_router(telegram_webhook.router)
 
 
 @app.get("/health", tags=["Health"])

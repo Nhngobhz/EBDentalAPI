@@ -20,7 +20,7 @@ import string
 from decimal import Decimal
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.deps import oauth2_scheme, require_permission
@@ -28,6 +28,7 @@ from app.core.security import decode_access_token
 from app.database import get_db
 from app.models import Customer, Order, OrderItem, Product, User
 from app.schemas import OrderCreate, OrderOut, OrderUpdate
+from app.services.telegram import send_order_alert
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
@@ -123,6 +124,7 @@ def _generate_quote_code(db: Session) -> str:
 @router.post("/", response_model=OrderOut, status_code=status.HTTP_201_CREATED)
 def create_order(
     payload: OrderCreate,
+    background_tasks: BackgroundTasks,
     principal: tuple[Customer | None, User | None] = Depends(_get_ordering_principal),
     db: Session = Depends(get_db),
 ):
@@ -138,14 +140,16 @@ def create_order(
         salesperson = "Website"
         quoted_by_name = customer.customer_name
 
-    # A cash discount is a real reduction staff hand out at their own discretion - gated to
-    # product_management specifically (a customer, or a price_listing-only staffer, can
-    # still apply a percent discount, just not a cash one).
-    if payload.discount_type == "cash" and payload.discount_value > 0:
+    # Any order-level discount (percent or cash) is a real reduction handed out at staff
+    # discretion - gated to product_management specifically. A customer, or a
+    # price_listing-only staffer, can still place an order, just not apply a discount to
+    # it. Mirrors the quote drawer's UI, which only renders the discount control at all
+    # for product_management staff.
+    if payload.discount_value > 0:
         if user is None or not user.product_management:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="A cash discount requires the 'product_management' permission",
+                detail="A discount requires the 'product_management' permission",
             )
 
     items: list[OrderItem] = []
@@ -208,6 +212,12 @@ def create_order(
     db.add(order)
     db.commit()
     db.refresh(order)
+    # Snapshotted into a plain OrderOut (not the ORM object) before handing off to the
+    # background task - the task runs after this request's db session may already be
+    # torn down, so a lazy-loaded relationship access there would raise
+    # DetachedInstanceError. OrderOut.model_validate() reads everything needed (incl.
+    # items) right now, while the session is still live.
+    background_tasks.add_task(send_order_alert, OrderOut.model_validate(order))
     return order
 
 
