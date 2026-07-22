@@ -15,8 +15,7 @@ calling must also meet the same "can place an order" bar the frontend enforces b
 even showing the quote-cart UI: staff need price_listing or product_management,
 customers need access_permission. This is enforced here too, not just hidden in the UI.
 """
-import secrets
-import string
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import jwt
@@ -103,22 +102,20 @@ def _next_order_number(db: Session) -> str:
     return f"{(last.id + 1) if last else 1:06d}"
 
 
-_QUOTE_CODE_ALPHABET = string.ascii_uppercase
-_QUOTE_CODE_DIGITS = string.digits
-
-
 def _generate_quote_code(db: Session) -> str:
-    """Random "C. Code" - 2 letters + 6 digits, e.g. "QT483920". Looped with a uniqueness
-    check (collisions are astronomically unlikely at this alphabet size, but a quote code
-    silently colliding with an older quote would be a real, confusing bug if it ever
-    happened)."""
-    for _ in range(10):
-        code = "".join(secrets.choice(_QUOTE_CODE_ALPHABET) for _ in range(2)) + "".join(
-            secrets.choice(_QUOTE_CODE_DIGITS) for _ in range(6)
-        )
-        if not db.query(Order).filter(Order.quote_code == code).first():
-            return code
-    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not generate a unique quote code")
+    """"C. Code" - a readable yymmddhhmmss timestamp, e.g. "260722070145", instead of
+    the old random 2-letters-6-digits code. Seconds are included specifically so two
+    orders placed in the same minute don't already collide on the column's uniqueness
+    constraint; a "-2", "-3", ... suffix is still appended on the rarer same-second
+    collision - the base timestamp stays intact and readable, only same-second
+    duplicates get the extra suffix."""
+    base = datetime.now(timezone.utc).strftime("%y%m%d%H%M%S")
+    code = base
+    suffix = 1
+    while db.query(Order).filter(Order.quote_code == code).first():
+        suffix += 1
+        code = f"{base}-{suffix}"
+    return code
 
 
 @router.post("/", response_model=OrderOut, status_code=status.HTTP_201_CREATED)

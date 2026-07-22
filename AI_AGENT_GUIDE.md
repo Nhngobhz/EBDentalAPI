@@ -397,9 +397,10 @@ Notes an agent should know before calling this:
   whoever's bearer token is calling: a staff `User` → their `user_name`
   for both; a `Customer` → `"Website"` for `salesperson`, but their own
   `customer_name` for `quoted_by_name` (that one's never overridden).
-- **`quote_code`** ("C. Code" on the paper quotation form) is randomly
-  generated server-side on every create (2 letters + 6 digits, e.g.
-  `"QT483920"`) - distinct from the sequential `order_number`.
+- **`quote_code`** ("C. Code" on the paper quotation form) is a readable
+  `yymmddhhmmss` UTC timestamp generated server-side on every create (e.g.
+  `"260722070145"`), "-N" suffixed on the rare same-second collision (the
+  column is UNIQUE) - distinct from the sequential `order_number`.
 - **A cash discount (`discount_type: "cash"`, `discount_value > 0`)
   requires `product_management` specifically**, not just
   `price_listing`/`access_permission` - a `403` here doesn't mean the
