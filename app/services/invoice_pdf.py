@@ -158,17 +158,34 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
     label_width = 32
 
     def info_rows(x, rows, khmer_fields=()):
+        # Address (and potentially Clinic) can be long enough to wrap - a plain fixed-
+        # height cell() doesn't wrap at all, it just overflows past the column width and
+        # bleeds into the neighboring column's text. Measure the wrapped line count with
+        # a dry run first so the row - and everything below it in this column - can grow
+        # to fit instead of overlapping.
         y = info_top
+        value_width = col_width - label_width
         for label, value in rows:
-            pdf.set_xy(x, y)
-            _use_latin_font(pdf, 9)
-            pdf.cell(label_width, 5, label)
+            text = str(value or "—")
             if label in khmer_fields:
                 _use_khmer_font(pdf, 9, bold=True)
             else:
                 _use_latin_font(pdf, 9, bold=True)
-            pdf.cell(col_width - label_width, 5, str(value or "—"))
-            y += 5
+            lines = pdf.multi_cell(value_width, 5, text, align="L", dry_run=True, output="LINES")
+            row_height = 5 * max(1, len(lines))
+
+            pdf.set_xy(x, y)
+            _use_latin_font(pdf, 9)
+            pdf.cell(label_width, row_height, label)
+
+            if label in khmer_fields:
+                _use_khmer_font(pdf, 9, bold=True)
+            else:
+                _use_latin_font(pdf, 9, bold=True)
+            pdf.set_xy(x + label_width, y)
+            pdf.multi_cell(value_width, 5, text, align="L")
+
+            y += row_height
         return y
 
     # Clinic/Address are the two fields the website tags .qpt-khmer (main.js's
