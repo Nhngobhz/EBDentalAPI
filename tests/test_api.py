@@ -1066,7 +1066,10 @@ def test_product_cash_discount_create_and_snapshot_onto_order_item(client, db_se
     assert item["discount"] == "15.00"
 
 
-def test_product_cash_discount_cannot_exceed_price(client, db_session):
+def test_product_cash_discount_may_exceed_price(client, db_session):
+    """price is the already-discounted amount the caller computed (e.g. Flask does
+    original=100, cash discount=60 -> price=40 before calling this API), so a cash
+    discount numerically larger than price is a normal, valid state, not an error."""
     admin = make_admin(db_session, email="proddiscount2@example.com", password="password123")
     headers = auth_header(client, "proddiscount2@example.com", "password123")
     brand_id = client.post("/brands/", data={"brand_name": "CashDiscountCo2"}, headers=headers).json()["id"]
@@ -1075,15 +1078,17 @@ def test_product_cash_discount_cannot_exceed_price(client, db_session):
         "/products/",
         json={
             "product_name": "Overdiscounted Widget",
-            "price": "50.00",
+            "price": "40.00",
             "discount_type": "cash",
-            "discount": "50.00",
+            "discount": "60.00",
             "brand_id": brand_id,
         },
         headers=headers,
     )
-    assert resp.status_code == 400
-    assert "price" in resp.json()["detail"]
+    assert resp.status_code == 201, resp.text
+    product = resp.json()
+    assert product["price"] == "40.00"
+    assert product["discount"] == "60.00"
 
 
 def test_product_percent_discount_still_capped_at_100(client, db_session):

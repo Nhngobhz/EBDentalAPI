@@ -28,19 +28,6 @@ def _get_product_or_404(db: Session, product_id: int) -> Product:
     return product
 
 
-def _validate_discount_against_price(price, discount_type: str, discount) -> None:
-    """A cash discount that equals or exceeds price would make the product free (or
-    imply a negative "old price" when reconstructed for display, see
-    formatting.derive_old_price on the Flask side) - reject it outright rather than
-    silently storing a nonsensical value. Percent is already capped at 100 by the
-    schema, which alone guarantees it can never reach 100% of price."""
-    if discount_type == "cash" and discount is not None and price is not None and discount >= price:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="A cash discount cannot be greater than or equal to the product's price",
-        )
-
-
 def _serialize_product(product: Product, can_view_price: bool) -> dict:
     """Only staff and customers with access_permission=True (see
     get_price_visibility) get the real price/discount. Everyone else gets
@@ -100,7 +87,6 @@ def create_product(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="category_id does not exist")
     if payload.product_code and db.query(Product).filter(Product.product_code == payload.product_code).first():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="product_code already in use")
-    _validate_discount_against_price(payload.price, payload.discount_type, payload.discount)
 
     product = Product(**payload.model_dump())
     db.add(product)
@@ -138,13 +124,6 @@ def update_product(
     if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
 
-    if touches_price:
-        _validate_discount_against_price(
-            data.get("price", product.price),
-            data.get("discount_type", product.discount_type),
-            data.get("discount", product.discount),
-        )
-
     if "brand_id" in data and not db.query(Brand).filter(Brand.id == data["brand_id"]).first():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="brand_id does not exist")
     if (
@@ -180,11 +159,6 @@ def update_product_price(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
 
     data = payload.model_dump(exclude_unset=True)
-    _validate_discount_against_price(
-        data.get("price", product.price),
-        data.get("discount_type", product.discount_type),
-        data.get("discount", product.discount),
-    )
 
     for field, value in data.items():
         setattr(product, field, value)
