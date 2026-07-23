@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -410,11 +410,20 @@ class PromotionOut(PromotionBase):
 # Order (a finalized storefront quote - see partials/quote_drawer.html)
 # ---------------------------------------------------------------------------
 class OrderItemCreate(BaseModel):
-    """Only product_id + qty are ever accepted from the client - price/discount/name
-    are always looked up and snapshotted server-side, see routers/orders.py."""
+    """Only product_id/promotion_id + qty are ever accepted from the client -
+    price/discount/name are always looked up and snapshotted server-side, see
+    routers/orders.py. A line buys either a product or a promotion, never both -
+    exactly one of the two ids must be set."""
 
-    product_id: int
+    product_id: Optional[int] = None
+    promotion_id: Optional[int] = None
     qty: int = Field(..., gt=0)
+
+    @model_validator(mode="after")
+    def _exactly_one_id(self):
+        if (self.product_id is None) == (self.promotion_id is None):
+            raise ValueError("Exactly one of product_id or promotion_id must be set")
+        return self
 
 
 class OrderCreate(BaseModel):
@@ -454,6 +463,7 @@ class OrderUpdate(BaseModel):
 class OrderItemOut(BaseModel):
     id: int
     product_id: Optional[int] = None
+    promotion_id: Optional[int] = None
     product_name: str
     product_code: Optional[str] = None
     uom: Optional[str] = None

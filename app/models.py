@@ -279,11 +279,16 @@ class OrderItem(Base):
 
     # SET NULL (not RESTRICT): deleting a product must never block or corrupt historical
     # orders - the snapshot fields below are what actually matters once an order exists.
+    # Exactly one of product_id/promotion_id is set per line (see OrderItemCreate) - a
+    # promotion is bought the same way a product is, just priced from Promotion instead.
     product_id = Column(Integer, ForeignKey("products.id", ondelete="SET NULL"), nullable=True)
+    promotion_id = Column(Integer, ForeignKey("promotions.id", ondelete="SET NULL"), nullable=True)
 
-    # Snapshotted at order-creation time from the Product row - never re-derived later,
-    # so a historical order stays accurate even if the product's price/name/code changes
-    # or the product itself is deleted.
+    # Snapshotted at order-creation time from the Product/Promotion row - never
+    # re-derived later, so a historical order stays accurate even if the product's
+    # price/name/code changes or the product/promotion itself is deleted. Reused as-is
+    # for a promotion line (product_name holds promotion_name, product_code/uom stay
+    # null - a promotion has neither).
     product_name = Column(String(200), nullable=False)
     product_code = Column(String(50), nullable=True)
     uom = Column(String(20), nullable=True)

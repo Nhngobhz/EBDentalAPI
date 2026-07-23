@@ -27,7 +27,7 @@ from app.core.deps import oauth2_scheme, require_permission
 from app.core.files import ALLOWED_PDF_TYPES
 from app.core.security import decode_access_token
 from app.database import get_db
-from app.models import Customer, Order, OrderItem, Product, User
+from app.models import Customer, Order, OrderItem, Product, Promotion, User
 from app.schemas import OrderCreate, OrderOut, OrderUpdate
 from app.services.telegram import deliver_order_alert, resolve_pending_quotation_pdf
 
@@ -154,32 +154,76 @@ def create_order(
     items: list[OrderItem] = []
     subtotal = Decimal("0")
     discountable_subtotal = Decimal("0")
+    now = datetime.now(timezone.utc)
     for line in payload.items:
-        product = db.query(Product).filter(Product.id == line.product_id).first()
-        if not product:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"product_id {line.product_id} does not exist",
+        if line.product_id is not None:
+            product = db.query(Product).filter(Product.id == line.product_id).first()
+            if not product:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"product_id {line.product_id} does not exist",
+                )
+            line_amount = product.price * line.qty
+            items.append(
+                OrderItem(
+                    product_id=product.id,
+                    product_name=product.product_name,
+                    product_code=product.product_code,
+                    uom=product.uom,
+                    unit_price=product.price,
+                    discount_type=product.discount_type,
+                    discount=product.discount,
+                    qty=line.qty,
+                    line_amount=line_amount,
+                )
             )
-        line_amount = product.price * line.qty
-        items.append(
-            OrderItem(
-                product_id=product.id,
-                product_name=product.product_name,
-                product_code=product.product_code,
-                uom=product.uom,
-                unit_price=product.price,
-                discount_type=product.discount_type,
-                discount=product.discount,
-                qty=line.qty,
-                line_amount=line_amount,
+            subtotal += line_amount
+            # Promotional products carry a fixed promo price - the order-level discount
+            # below never applies to them, so they're excluded from the base it's
+            # computed against.
+            if product.product_type != "promotional":
+                discountable_subtotal += line_amount
+        else:
+            # A Promotion (the storefront's homepage/promotions-page marketing deal, not
+            # a Product with product_type="promotional") is bought the same way - see
+            # OrderItemCreate/schemas.py.
+            promotion = db.query(Promotion).filter(Promotion.id == line.promotion_id).first()
+            if not promotion:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"promotion_id {line.promotion_id} does not exist",
+                )
+            if not (promotion.start_date <= now <= promotion.end_date):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="This promotion is not currently active",
+                )
+            line_amount = promotion.price * line.qty
+            # Promotion has a real old_price (unlike Product, which only has
+            # discount/discount_type) - reproduce it via the same discount_type="cash"
+            # snapshot shape a product line uses, so deriveOldUnitPrice()/
+            # derive_old_price() reconstruct it identically without a schema change.
+            discount = (
+                promotion.old_price - promotion.price
+                if promotion.old_price and promotion.old_price > promotion.price
+                else Decimal("0")
             )
-        )
-        subtotal += line_amount
-        # Promotional products carry a fixed promo price - the order-level discount below
-        # never applies to them, so they're excluded from the base it's computed against.
-        if product.product_type != "promotional":
-            discountable_subtotal += line_amount
+            items.append(
+                OrderItem(
+                    promotion_id=promotion.id,
+                    product_name=promotion.promotion_name,
+                    product_code=None,
+                    uom=None,
+                    unit_price=promotion.price,
+                    discount_type="cash",
+                    discount=discount,
+                    qty=line.qty,
+                    line_amount=line_amount,
+                )
+            )
+            subtotal += line_amount
+            # A promotion is already a special deal price - the order-level discount
+            # never stacks on top of it, same exemption as a "promotional" product.
 
     if payload.discount_type == "percent":
         discount_amount = discountable_subtotal * payload.discount_value / Decimal("100")

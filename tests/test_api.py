@@ -886,6 +886,21 @@ def _order_payload(product_id, **overrides):
     return payload
 
 
+def _make_promotion(client, headers, name="Order Promo", price="50.00", old_price=None, start_offset_days=-1, end_offset_days=1):
+    now = datetime.now(timezone.utc)
+    payload = {
+        "promotion_name": name,
+        "price": price,
+        "start_date": (now + timedelta(days=start_offset_days)).isoformat(),
+        "end_date": (now + timedelta(days=end_offset_days)).isoformat(),
+    }
+    if old_price is not None:
+        payload["old_price"] = old_price
+    resp = client.post("/promotions/", json=payload, headers=headers)
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
 def test_order_requires_clinic_phone_address(client, db_session):
     admin = make_admin(db_session, email="orderadmin1@example.com", password="password123")
     headers = auth_header(client, "orderadmin1@example.com", "password123")
@@ -1026,6 +1041,107 @@ def test_promotional_product_excluded_from_discount_base(client, db_session):
     assert body["subtotal"] == "150.00"
     assert body["discount_amount"] == "10.00"
     assert body["grand_total"] == "140.00"
+
+
+def test_buy_active_promotion_creates_order_item(client, db_session):
+    admin = make_admin(db_session, email="promobuy1@example.com", password="password123")
+    headers = auth_header(client, "promobuy1@example.com", "password123")
+    promo = _make_promotion(client, headers, name="Scaler Bundle", price="50.00", old_price="80.00")
+
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(None, items=[{"promotion_id": promo["id"], "qty": 2}]),
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    item = body["items"][0]
+    assert item["promotion_id"] == promo["id"]
+    assert item["product_id"] is None
+    assert item["product_name"] == "Scaler Bundle"
+    assert item["unit_price"] == "50.00"
+    # discount snapshot reconstructs old_price (50 + 30 = 80), same shape as a
+    # product's own cash discount - see deriveOldUnitPrice()/derive_old_price().
+    assert item["discount_type"] == "cash"
+    assert item["discount"] == "30.00"
+    assert item["line_amount"] == "100.00"
+    assert body["subtotal"] == "100.00"
+
+
+def test_promotion_excluded_from_order_discount_base(client, db_session):
+    admin = make_admin(db_session, email="promobuy2@example.com", password="password123")
+    headers = auth_header(client, "promobuy2@example.com", "password123")
+    regular = _make_order_product(client, headers, name="Regular6", price="100.00")
+    promo = _make_promotion(client, headers, name="Promo6", price="50.00")
+
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(
+            None,
+            discount_type="percent",
+            discount_value=10,
+            items=[
+                {"product_id": regular["id"], "qty": 1},
+                {"promotion_id": promo["id"], "qty": 1},
+            ],
+        ),
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    # subtotal = 100 + 50 = 150; only the $100 regular line is discountable, same
+    # exemption a "promotional"-type Product gets.
+    assert body["subtotal"] == "150.00"
+    assert body["discount_amount"] == "10.00"
+    assert body["grand_total"] == "140.00"
+
+
+def test_cannot_buy_expired_or_upcoming_promotion(client, db_session):
+    admin = make_admin(db_session, email="promobuy3@example.com", password="password123")
+    headers = auth_header(client, "promobuy3@example.com", "password123")
+
+    expired = _make_promotion(client, headers, name="Expired Promo", start_offset_days=-10, end_offset_days=-5)
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(None, items=[{"promotion_id": expired["id"], "qty": 1}]),
+        headers=headers,
+    )
+    assert resp.status_code == 400
+    assert "not currently active" in resp.json()["detail"]
+
+    upcoming = _make_promotion(client, headers, name="Upcoming Promo", start_offset_days=5, end_offset_days=10)
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(None, items=[{"promotion_id": upcoming["id"], "qty": 1}]),
+        headers=headers,
+    )
+    assert resp.status_code == 400
+    assert "not currently active" in resp.json()["detail"]
+
+
+def test_order_item_requires_exactly_one_of_product_or_promotion(client, db_session):
+    admin = make_admin(db_session, email="promobuy4@example.com", password="password123")
+    headers = auth_header(client, "promobuy4@example.com", "password123")
+    product = _make_order_product(client, headers, name="Widget7")
+    promo = _make_promotion(client, headers, name="Promo7")
+
+    # neither id set
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(None, items=[{"qty": 1}]),
+        headers=headers,
+    )
+    assert resp.status_code == 422
+
+    # both ids set
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(
+            None, items=[{"product_id": product["id"], "promotion_id": promo["id"], "qty": 1}]
+        ),
+        headers=headers,
+    )
+    assert resp.status_code == 422
 
 
 # ---------------------------------------------------------------------------
