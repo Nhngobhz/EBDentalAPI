@@ -31,8 +31,9 @@ confusing (not obviously wrong) results.
   and `POST /products/` use a trailing slash; item-scoped paths like
   `GET /products/{id}` do not. This is standard FastAPI router behavior,
   not a typo - use the exact paths in section 6.
-- **9 "physical" entities**: `User` (staff), `Customer`, `Brand`,
-  `Category`, `Product`, `Manual`, `Promotion`, `Order`, `OrderItem`. An
+- **10 "physical" entities**: `User` (staff), `Customer`, `Brand`,
+  `Category`, `Product`, `Manual`, `Promotion`, `Set`, `Order`,
+  `OrderItem`. An
   `Order` is a finalized storefront **quote** (see the EB Web Project
   frontend's `quote_drawer.html`/`QuoteCart`), not a checkout/POS
   transaction - there's no cart/payment/shipping concept, just a
@@ -137,7 +138,7 @@ row, checked directly:
 | `user_management` | Create/edit/deactivate staff (`User`) accounts, view the staff list |
 | `customer_management` | Full CRUD on `Customer` records, including toggling `access_permission` |
 | `product_management` | CRUD on `Brand`, `Category`, `Product` (non-price fields), `Manual` |
-| `price_listing` | Set `price`/`discount` on `Product`, full CRUD on `Promotion` |
+| `price_listing` | Set `price`/`discount` on `Product`, full CRUD on `Promotion` and `Set` |
 
 Notes an agent should know before assuming a 403 is a bug:
 
@@ -345,9 +346,9 @@ record only.
 ### Products - `/products`
 | Method & path | Auth | Body / notes |
 |---|---|---|
-| `GET /products/` | Public | query `skip`, `limit`, `brand_id`, `category_id`, `product_type` (`"single"`/`"combo"`), `q` (name substring); price masking applies, see section 4 |
+| `GET /products/` | Public | query `skip`, `limit`, `brand_id`, `category_id`, `q` (name substring); price masking applies, see section 4 |
 | `GET /products/{id}` | Public | same masking |
-| `POST /products/` | `product_management` | JSON `ProductCreate` (`product_name`, `description?`, `badge?`, `product_type?` - `"single"`/`"combo"`, defaults `"single"` -, `product_code?` (SKU, must be globally unique or `400`), `uom?` (unit of measure, free text e.g. `"pcs"`/`"box"`), `price` >0, `discount?` (integer percent, `0`-`100`, defaults `0`), `brand_id` - must reference an existing brand or `400`, `category_id?` - must reference an existing category or `400`) |
+| `POST /products/` | `product_management` | JSON `ProductCreate` (`product_name`, `description?`, `badge?`, `product_code?` (SKU, must be globally unique or `400`), `uom?` (unit of measure, free text e.g. `"pcs"`/`"box"`), `price` >0, `discount?` (integer percent, `0`-`100`, defaults `0`), `brand_id` - must reference an existing brand or `400`, `category_id?` - must reference an existing category or `400`) |
 | `PUT /products/{id}` | `product_management`, **+`price_listing` if the body includes `price` or `discount`** | JSON `ProductUpdate`, all fields optional |
 | `PATCH /products/{id}/price` | `price_listing` only | JSON `{"price"?, "discount"?}` - use this instead of `PUT` if the caller only has `price_listing` |
 | `POST /products/{id}/image` | `product_management` | multipart `file` |
@@ -377,15 +378,30 @@ record only.
 `Product` prices - unauthenticated/unentitled callers get `price` as the
 literal string `"XXXX"` and `old_price` as `null`; see section 4.
 
-### Orders - `/orders`
-An `Order` is a finalized storefront **quote** - it only ever accepts
-`product_id`+`qty` per line; every other value (price, discount,
-`salesperson`, `quoted_by_name`, `quote_code`, the computed discount) is
-derived/priced server-side and never trusted from the request body.
+### Sets - `/sets`
+A `Set` is a bundle deal shown on the storefront's Promotions page,
+alongside `Promotion`. Same shape as `Promotion` minus `start_date`/
+`end_date` - a set is never time-boxed, it's always on sale.
 
 | Method & path | Auth | Body / notes |
 |---|---|---|
-| `POST /orders/` | `Any user` with `price_listing` or `product_management`, OR `Any customer` with `access_permission` | JSON `OrderCreate` (`clinic_name`, `phone`, `address` - all **required**; `contact_person?`, `payment_term?`, `install_term?`; `discount_type`: `"percent"`\|`"cash"`, default `"cash"`; `discount_value` ≥0, default `0`; `items`: list of `{product_id, qty}`, at least 1). See notes below. |
+| `GET /sets/` | Public | query `skip`, `limit`; price masking applies, see section 4 |
+| `GET /sets/{id}` | Public | price masking applies, see section 4 |
+| `POST /sets/` | `price_listing` | JSON `SetCreate` (`set_name`, `description?`, `price` >0, `old_price?` >0) |
+| `PUT /sets/{id}` | `price_listing` | JSON `SetUpdate`, all optional |
+| `POST /sets/{id}/image` | `price_listing` | multipart `file` |
+| `DELETE /sets/{id}` | `price_listing` | - |
+
+### Orders - `/orders`
+An `Order` is a finalized storefront **quote** - it only ever accepts
+`{product_id|promotion_id|set_id}`+`qty` per line (exactly one id per line);
+every other value (price, discount, `salesperson`, `quoted_by_name`,
+`quote_code`, the computed discount) is derived/priced server-side and
+never trusted from the request body.
+
+| Method & path | Auth | Body / notes |
+|---|---|---|
+| `POST /orders/` | `Any user` with `price_listing` or `product_management`, OR `Any customer` with `access_permission` | JSON `OrderCreate` (`clinic_name`, `phone`, `address` - all **required**; `contact_person?`, `payment_term?`, `install_term?`; `discount_type`: `"percent"`\|`"cash"`, default `"cash"`; `discount_value` ≥0, default `0`; `items`: list of `{product_id\|promotion_id\|set_id, qty}`, at least 1). See notes below. |
 | `GET /orders/` | `price_listing` | query `skip`, `limit`, `status`, `customer_id` |
 | `GET /orders/{id}` | `price_listing` | - |
 | `PUT /orders/{id}` | `price_listing` | JSON `{"status"}` - the only thing editable after creation; everything else is an immutable record of what was actually quoted |
@@ -408,13 +424,15 @@ Notes an agent should know before calling this:
   caller can't place the order at all, just that they can't apply a cash
   discount to it (a percent discount is fine for anyone who can already
   place an order). Read the `detail` message to tell the two apart.
-- **Promotional products (`Product.product_type == "promotional"`) are
-  excluded from the discount calculation entirely** - both percent and
-  cash discounts are computed only against the subtotal of non-promotional
-  lines, then subtracted from the full order subtotal. A quote mixing a
-  promotional and a regular product will show a smaller discount than
-  `discount_value`% of the full subtotal would suggest - that's expected,
-  not a bug.
+- **`Promotion`/`Set` lines are excluded from the discount calculation
+  entirely** - both percent and cash discounts are computed only against
+  the subtotal of `Product` lines, then subtracted from the full order
+  subtotal. A quote mixing a promotion/set and a regular product will show
+  a smaller discount than `discount_value`% of the full subtotal would
+  suggest - that's expected, not a bug. (Prior to 2026-07-27, this
+  exemption was instead driven by a now-removed `Product.product_type ==
+  "promotional"` value - `Product` lines have no such exemption anymore,
+  every `Product` line participates in the discount base.)
 - `discount_amount` in the response is the actual computed $ figure
   already subtracted (`grand_total = subtotal - discount_amount`) - don't
   recompute it client-side from `discount_type`/`discount_value`, the
@@ -448,23 +466,19 @@ Notes an agent should know before calling this:
   reserved test TLDs (`.test`, `.example`, `.invalid`, `.localhost`) are
   **rejected** by the validator. Use a realistic-looking domain even for
   throwaway test data.
-- `price` on `Product` and `Promotion`, and `Promotion.old_price`: must be
-  `> 0` (not `>= 0`) wherever settable - a free/zero-price item isn't
-  representable. `Product.discount` is a `0`-`100` integer percent instead,
-  not a price.
+- `price` on `Product`, `Promotion`, and `Set`, and `Promotion.old_price`/
+  `Set.old_price`: must be `> 0` (not `>= 0`) wherever settable - a
+  free/zero-price item isn't representable. `Product.discount` is a
+  `0`-`100` integer percent instead, not a price.
 - `Promotion.end_date` must be strictly after `start_date`, enforced both
   in the schema (on create) and again in the router (on update, against
-  whichever of the two values ends up in effect).
-- IDs (`brand_id`, `category_id`, `product_id`) referenced in create/update
-  payloads are checked for existence server-side and rejected with `400`
-  if dangling - don't pre-validate them client-side beyond that.
-  `category_id` is the exception that's optional (`null` allowed).
-- `Product.product_type` only accepts `"single"`, `"combo"`, or
-  `"promotional"` (see `ProductType` in `app/schemas.py`) - anything else
-  is a `422`, not a `400`, since it's a schema-level literal check rather
-  than a DB lookup. `"promotional"` products carry a fixed price that
-  order-level quote discounts never apply to - see the Orders section
-  above.
+  whichever of the two values ends up in effect). `Set` has no dates at
+  all - it's never time-boxed.
+- IDs (`brand_id`, `category_id`, `product_id`, `promotion_id`, `set_id`)
+  referenced in create/update payloads are checked for existence
+  server-side and rejected with `400` if dangling - don't pre-validate them
+  client-side beyond that. `category_id` is the exception that's optional
+  (`null` allowed).
 - `OrderCreate.discount_value` must be ≤100 when `discount_type ==
   "percent"` (checked by a `field_validator`, so this is also a `422` not
   a `400`) - there's no such cap when `discount_type == "cash"`, since a

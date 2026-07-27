@@ -174,43 +174,6 @@ def test_product_rejects_invalid_category_id(client, db_session):
     assert resp.status_code == 400
 
 
-def test_product_type_defaults_to_single_and_filters(client, db_session):
-    make_admin(db_session, email="ptype@example.com", password="password123")
-    headers = auth_header(client, "ptype@example.com", "password123")
-    brand_id = client.post("/brands/", data={"brand_name": "ComboCo"}, headers=headers).json()["id"]
-
-    single = client.post(
-        "/products/",
-        json={"product_name": "Single Item", "price": "10.00", "brand_id": brand_id},
-        headers=headers,
-    ).json()
-    assert single["product_type"] == "single"
-
-    combo = client.post(
-        "/products/",
-        json={
-            "product_name": "Combo Set",
-            "price": "50.00",
-            "brand_id": brand_id,
-            "product_type": "combo",
-        },
-        headers=headers,
-    ).json()
-    assert combo["product_type"] == "combo"
-
-    resp = client.get("/products/?product_type=combo")
-    assert resp.status_code == 200
-    assert [p["product_name"] for p in resp.json()] == ["Combo Set"]
-
-    # Not one of the allowed values (see schemas.ProductType) - rejected
-    resp = client.post(
-        "/products/",
-        json={"product_name": "Bad Type", "price": "1.00", "brand_id": brand_id, "product_type": "bogus"},
-        headers=headers,
-    )
-    assert resp.status_code == 422
-
-
 def test_full_catalog_crud_and_public_reads(client, db_session):
     make_admin(db_session, email="catalog2@example.com", password="password123")
     headers = auth_header(client, "catalog2@example.com", "password123")
@@ -866,13 +829,22 @@ def test_admin_set_password_requires_user_management(client, db_session):
 # ---------------------------------------------------------------------------
 # Orders (quotes)
 # ---------------------------------------------------------------------------
-def _make_order_product(client, headers, name="Quoted Widget", price="100.00", product_type="single"):
+def _make_order_product(client, headers, name="Quoted Widget", price="100.00"):
     brand_id = client.post("/brands/", data={"brand_name": f"OrderCo-{name}"}, headers=headers).json()["id"]
     return client.post(
         "/products/",
-        json={"product_name": name, "price": price, "brand_id": brand_id, "product_type": product_type},
+        json={"product_name": name, "price": price, "brand_id": brand_id},
         headers=headers,
     ).json()
+
+
+def _make_set(client, headers, name="Order Set", price="50.00", old_price=None):
+    payload = {"set_name": name, "price": price}
+    if old_price is not None:
+        payload["old_price"] = old_price
+    resp = client.post("/sets/", json=payload, headers=headers)
+    assert resp.status_code == 201, resp.text
+    return resp.json()
 
 
 def _order_payload(product_id, **overrides):
@@ -1014,12 +986,12 @@ def test_order_cash_discount_requires_product_management(client, db_session):
     assert body["grand_total"] == "185.00"
 
 
-def test_promotional_product_excluded_from_discount_base(client, db_session):
+def test_all_product_lines_are_discountable(client, db_session):
     admin = make_admin(db_session, email="orderadmin5@example.com", password="password123")
     headers = auth_header(client, "orderadmin5@example.com", "password123")
 
-    regular = _make_order_product(client, headers, name="Regular5", price="100.00", product_type="single")
-    promo = _make_order_product(client, headers, name="Promo5", price="50.00", product_type="promotional")
+    first = _make_order_product(client, headers, name="Regular5", price="100.00")
+    second = _make_order_product(client, headers, name="Regular5b", price="50.00")
 
     resp = client.post(
         "/orders/",
@@ -1028,19 +1000,19 @@ def test_promotional_product_excluded_from_discount_base(client, db_session):
             discount_type="percent",
             discount_value=10,
             items=[
-                {"product_id": regular["id"], "qty": 1},
-                {"product_id": promo["id"], "qty": 1},
+                {"product_id": first["id"], "qty": 1},
+                {"product_id": second["id"], "qty": 1},
             ],
         ),
         headers=headers,
     )
     assert resp.status_code == 201, resp.text
     body = resp.json()
-    # subtotal = 100 + 50 = 150; only the $100 regular line is discountable -> 10% of
-    # that ($10), not 10% of the full $150 subtotal.
+    # subtotal = 100 + 50 = 150; both product lines are discountable -> 10% of the
+    # full $150 subtotal (products no longer carry a discount-exempt type).
     assert body["subtotal"] == "150.00"
-    assert body["discount_amount"] == "10.00"
-    assert body["grand_total"] == "140.00"
+    assert body["discount_amount"] == "15.00"
+    assert body["grand_total"] == "135.00"
 
 
 def test_buy_active_promotion_creates_order_item(client, db_session):
@@ -1089,8 +1061,8 @@ def test_promotion_excluded_from_order_discount_base(client, db_session):
     )
     assert resp.status_code == 201, resp.text
     body = resp.json()
-    # subtotal = 100 + 50 = 150; only the $100 regular line is discountable, same
-    # exemption a "promotional"-type Product gets.
+    # subtotal = 100 + 50 = 150; only the $100 regular line is discountable - a
+    # promotion is already a fixed deal price, so it's excluded from the base.
     assert body["subtotal"] == "150.00"
     assert body["discount_amount"] == "10.00"
     assert body["grand_total"] == "140.00"
@@ -1139,6 +1111,73 @@ def test_order_item_requires_exactly_one_of_product_or_promotion(client, db_sess
         json=_order_payload(
             None, items=[{"product_id": product["id"], "promotion_id": promo["id"], "qty": 1}]
         ),
+        headers=headers,
+    )
+    assert resp.status_code == 422
+
+
+def test_buy_set_creates_order_item(client, db_session):
+    admin = make_admin(db_session, email="setbuy1@example.com", password="password123")
+    headers = auth_header(client, "setbuy1@example.com", "password123")
+    set_ = _make_set(client, headers, name="Scaler Set", price="50.00", old_price="80.00")
+
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(None, items=[{"set_id": set_["id"], "qty": 2}]),
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    item = body["items"][0]
+    assert item["set_id"] == set_["id"]
+    assert item["product_id"] is None
+    assert item["promotion_id"] is None
+    assert item["product_name"] == "Scaler Set"
+    assert item["unit_price"] == "50.00"
+    assert item["discount_type"] == "cash"
+    assert item["discount"] == "30.00"
+    assert item["line_amount"] == "100.00"
+    assert body["subtotal"] == "100.00"
+
+
+def test_set_excluded_from_order_discount_base(client, db_session):
+    admin = make_admin(db_session, email="setbuy2@example.com", password="password123")
+    headers = auth_header(client, "setbuy2@example.com", "password123")
+    regular = _make_order_product(client, headers, name="Regular8", price="100.00")
+    set_ = _make_set(client, headers, name="Set8", price="50.00")
+
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(
+            None,
+            discount_type="percent",
+            discount_value=10,
+            items=[
+                {"product_id": regular["id"], "qty": 1},
+                {"set_id": set_["id"], "qty": 1},
+            ],
+        ),
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    # subtotal = 100 + 50 = 150; only the $100 regular line is discountable - a set is
+    # already a fixed deal price, so it's excluded from the base.
+    assert body["subtotal"] == "150.00"
+    assert body["discount_amount"] == "10.00"
+    assert body["grand_total"] == "140.00"
+
+
+def test_order_item_requires_exactly_one_of_product_promotion_or_set(client, db_session):
+    admin = make_admin(db_session, email="setbuy3@example.com", password="password123")
+    headers = auth_header(client, "setbuy3@example.com", "password123")
+    product = _make_order_product(client, headers, name="Widget8")
+    set_ = _make_set(client, headers, name="Set9")
+
+    # both ids set
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(None, items=[{"product_id": product["id"], "set_id": set_["id"], "qty": 1}]),
         headers=headers,
     )
     assert resp.status_code == 422

@@ -46,7 +46,6 @@ def list_products(
     limit: int = 50,
     brand_id: OptionalInt = None,
     category_id: OptionalInt = None,
-    product_type: str | None = None,
     q: str | None = None,
     can_view_price: bool = Depends(get_price_visibility),
     db: Session = Depends(get_db),
@@ -59,8 +58,6 @@ def list_products(
         query = query.filter(Product.brand_id == brand_id)
     if category_id is not None:
         query = query.filter(Product.category_id == category_id)
-    if product_type:
-        query = query.filter(Product.product_type == product_type)
     if q:
         query = query.filter(Product.product_name.ilike(f"%{q}%"))
     products = query.order_by(Product.id).offset(skip).limit(limit).all()

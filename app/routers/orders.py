@@ -27,7 +27,7 @@ from app.core.deps import oauth2_scheme, require_permission
 from app.core.files import ALLOWED_PDF_TYPES
 from app.core.security import decode_access_token
 from app.database import get_db
-from app.models import Customer, Order, OrderItem, Product, Promotion, User
+from app.models import Customer, Order, OrderItem, Product, Promotion, Set, User
 from app.schemas import OrderCreate, OrderOut, OrderUpdate
 from app.services.telegram import deliver_order_alert, resolve_pending_quotation_pdf
 
@@ -178,15 +178,10 @@ def create_order(
                 )
             )
             subtotal += line_amount
-            # Promotional products carry a fixed promo price - the order-level discount
-            # below never applies to them, so they're excluded from the base it's
-            # computed against.
-            if product.product_type != "promotional":
-                discountable_subtotal += line_amount
-        else:
-            # A Promotion (the storefront's homepage/promotions-page marketing deal, not
-            # a Product with product_type="promotional") is bought the same way - see
-            # OrderItemCreate/schemas.py.
+            discountable_subtotal += line_amount
+        elif line.promotion_id is not None:
+            # A Promotion (the storefront's homepage/promotions-page marketing deal) is
+            # bought the same way a product is - see OrderItemCreate/schemas.py.
             promotion = db.query(Promotion).filter(Promotion.id == line.promotion_id).first()
             if not promotion:
                 raise HTTPException(
@@ -223,7 +218,39 @@ def create_order(
             )
             subtotal += line_amount
             # A promotion is already a special deal price - the order-level discount
-            # never stacks on top of it, same exemption as a "promotional" product.
+            # never stacks on top of it, so it's excluded from discountable_subtotal.
+        else:
+            # A Set (bundle deal on the Promotions page) - same purchase shape as a
+            # Promotion, just no start/end date to check since a set is never
+            # time-boxed.
+            set_ = db.query(Set).filter(Set.id == line.set_id).first()
+            if not set_:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"set_id {line.set_id} does not exist",
+                )
+            line_amount = set_.price * line.qty
+            discount = (
+                set_.old_price - set_.price
+                if set_.old_price and set_.old_price > set_.price
+                else Decimal("0")
+            )
+            items.append(
+                OrderItem(
+                    set_id=set_.id,
+                    product_name=set_.set_name,
+                    product_code=None,
+                    uom=None,
+                    unit_price=set_.price,
+                    discount_type="cash",
+                    discount=discount,
+                    qty=line.qty,
+                    line_amount=line_amount,
+                )
+            )
+            subtotal += line_amount
+            # Same reasoning as a promotion: already a fixed deal price, excluded from
+            # discountable_subtotal.
 
     if payload.discount_type == "percent":
         discount_amount = discountable_subtotal * payload.discount_value / Decimal("100")

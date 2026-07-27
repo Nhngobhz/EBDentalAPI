@@ -109,15 +109,14 @@ CRUD → file upload → error handling), not just written from memory - see
    than cascading. Deleting a `Product` cascades to its `Manual`s (a
    manual without its product is meaningless).
 
-10. **`Product.product_type`**: lets the catalog be sorted/filtered into
-    `"single"` items vs. `"combo"` (bundle) products, independent of
-    category - e.g. a "Portable X-ray" category contains both standalone
-    units and `"combo"` bundles that add a laptop/trolley/sensor. New
-    products default to `"single"`. Stored as a plain string rather than a
-    native Postgres enum (consistent with `badge`/`role_title` elsewhere
-    in this schema) so adding a third value later (e.g. `"bundle"`) is a
-    one-line change to `ProductType` in `app/schemas.py`, not a migration.
-    `GET /products` accepts `?product_type=combo` to filter on it.
+10. **`Product.product_type` was removed (2026-07-27).** It used to sort
+    products into `"single"`/`"combo"`/`"promotional"`, with `"promotional"`
+    exempting a product from order-level quote discounts. Dedicated
+    `Promotion` and `Set` models already cover "special, non-discountable
+    pricing" as their own tables, so the field (and the exemption it drove
+    in `create_order`) was redundant - now every `Product` line participates
+    in the order-level discount normally; `Promotion`/`Set` lines stay
+    excluded, same as before.
 
 11. **`Product.old_price` → `discount`.** Rather than storing a second
     absolute price to derive a markdown from, `Product` stores `price`
@@ -143,6 +142,16 @@ CRUD → file upload → error handling), not just written from memory - see
     Neither is masked for price visibility (see point 2) since neither is
     pricing data.
 
+13. **`Set` (added 2026-07-27):** a bundle deal shown on the storefront's
+    Promotions page, alongside `Promotion`. Same shape as `Promotion`
+    (`set_name`, `description`, `price`, `old_price`, `set_image`) minus
+    `start_date`/`end_date` - a set is never time-boxed, it's just always on
+    sale. Bought the same way a `Promotion` is: `OrderItem` gained a third
+    optional FK, `set_id` (exactly one of `product_id`/`promotion_id`/`set_id`
+    is set per line), and a `Set` line is excluded from the order-level
+    discount base for the same reason a `Promotion` line is - it already
+    carries its own deal price.
+
 ---
 
 ## 2. Project structure
@@ -164,7 +173,8 @@ app/
     telegram.py        Telegram bot notification helpers
   routers/
     auth.py, customer_auth.py, users.py, customers.py, brands.py,
-    categories.py, products.py, manuals.py, promotions.py
+    categories.py, products.py, manuals.py, promotions.py, sets.py,
+    orders.py
 alembic/               Migrations (env.py wired to app.models / .env)
 scripts/create_admin.py   Bootstrap script for the first admin account
 scripts/seed_catalog.py   Inserts a few sample brands/products for local testing
@@ -289,11 +299,12 @@ auth flows), see [`AI_AGENT_GUIDE.md`](AI_AGENT_GUIDE.md). Summary:
 | `GET/PUT /customers/me` | Any logged-in customer | Self profile. Same email re-verification behavior as `/users/me` |
 | `POST /customers/me/change-password` | Any logged-in customer | Requires `current_password` + `new_password` (only works for self-registered customers, i.e. ones with a password) |
 | `GET/POST/PUT/DELETE /customers/...` | `customer_management` | Staff-side customer management, incl. toggling `access_permission` |
-| `GET /brands`, `/categories`, `/products`, `/manuals`, `/promotions` | **Public** | Catalog browsing. `products` `price` is masked as `"XXXX"` and `discount` is omitted (`null`) unless the caller is staff or a customer with `access_permission=True`. `GET /products` also accepts `category_id` and `product_type` filters |
+| `GET /brands`, `/categories`, `/products`, `/manuals`, `/promotions`, `/sets` | **Public** | Catalog browsing. `products`/`promotions`/`sets` `price` is masked as `"XXXX"` (and `discount`/`old_price` omitted) unless the caller is staff or a customer with `access_permission=True`. `GET /products` also accepts a `category_id` filter |
 | `POST /brands/`, `POST /categories/` | `product_management` | `multipart/form-data`: `brand_name`/`category_name` plus an optional `file` to set the image in the same request |
 | `POST /manuals/` | `product_management` | `multipart/form-data`: `product_id`, optional `description`, plus an optional `file` to set the PDF in the same request |
 | `PUT/DELETE /brands/...`, `PUT/DELETE /categories/...`, `PUT/DELETE /manuals/...` | `product_management` | Deleting a `Category` that still has `Product`s assigned is rejected (400), same as `Brand` |
-| `POST/DELETE /products/...` | `product_management` (+`price_listing` if price included) | `product_type` (`"single"`/`"combo"`, default `"single"`) and optional `category_id` are set here |
+| `POST/DELETE /products/...` | `product_management` (+`price_listing` if price included) | Optional `category_id` is set here |
+| `GET/POST/PUT/DELETE /sets/...`, `POST /sets/{id}/image` | `price_listing` for writes | Same shape as `/promotions/...` - see point 13 above |
 | `PATCH /products/{id}/price` | `price_listing` | |
 | `POST/PUT/DELETE /promotions/...` | `price_listing` | |
 | `POST .../{id}/image`, `.../{id}/pdf` | Same permission as editing that resource | File uploads (still available for setting/replacing an image after creation) |

@@ -236,13 +236,6 @@ class CategoryMini(BaseModel):
 # ---------------------------------------------------------------------------
 # Product
 # ---------------------------------------------------------------------------
-# ProductType values are validated here rather than with a DB-level enum,
-# so adding a new one later (e.g. "bundle") is a one-line change, not a
-# migration - see Product.product_type in app/models.py. "promotional" products carry a
-# fixed price that order-level quote discounts never apply to - see
-# routers/orders.py::create_order's discountable_subtotal calculation.
-ProductType = Literal["single", "combo", "promotional"]
-
 # Shared by Product and Order - either a percentage (0-100) or a flat $ amount off,
 # depending on context. Declared once here (rather than separately near OrderCreate)
 # since ProductBase needs it first in file order.
@@ -253,7 +246,6 @@ class ProductBase(BaseModel):
     product_name: str = Field(..., min_length=1, max_length=200)
     description: Optional[str] = None
     badge: Optional[str] = Field(None, max_length=50)
-    product_type: ProductType = "single"
     product_code: Optional[str] = Field(None, max_length=50)
     uom: Optional[str] = Field(None, max_length=20)
 
@@ -280,7 +272,6 @@ class ProductUpdate(BaseModel):
     product_name: Optional[str] = Field(None, min_length=1, max_length=200)
     description: Optional[str] = None
     badge: Optional[str] = Field(None, max_length=50)
-    product_type: Optional[ProductType] = None
     product_code: Optional[str] = Field(None, max_length=50)
     uom: Optional[str] = Field(None, max_length=20)
     brand_id: Optional[int] = None
@@ -407,22 +398,59 @@ class PromotionOut(PromotionBase):
 
 
 # ---------------------------------------------------------------------------
+# Set (a bundle deal shown on the Promotions page - see Set in app/models.py.
+# Same shape as Promotion minus start_date/end_date, since a set isn't
+# time-boxed.)
+# ---------------------------------------------------------------------------
+class SetBase(BaseModel):
+    set_name: str = Field(..., min_length=1, max_length=200)
+    description: Optional[str] = None
+
+
+class SetCreate(SetBase):
+    price: Decimal = Field(..., gt=0)
+    old_price: Optional[Decimal] = Field(None, gt=0)
+
+
+class SetUpdate(BaseModel):
+    set_name: Optional[str] = Field(None, min_length=1, max_length=200)
+    description: Optional[str] = None
+    price: Optional[Decimal] = Field(None, gt=0)
+    old_price: Optional[Decimal] = Field(None, gt=0)
+
+
+class SetOut(SetBase):
+    id: int
+    # Union[Decimal, str]: same masking as ProductOut.price/PromotionOut.price
+    # - viewers without price access get "XXXX" instead of the real value,
+    # see app.routers.sets._serialize_set.
+    price: Union[Decimal, str]
+    old_price: Optional[Union[Decimal, str]] = None
+    set_image: Optional[str] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ---------------------------------------------------------------------------
 # Order (a finalized storefront quote - see partials/quote_drawer.html)
 # ---------------------------------------------------------------------------
 class OrderItemCreate(BaseModel):
-    """Only product_id/promotion_id + qty are ever accepted from the client -
-    price/discount/name are always looked up and snapshotted server-side, see
-    routers/orders.py. A line buys either a product or a promotion, never both -
-    exactly one of the two ids must be set."""
+    """Only product_id/promotion_id/set_id + qty are ever accepted from the
+    client - price/discount/name are always looked up and snapshotted
+    server-side, see routers/orders.py. A line buys exactly one of a
+    product, a promotion, or a set - exactly one of the three ids must be
+    set."""
 
     product_id: Optional[int] = None
     promotion_id: Optional[int] = None
+    set_id: Optional[int] = None
     qty: int = Field(..., gt=0)
 
     @model_validator(mode="after")
     def _exactly_one_id(self):
-        if (self.product_id is None) == (self.promotion_id is None):
-            raise ValueError("Exactly one of product_id or promotion_id must be set")
+        if sum(i is not None for i in (self.product_id, self.promotion_id, self.set_id)) != 1:
+            raise ValueError("Exactly one of product_id, promotion_id, or set_id must be set")
         return self
 
 
@@ -464,6 +492,7 @@ class OrderItemOut(BaseModel):
     id: int
     product_id: Optional[int] = None
     promotion_id: Optional[int] = None
+    set_id: Optional[int] = None
     product_name: str
     product_code: Optional[str] = None
     uom: Optional[str] = None

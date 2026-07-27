@@ -19,6 +19,7 @@ from app.routers import (
     orders,
     products,
     promotions,
+    sets,
     telegram_webhook,
     users,
 )
@@ -75,6 +76,7 @@ app.include_router(categories.router)
 app.include_router(products.router)
 app.include_router(manuals.router)
 app.include_router(promotions.router)
+app.include_router(sets.router)
 app.include_router(orders.router)
 app.include_router(telegram_webhook.router)
 

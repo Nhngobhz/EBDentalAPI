@@ -146,13 +146,6 @@ class Product(Base):
     # been sorted into a category yet.
     category_id = Column(Integer, ForeignKey("categories.id", ondelete="RESTRICT"), nullable=True)
 
-    # Lets the catalog be sorted/filtered into single items vs. bundled
-    # combos (e.g. "single", "combo"), independent of category. Plain
-    # string rather than a DB-level enum (matches badge/role_title
-    # elsewhere in this schema) so new values don't need a migration -
-    # allowed values are validated in ProductBase.product_type instead.
-    product_type = Column(String(20), nullable=False, server_default="single", index=True)
-
     # SKU / manufacturer code. Unique once set (see products.py router for
     # the pre-insert/update duplicate check - the DB constraint alone would
     # otherwise surface as a raw 500), but nullable since existing products
@@ -200,6 +193,23 @@ class Promotion(Base):
     start_date = Column(DateTime(timezone=True), nullable=False)
     end_date = Column(DateTime(timezone=True), nullable=False)
     promotion_image = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class Set(Base):
+    """A bundle deal shown on the Promotions page, styled like a Promotion
+    (fixed price + optional old_price, image) but always on sale - unlike
+    Promotion there's no start_date/end_date, since a set isn't time-boxed.
+    Bought the same way a Promotion is (see OrderItem.set_id)."""
+
+    __tablename__ = "sets"
+
+    id = Column(Integer, primary_key=True, index=True)
+    set_name = Column(String(200), nullable=False, index=True)
+    description = Column(Text, nullable=True)
+    price = Column(Numeric(10, 2), nullable=False)
+    old_price = Column(Numeric(10, 2), nullable=True)
+    set_image = Column(String(500), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -279,16 +289,18 @@ class OrderItem(Base):
 
     # SET NULL (not RESTRICT): deleting a product must never block or corrupt historical
     # orders - the snapshot fields below are what actually matters once an order exists.
-    # Exactly one of product_id/promotion_id is set per line (see OrderItemCreate) - a
-    # promotion is bought the same way a product is, just priced from Promotion instead.
+    # Exactly one of product_id/promotion_id/set_id is set per line (see
+    # OrderItemCreate) - a promotion or set is bought the same way a product is, just
+    # priced from Promotion/Set instead.
     product_id = Column(Integer, ForeignKey("products.id", ondelete="SET NULL"), nullable=True)
     promotion_id = Column(Integer, ForeignKey("promotions.id", ondelete="SET NULL"), nullable=True)
+    set_id = Column(Integer, ForeignKey("sets.id", ondelete="SET NULL"), nullable=True)
 
-    # Snapshotted at order-creation time from the Product/Promotion row - never
+    # Snapshotted at order-creation time from the Product/Promotion/Set row - never
     # re-derived later, so a historical order stays accurate even if the product's
-    # price/name/code changes or the product/promotion itself is deleted. Reused as-is
-    # for a promotion line (product_name holds promotion_name, product_code/uom stay
-    # null - a promotion has neither).
+    # price/name/code changes or the product/promotion/set itself is deleted. Reused
+    # as-is for a promotion/set line (product_name holds promotion_name/set_name,
+    # product_code/uom stay null - neither has them).
     product_name = Column(String(200), nullable=False)
     product_code = Column(String(50), nullable=True)
     uom = Column(String(20), nullable=True)
