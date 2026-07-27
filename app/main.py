@@ -67,6 +67,18 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+
+@app.middleware("http")
+async def add_static_cache_headers(request: Request, call_next):
+    """Let browsers cache uploaded images/PDFs for an hour instead of re-downloading
+    them on every page view. Kept moderate (not immutable) because save_named_image()
+    reuses the same filename when a product's image is replaced - after the hour,
+    StaticFiles' own ETag/Last-Modified handling turns re-checks into cheap 304s."""
+    response = await call_next(request)
+    if request.url.path.startswith("/static/") and response.status_code == 200:
+        response.headers.setdefault("Cache-Control", "public, max-age=3600")
+    return response
+
 app.include_router(auth.router)
 app.include_router(customer_auth.router)
 app.include_router(users.router)

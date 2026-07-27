@@ -210,6 +210,10 @@ class Set(Base):
     price = Column(Numeric(10, 2), nullable=False)
     old_price = Column(Numeric(10, 2), nullable=True)
     set_image = Column(String(500), nullable=True)
+    # Optional second image shown under the name/description on the storefront
+    # set card - e.g. a shot of what's inside the bundle. Purely decorative:
+    # a set without one just renders the card without it.
+    detail_image = Column(String(500), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 

@@ -92,6 +92,23 @@ async def upload_set_image(
     return set_
 
 
+@router.post("/{set_id}/detail-image", response_model=SetOut)
+async def upload_set_detail_image(
+    set_id: int, file: UploadFile, _: User = _perm, db: Session = Depends(get_db)
+):
+    """The optional second image shown under the name/description on the
+    storefront set card (see Set.detail_image). Saved under a " detail"-suffixed
+    name so it never overwrites the set's main image, which save_named_image
+    would otherwise store under the exact same key."""
+    set_ = db.query(Set).filter(Set.id == set_id).first()
+    if not set_:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Set not found")
+    set_.detail_image = await save_named_image(file, "sets", f"{set_.set_name} detail")
+    db.commit()
+    db.refresh(set_)
+    return set_
+
+
 @router.delete("/{set_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_set(set_id: int, _: User = _perm, db: Session = Depends(get_db)):
     set_ = db.query(Set).filter(Set.id == set_id).first()

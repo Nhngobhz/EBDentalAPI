@@ -427,6 +427,7 @@ class SetOut(SetBase):
     price: Union[Decimal, str]
     old_price: Optional[Union[Decimal, str]] = None
     set_image: Optional[str] = None
+    detail_image: Optional[str] = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
