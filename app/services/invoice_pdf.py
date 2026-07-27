@@ -91,9 +91,18 @@ def _format_plain_number(value: Decimal) -> str:
 
 
 def _format_item_discount(discount: Decimal, discount_type: str) -> str:
-    if not discount:
+    # Only a % discount shows inline on its own row - a $ (cash) discount is rolled into
+    # the combined "Discount($)" total row instead (see _item_display_amount below),
+    # mirroring printedItemDiscountText()/printedItemAmount() in main.js.
+    if discount_type != "percent" or not discount:
         return "—"  # em dash, matches the website's "—" placeholder
-    return f"$ {Decimal(discount):.2f}" if discount_type == "cash" else f"{_format_plain_number(discount)}%"
+    return f"{_format_plain_number(discount)}%"
+
+
+def _item_display_amount(old_unit_price: Decimal, line_amount, qty, discount_type: str) -> Decimal:
+    if discount_type == "cash":
+        return old_unit_price * qty
+    return Decimal(line_amount)
 
 
 def _money(value) -> str:
@@ -216,23 +225,30 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
 
     khmer_style = FontFace(family=_KHMER_FONT)
     undiscounted_subtotal = Decimal("0")
+    # Only $ (cash) item discounts feed the "Discount($)" total row - a % item discount
+    # is already visible inline on its own row (see _format_item_discount), so folding it
+    # into this aggregate too would double-count the same discount.
+    cash_discount_total = Decimal("0")
     item_rows = []
     for i, item in enumerate(order.items, start=1):
         old_unit_price = _derive_old_unit_price(item.unit_price, item.discount, item.discount_type)
         undiscounted_subtotal += old_unit_price * item.qty
+        if item.discount_type == "cash":
+            cash_discount_total += (old_unit_price - Decimal(item.unit_price)) * item.qty
         code = item.product_code or "—"
         # Product code/name are plain free text - unlike Clinic/Address, the website
         # doesn't tag this column .qpt-khmer either, but a browser still auto-falls-back
         # per-glyph to a font that has it, which fpdf2 won't do on its own - so any cell
         # that actually contains Khmer script gets the Khmer font+shaping explicitly.
+        display_amount = _item_display_amount(old_unit_price, item.line_amount, item.qty, item.discount_type)
         item_rows.append((
             (str(i), None), (code, khmer_style if _has_khmer(code) else None),
             (item.product_name, khmer_style if _has_khmer(item.product_name) else None),
             (str(item.qty), None), (item.uom or "PCS", None), (_money(old_unit_price), None),
-            (_format_item_discount(item.discount, item.discount_type), None), (_money(item.line_amount), None),
+            (_format_item_discount(item.discount, item.discount_type), None), (_money(display_amount), None),
         ))
 
-    item_discount_total = max(Decimal("0"), undiscounted_subtotal - Decimal(order.subtotal))
+    item_discount_total = cash_discount_total
     special_discount_label = (
         "Special Discount (Cash):" if order.discount_type == "cash"
         else f"Special Discount ({_format_plain_number(order.discount_value)}%):"
