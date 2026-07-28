@@ -11,7 +11,8 @@ Things get pushed to the configured Telegram chat:
   3. Every new order - see deliver_order_alert(), called from
      routers/orders.py::create_order. Includes the quotation PDF and inline
      Delivered/Cancelled buttons; button presses land on the webhook in
-     routers/telegram_webhook.py.
+     routers/telegram_webhook.py. If the PDF upload itself fails, the alert still
+     goes out as text - see _send_order_alert_without_pdf().
 
 If TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are not configured, these
 functions are no-ops (logged at debug level) so the app works fully
@@ -48,6 +49,23 @@ logger = get_logger("telegram")
 # html2canvas render + upload round-trip, short enough that staff never wait long for
 # their notification.
 _QUOTATION_PDF_WAIT_SECONDS = 20.0
+
+# The client quotation PDF is a full-page html2canvas PNG snapshot embedded by jsPDF
+# (main.js exportPDF) - routinely several MB, and up to MAX_PDF_SIZE_MB. A flat 15s
+# budget for the whole sendDocument round-trip was not enough for that on a normal
+# connection, so uploads died partway and the alert was lost. Split out per phase:
+# connecting stays fast-fail, but writing the body and waiting for Telegram to finish
+# ingesting a multi-MB document get real headroom. Kept as plain numbers rather than an
+# httpx.Timeout so this module still doesn't import httpx until something is actually
+# sent (see the local imports below).
+_UPLOAD_TIMEOUT_KWARGS = {"connect": 10.0, "write": 120.0, "read": 120.0, "pool": 10.0}
+
+# Transport-level failures reaching api.telegram.org (connection reset mid-upload, TLS
+# hiccup, timeout) are transient, and the previous version dropped the whole alert on the
+# first one - silently, because it logged str(exc), which for those exception types is
+# empty. Retried a couple of times, with a text-only alert as the final fallback.
+_UPLOAD_ATTEMPTS = 3
+_UPLOAD_RETRY_DELAY_SECONDS = 2.0
 
 # Single-process in-memory handoff between deliver_order_alert() (waiting) and
 # routers/orders.py's POST /{id}/quotation-pdf (resolving) - store-api runs as one
@@ -95,6 +113,30 @@ def _api_url(method: str) -> str:
     return _API_BASE.format(token=settings.TELEGRAM_BOT_TOKEN, method=method)
 
 
+def _describe(exc: BaseException) -> str:
+    """Renders an exception for a log line.
+
+    Plain `%s` is not enough here: the network-layer exceptions this module actually
+    hits (httpx.ReadError/WriteError/ConnectTimeout wrapping an httpcore or anyio
+    error, asyncio.CancelledError) very often have an EMPTY str(), which logged as
+    "Failed to send Telegram order alert: " with nothing after the colon and left
+    outages undiagnosable. The class name always carries the useful signal."""
+    detail = str(exc).strip()
+    return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+
+
+def _describe_response(resp) -> str:
+    """Telegram puts the actionable reason in the JSON body's `description`
+    ("message thread not found", "file is too big", "bot was kicked from the
+    supergroup chat", ...). raise_for_status() throws that body away, so failures are
+    read out of the response explicitly instead."""
+    try:
+        description = resp.json().get("description") or resp.text[:300]
+    except Exception:
+        description = resp.text[:300]
+    return f"HTTP {resp.status_code} - {description}"
+
+
 async def send_telegram_message(text: str, topic_id: str | None = None) -> None:
     if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
         logger.debug("Telegram not configured - skipping notification.")
@@ -111,11 +153,12 @@ async def send_telegram_message(text: str, topic_id: str | None = None) -> None:
     if topic_id:
         payload["message_thread_id"] = int(topic_id)
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
+        async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(_api_url("sendMessage"), json=payload)
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                logger.warning("Telegram rejected a notification: %s", _describe_response(resp))
     except Exception as exc:
-        logger.warning("Failed to send Telegram notification: %s", exc)
+        logger.warning("Failed to send Telegram notification: %s", _describe(exc))
 
 
 async def notify_admin_login(
@@ -181,16 +224,85 @@ async def send_order_alert(order: "OrderOut", pdf_bytes: bytes | None = None) ->
         data["message_thread_id"] = settings.TELEGRAM_ORDER_TOPIC_ID
 
     try:
+        from_client = pdf_bytes is not None
         if pdf_bytes is None:
             from app.services.invoice_pdf import build_invoice_pdf
 
             pdf_bytes = build_invoice_pdf(order)
+        logger.info(
+            "Sending Telegram order alert for order %s (%s PDF, %.1f MB).",
+            order.id, "client" if from_client else "server-rendered", len(pdf_bytes) / 1024 / 1024,
+        )
         files = {"document": (f"EB-Dental-Quotation-{order.quote_code}.pdf", pdf_bytes, "application/pdf")}
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(_api_url("sendDocument"), data=data, files=files)
-            resp.raise_for_status()
+        async with httpx.AsyncClient(timeout=httpx.Timeout(**_UPLOAD_TIMEOUT_KWARGS)) as client:
+            for attempt in range(1, _UPLOAD_ATTEMPTS + 1):
+                try:
+                    resp = await client.post(_api_url("sendDocument"), data=data, files=files)
+                except Exception as exc:
+                    # Transport-level failure (connection reset mid-upload, timeout, DNS
+                    # blip). Retried, because these are transient by nature and this is
+                    # the one notification staff actually act on - the previous version
+                    # gave up on the first one and the order went unnoticed.
+                    logger.warning(
+                        "Telegram order alert for order %s failed on attempt %s/%s: %s",
+                        order.id, attempt, _UPLOAD_ATTEMPTS, _describe(exc),
+                    )
+                    if attempt == _UPLOAD_ATTEMPTS:
+                        raise
+                    await asyncio.sleep(_UPLOAD_RETRY_DELAY_SECONDS * attempt)
+                    continue
+                if resp.status_code >= 400:
+                    # Telegram answered and said no. Not retried: a rejection is about the
+                    # request itself (bad topic, file too big, bot removed from the chat)
+                    # and resending an identical one just gets rejected identically.
+                    logger.warning(
+                        "Telegram rejected the order alert for order %s: %s",
+                        order.id, _describe_response(resp),
+                    )
+                    await _send_order_alert_without_pdf(order, caption, reply_markup)
+                    return
+                logger.info("Telegram order alert sent for order %s.", order.id)
+                return
     except Exception as exc:
-        logger.warning("Failed to send Telegram order alert: %s", exc)
+        logger.warning(
+            "Giving up on the Telegram order alert with PDF for order %s: %s",
+            order.id, _describe(exc),
+        )
+        await _send_order_alert_without_pdf(order, caption, reply_markup)
+
+
+async def _send_order_alert_without_pdf(order: "OrderOut", caption: str, reply_markup: dict) -> None:
+    """Last-resort alert when sendDocument fails (upload timed out, connection dropped,
+    Telegram rejected the file...). A text message is small enough to get through almost
+    anything the document upload can't, so a placed order is never silently invisible -
+    staff still get the order number, clinic and total, plus the same Delivered/Cancelled
+    buttons, and can pull the PDF from the admin Orders page. Deliberately not retried
+    beyond this: one alert, degraded, beats none."""
+    import httpx
+
+    payload = {
+        "chat_id": settings.TELEGRAM_CHAT_ID,
+        "text": caption + "\n\n⚠️ <i>The quotation PDF could not be attached - open the order in the admin Orders page to print it.</i>",
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+        "reply_markup": json.dumps(reply_markup),
+    }
+    if settings.TELEGRAM_ORDER_TOPIC_ID:
+        payload["message_thread_id"] = int(settings.TELEGRAM_ORDER_TOPIC_ID)
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(_api_url("sendMessage"), json=payload)
+            if resp.status_code >= 400:
+                logger.error(
+                    "Text-only fallback alert for order %s also failed: %s",
+                    order.id, _describe_response(resp),
+                )
+            else:
+                logger.info("Sent text-only fallback alert for order %s.", order.id)
+    except Exception as exc:
+        logger.error(
+            "Text-only fallback alert for order %s also failed: %s", order.id, _describe(exc)
+        )
 
 
 async def answer_callback_query(callback_query_id: str, text: str) -> None:
