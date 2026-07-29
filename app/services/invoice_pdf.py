@@ -131,14 +131,19 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
     content_width = pdf.w - pdf.l_margin - pdf.r_margin  # 190mm at A4/10mm margins
     top = pdf.get_y()
 
-    # ---- header: brand (left) / "Quotation" + No/Date (right) ----
+    # A paid KHQR order gets a Receipt; everything else (staff quote, customer cash
+    # quote) stays a Quotation - mirrors the client-side buildPrintTemplate() title.
+    is_receipt = order.payment_method == "khqr" and order.payment_status == "paid"
+    doc_title = "Receipt" if is_receipt else "Quotation"
+
+    # ---- header: brand (left) / "Quotation"/"Receipt" + No/Date (right) ----
     # Font sizes/positions mirror qpt-brand-name/qpt-title (1.6-1.7rem) and
     # qpt-brand-meta/qpt-meta-right (0.72-0.75rem) at ~96dpi/16px-root.
     pdf.set_xy(pdf.l_margin, top)
     _use_latin_font(pdf, 20, bold=True)
     pdf.cell(content_width / 2, 9, "EB DENTAL")
     pdf.set_xy(pdf.l_margin + content_width / 2, top)
-    pdf.cell(content_width / 2, 9, "Quotation", align="R")
+    pdf.cell(content_width / 2, 9, doc_title, align="R")
 
     pdf.set_xy(pdf.l_margin, top + 9)
     _use_latin_font(pdf, 8.5)
@@ -307,7 +312,9 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
 
         totals_row = table.row()
         totals_row.cell(
-            "Quotation valid for 30 days from the date issued.",
+            "Paid via KHQR. Thank you for your purchase."
+            if is_receipt
+            else "Quotation valid for 30 days from the date issued.",
             colspan=6, rowspan=4, align="L", v_align="TOP",
         )
         totals_row.cell("Sub-Total($):", colspan=1, align="L")

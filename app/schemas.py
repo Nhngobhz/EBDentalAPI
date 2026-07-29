@@ -472,6 +472,12 @@ class OrderCreate(BaseModel):
     # Decimal("0") not bare 0 - see the identical comment on ProductCreate.discount.
     discount_value: Decimal = Field(Decimal("0"), ge=0)
 
+    # Required for customers ("cash" -> quote, "khqr" -> real order awaiting payment),
+    # ignored for staff (their cart always produces a quote) - enforced in
+    # routers/orders.py::create_order, not here, since only the router knows which
+    # principal type is calling.
+    payment_method: Optional[Literal["cash", "khqr"]] = None
+
     items: list[OrderItemCreate] = Field(..., min_length=1)
 
     @field_validator("discount_value")
@@ -483,10 +489,14 @@ class OrderCreate(BaseModel):
 
 
 class OrderUpdate(BaseModel):
-    """The only thing staff can change after the fact - everything else is an
-    immutable record of what was actually quoted/sold."""
+    """The only things staff can change after the fact - everything else is an
+    immutable record of what was actually quoted/sold. payment_status exists so
+    staff can manually confirm a KHQR payment (admin Orders page "Mark as Paid")
+    when automatic Bakong checking isn't configured - the router rejects it on
+    non-KHQR rows."""
 
     status: Optional[str] = Field(None, max_length=30)
+    payment_status: Optional[Literal["unpaid", "paid"]] = None
 
 
 class OrderItemOut(BaseModel):
@@ -526,6 +536,12 @@ class OrderOut(BaseModel):
     subtotal: Decimal
     grand_total: Decimal
     status: str
+    order_type: str = "order"
+    payment_method: Optional[str] = None
+    payment_status: Optional[str] = None
+    paid_at: Optional[datetime] = None
+    khqr_string: Optional[str] = None
+    khqr_md5: Optional[str] = None
     created_at: datetime
     items: list[OrderItemOut] = []
 

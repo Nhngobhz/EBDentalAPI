@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from app.config import settings
 from tests.conftest import auth_header, customer_auth_header, make_admin, make_customer
 
@@ -901,7 +903,10 @@ def test_order_salesperson_and_user_are_server_derived(client, db_session):
 
     customer = make_customer(db_session, email="ordercust@example.com", password="customerpass1", access_permission=True)
     cust_headers = customer_auth_header(client, "ordercust@example.com", "customerpass1")
-    resp = client.post("/orders/", json=_order_payload(product["id"]), headers=cust_headers)
+    # payment_method is mandatory for customers (see the dedicated tests below).
+    resp = client.post(
+        "/orders/", json=_order_payload(product["id"], payment_method="cash"), headers=cust_headers
+    )
     assert resp.status_code == 201, resp.text
     body = resp.json()
     assert body["salesperson"] == "Website"
@@ -1263,6 +1268,447 @@ def test_product_percent_discount_still_capped_at_100(client, db_session):
         headers=headers,
     )
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Order type (quote vs. order) + KHQR payment
+# ---------------------------------------------------------------------------
+def _fast_alert_wait(monkeypatch):
+    """deliver_order_alert waits _QUOTATION_PDF_WAIT_SECONDS for the browser's PDF
+    upload before falling back - pointless (and slow) in tests, where no browser
+    ever uploads one."""
+    monkeypatch.setattr("app.services.telegram._QUOTATION_PDF_WAIT_SECONDS", 0.01)
+
+
+def test_staff_order_is_stored_as_quote(client, db_session, monkeypatch):
+    _fast_alert_wait(monkeypatch)
+    make_admin(db_session, email="quotestaff@example.com", password="password123")
+    headers = auth_header(client, "quotestaff@example.com", "password123")
+    product = _make_order_product(client, headers, name="QuoteWidget")
+
+    # Even if a staff client sends a payment_method, the row is a quote with no
+    # payment concept attached.
+    resp = client.post(
+        "/orders/", json=_order_payload(product["id"], payment_method="khqr"), headers=headers
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["order_type"] == "quote"
+    assert body["payment_method"] is None
+    assert body["payment_status"] is None
+    assert body["khqr_string"] is None
+
+
+def test_customer_must_choose_payment_method(client, db_session):
+    make_admin(db_session, email="pmadmin@example.com", password="password123")
+    admin_headers = auth_header(client, "pmadmin@example.com", "password123")
+    product = _make_order_product(client, admin_headers, name="PmWidget")
+
+    make_customer(db_session, email="pmcust@example.com", password="customerpass1", access_permission=True)
+    cust_headers = customer_auth_header(client, "pmcust@example.com", "customerpass1")
+
+    resp = client.post("/orders/", json=_order_payload(product["id"]), headers=cust_headers)
+    assert resp.status_code == 400
+    assert "payment method" in resp.json()["detail"].lower()
+
+
+def test_customer_cash_order_is_quote(client, db_session, monkeypatch):
+    _fast_alert_wait(monkeypatch)
+    make_admin(db_session, email="cashadmin@example.com", password="password123")
+    admin_headers = auth_header(client, "cashadmin@example.com", "password123")
+    product = _make_order_product(client, admin_headers, name="CashWidget")
+
+    make_customer(db_session, email="cashcust@example.com", password="customerpass1", access_permission=True)
+    cust_headers = customer_auth_header(client, "cashcust@example.com", "customerpass1")
+
+    resp = client.post(
+        "/orders/", json=_order_payload(product["id"], payment_method="cash"), headers=cust_headers
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["order_type"] == "quote"
+    assert body["payment_method"] == "cash"
+    assert body["payment_status"] is None
+    assert body["khqr_string"] is None
+
+
+def _configure_bakong(monkeypatch, account_id="testmerchant@devb"):
+    """Pins the Bakong-direct provider for a test, clearing anything the developer's
+    real .env may have configured - without this, local PayWay credentials take
+    priority and the test silently exercises the wrong provider (and calls out to
+    ABA's sandbox for real)."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "KHQR_PROVIDER", "auto")
+    monkeypatch.setattr(settings, "PAYWAY_MERCHANT_ID", "")
+    monkeypatch.setattr(settings, "PAYWAY_API_KEY", "")
+    monkeypatch.setattr(settings, "KHQR_STATIC_TEMPLATE", "")
+    monkeypatch.setattr(settings, "BAKONG_ACCOUNT_ID", account_id)
+
+
+def test_khqr_unavailable_when_not_configured(client, db_session, monkeypatch):
+    _configure_bakong(monkeypatch, account_id="")
+    make_admin(db_session, email="noqradmin@example.com", password="password123")
+    admin_headers = auth_header(client, "noqradmin@example.com", "password123")
+    product = _make_order_product(client, admin_headers, name="NoQrWidget")
+
+    make_customer(db_session, email="noqrcust@example.com", password="customerpass1", access_permission=True)
+    cust_headers = customer_auth_header(client, "noqrcust@example.com", "customerpass1")
+
+    resp = client.post(
+        "/orders/", json=_order_payload(product["id"], payment_method="khqr"), headers=cust_headers
+    )
+    assert resp.status_code == 400
+    assert "not available" in resp.json()["detail"]
+
+
+def test_customer_khqr_order_generates_payload(client, db_session, monkeypatch):
+    import hashlib
+
+    from app.services.khqr import _crc16_ccitt
+
+    _configure_bakong(monkeypatch)
+    make_admin(db_session, email="qradmin@example.com", password="password123")
+    admin_headers = auth_header(client, "qradmin@example.com", "password123")
+    product = _make_order_product(client, admin_headers, name="QrWidget", price="75.00")
+
+    make_customer(db_session, email="qrcust@example.com", password="customerpass1", access_permission=True)
+    cust_headers = customer_auth_header(client, "qrcust@example.com", "customerpass1")
+
+    resp = client.post(
+        "/orders/", json=_order_payload(product["id"], payment_method="khqr"), headers=cust_headers
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["order_type"] == "order"
+    assert body["payment_method"] == "khqr"
+    assert body["payment_status"] == "unpaid"
+
+    payload = body["khqr_string"]
+    assert payload.startswith("000201")  # tag 00, len 02, version "01"
+    assert "testmerchant@devb" in payload
+    assert "5303840" in payload  # currency tag: USD
+    assert "5406150.00" in payload  # amount tag: 2 x $75.00
+    assert body["order_number"] in payload  # bill number carries the order number
+    # CRC integrity: the last 4 chars must be the CRC of everything before them.
+    assert payload[-8:-4] == "6304"
+    assert payload[-4:] == _crc16_ccitt(payload[:-4])
+    assert body["khqr_md5"] == hashlib.md5(payload.encode()).hexdigest()
+
+
+def test_khqr_payment_status_poll_and_manual_mark_paid(client, db_session, monkeypatch):
+    _fast_alert_wait(monkeypatch)
+    _configure_bakong(monkeypatch)
+    make_admin(db_session, email="payadmin@example.com", password="password123")
+    admin_headers = auth_header(client, "payadmin@example.com", "password123")
+    product = _make_order_product(client, admin_headers, name="PayWidget")
+
+    make_customer(db_session, email="paycust@example.com", password="customerpass1", access_permission=True)
+    cust_headers = customer_auth_header(client, "paycust@example.com", "customerpass1")
+
+    order = client.post(
+        "/orders/", json=_order_payload(product["id"], payment_method="khqr"), headers=cust_headers
+    ).json()
+
+    # No Bakong token configured -> the poll can't auto-confirm; stays unpaid.
+    resp = client.get(f"/orders/{order['id']}/payment-status", headers=cust_headers)
+    assert resp.status_code == 200
+    assert resp.json() == {"payment_status": "unpaid"}
+
+    # Someone else's account can't poll it.
+    make_customer(db_session, email="otherpay@example.com", password="customerpass1", access_permission=True)
+    other_headers = customer_auth_header(client, "otherpay@example.com", "customerpass1")
+    resp = client.get(f"/orders/{order['id']}/payment-status", headers=other_headers)
+    assert resp.status_code == 403
+
+    # Staff manually mark it paid (the no-Bakong-token fallback) - paid_at gets stamped.
+    resp = client.put(
+        f"/orders/{order['id']}", json={"payment_status": "paid"}, headers=admin_headers
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["payment_status"] == "paid"
+    assert body["paid_at"] is not None
+
+    # The customer's poll now sees it.
+    resp = client.get(f"/orders/{order['id']}/payment-status", headers=cust_headers)
+    assert resp.json() == {"payment_status": "paid"}
+
+
+def test_khqr_built_from_a_bank_static_qr_template(monkeypatch):
+    """A bank's own personal/P2P QR isn't a plain name@bank alias - ABA's
+    dual-currency one carries the institution id in tag 29 sub-00 and the real
+    account number in sub-01, plus a proprietary tag 40. All of that payee routing
+    data must survive into the generated dynamic QR, or payments have nowhere to
+    land. Template values here mirror a real ABA card's structure."""
+    from decimal import Decimal
+
+    from app.config import settings
+    from app.services.khqr import _parse_tlv, build_khqr
+
+    template = (
+        "00020101021129450016abaakhppxxx@abaa01090046136230208ABA Bank"
+        "40600006abaP2P0112DA7A91479DE3020900461362303095000375630404Dual"
+        "5204000053031165802KH5910BUNTHAY TE6010Phnom Penh6304C551"
+    )
+    monkeypatch.setattr(settings, "KHQR_STATIC_TEMPLATE", template)
+    monkeypatch.setattr(settings, "BAKONG_ACCOUNT_ID", "")
+
+    payload, md5 = build_khqr(Decimal("12.50"), bill_number="000123")
+    fields = dict(_parse_tlv(payload))
+
+    # Payee routing copied through byte-for-byte, including the proprietary tag.
+    source = dict(_parse_tlv(template))
+    assert fields["29"] == source["29"]
+    assert fields["40"] == source["40"]
+    assert "004613623" in fields["29"]  # the actual account, from sub-field 01
+
+    # ...and the transaction-specific fields replaced.
+    assert fields["01"] == "12"  # static -> dynamic
+    assert fields["53"] == "840"  # USD, since every price here is USD
+    assert fields["54"] == "12.50"
+    assert fields["62"] == "0106000123"  # bill number = order_number
+    # The name stays the bank's own (matches the account), not KHQR_MERCHANT_NAME.
+    assert fields["59"] == "BUNTHAY TE"
+
+    from app.services.khqr import _crc16_ccitt
+
+    assert payload[-4:] == _crc16_ccitt(payload[:-4])
+    import hashlib
+
+    assert md5 == hashlib.md5(payload.encode()).hexdigest()
+
+
+def test_khqr_template_rejects_a_non_khqr_string(monkeypatch):
+    from decimal import Decimal
+
+    from app.config import settings
+    from app.services.khqr import build_khqr
+
+    # Well-formed TLV, but no merchant-account tag (26-51) - nothing to pay into.
+    monkeypatch.setattr(settings, "KHQR_STATIC_TEMPLATE", "00020101021158021KH")
+    monkeypatch.setattr(settings, "BAKONG_ACCOUNT_ID", "")
+    with pytest.raises(RuntimeError, match="merchant-account tag"):
+        build_khqr(Decimal("1.00"), bill_number="000001")
+
+
+def _settings(**overrides):
+    """A Settings built in isolation from the developer's real .env - otherwise
+    whatever credentials happen to be configured locally leak into these
+    assertions (and, worse, into live network calls)."""
+    from app.config import Settings
+
+    return Settings(_env_file=None, **overrides)
+
+
+def test_qr_provider_selection():
+    """PayWay wins when both providers are configured; neither -> KHQR disabled."""
+    both = _settings(PAYWAY_MERCHANT_ID="m", PAYWAY_API_KEY="k", BAKONG_ACCOUNT_ID="a@b")
+    assert both.qr_provider == "payway" and both.khqr_configured
+    bakong_only = _settings(BAKONG_ACCOUNT_ID="a@b")
+    assert bakong_only.qr_provider == "bakong" and bakong_only.khqr_configured
+    # A pasted static-QR template enables KHQR on its own, with no alias set.
+    template_only = _settings(KHQR_STATIC_TEMPLATE="000201010211...")
+    assert template_only.qr_provider == "bakong" and template_only.khqr_configured
+    neither = _settings()
+    assert neither.qr_provider == "" and not neither.khqr_configured
+
+
+def test_khqr_provider_can_be_pinned_explicitly():
+    """KHQR_PROVIDER pins the provider even with both configured - what lets a
+    PayWay-credentialed setup test against a personal bank QR. A pin naming an
+    unconfigured provider is ignored rather than disabling checkout."""
+    both = dict(PAYWAY_MERCHANT_ID="m", PAYWAY_API_KEY="k", BAKONG_ACCOUNT_ID="a@b")
+    assert _settings(**both, KHQR_PROVIDER="bakong").qr_provider == "bakong"
+    assert _settings(**both, KHQR_PROVIDER="payway").qr_provider == "payway"
+    assert _settings(**both, KHQR_PROVIDER="auto").qr_provider == "payway"
+    # Pinned to a provider that isn't set up -> falls back to the one that is.
+    assert _settings(BAKONG_ACCOUNT_ID="a@b", KHQR_PROVIDER="payway").qr_provider == "bakong"
+
+
+def test_payway_reads_the_qr_string_under_either_key(monkeypatch):
+    """PayWay's live API returns the QR under `qrString`, although its published
+    docs call it `qr_string` (confirmed against the sandbox on 2026-07-29). Reading
+    only the documented key meant a perfectly successful `code=00` purchase was
+    treated as a failure, so both spellings are accepted - and an accepted purchase
+    with no QR at all must still raise rather than return nothing."""
+    from decimal import Decimal
+
+    import httpx
+
+    from app.config import settings
+    from app.services import payway
+
+    monkeypatch.setattr(settings, "PAYWAY_MERCHANT_ID", "m")
+    monkeypatch.setattr(settings, "PAYWAY_API_KEY", "k")
+
+    def fake_client_returning(body):
+        class _Response:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return body
+
+        class _Client:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def post(self, url, files=None):
+                return _Response()
+
+        return lambda **kwargs: _Client()
+
+    monkeypatch.setattr(httpx, "Client", fake_client_returning(
+        {"status": {"code": "00"}, "qrString": "QR-CAMEL"}))
+    assert payway.create_payway_khqr(Decimal("1.00"), tran_id="T1") == "QR-CAMEL"
+
+    monkeypatch.setattr(httpx, "Client", fake_client_returning(
+        {"status": {"code": "00"}, "qr_string": "QR-SNAKE"}))
+    assert payway.create_payway_khqr(Decimal("1.00"), tran_id="T2") == "QR-SNAKE"
+
+    monkeypatch.setattr(httpx, "Client", fake_client_returning({"status": {"code": "00"}}))
+    with pytest.raises(payway.PayWayError, match="no QR code"):
+        payway.create_payway_khqr(Decimal("1.00"), tran_id="T3")
+
+    monkeypatch.setattr(httpx, "Client", fake_client_returning(
+        {"status": {"code": "5", "message": "Invalid hash"}}))
+    with pytest.raises(payway.PayWayError, match="Invalid hash"):
+        payway.create_payway_khqr(Decimal("1.00"), tran_id="T4")
+
+
+def test_payway_base_url_tolerates_a_full_endpoint_url():
+    """PayWay's docs list the base URL and endpoint path separately, so pasting the
+    whole purchase URL into PAYWAY_API_BASE is an easy mistake - it used to produce
+    a doubled path and a 404."""
+    host = "https://checkout-sandbox.payway.com.kh"
+    assert _settings(PAYWAY_API_BASE=host).payway_base_url == host
+    assert _settings(PAYWAY_API_BASE=host + "/").payway_base_url == host
+    full = host + "/api/payment-gateway/v1/payments/purchase"
+    assert _settings(PAYWAY_API_BASE=full).payway_base_url == host
+
+
+def _configure_payway(monkeypatch):
+    from app.config import settings
+
+    # KHQR_PROVIDER is pinned too: the real .env may pin "bakong", which would
+    # otherwise route these PayWay tests down the Bakong path.
+    monkeypatch.setattr(settings, "KHQR_PROVIDER", "auto")
+    monkeypatch.setattr(settings, "PAYWAY_MERCHANT_ID", "testmerchant")
+    monkeypatch.setattr(settings, "PAYWAY_API_KEY", "testkey123")
+    # No Bakong config needed - PayWay alone enables KHQR checkout.
+    monkeypatch.setattr(settings, "KHQR_STATIC_TEMPLATE", "")
+    monkeypatch.setattr(settings, "BAKONG_ACCOUNT_ID", "")
+
+
+def test_customer_khqr_order_via_payway(client, db_session, monkeypatch):
+    _configure_payway(monkeypatch)
+    # The real call would hit ABA's gateway - stub the service at its use site.
+    monkeypatch.setattr(
+        "app.routers.orders.create_payway_khqr",
+        lambda amount, tran_id: f"FAKEQR|{amount:.2f}|{tran_id}",
+    )
+    make_admin(db_session, email="pwadmin1@example.com", password="password123")
+    admin_headers = auth_header(client, "pwadmin1@example.com", "password123")
+    product = _make_order_product(client, admin_headers, name="PwWidget", price="60.00")
+
+    make_customer(db_session, email="pwcust1@example.com", password="customerpass1", access_permission=True)
+    cust_headers = customer_auth_header(client, "pwcust1@example.com", "customerpass1")
+
+    resp = client.post(
+        "/orders/", json=_order_payload(product["id"], payment_method="khqr"), headers=cust_headers
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["order_type"] == "order"
+    assert body["payment_status"] == "unpaid"
+    assert body["khqr_string"] == f"FAKEQR|120.00|{body['order_number']}"
+    # PayWay orders keep khqr_md5 empty - that's how payment checks know to go by
+    # tran_id instead of Bakong md5.
+    assert body["khqr_md5"] is None
+
+
+def test_payway_failure_degrades_to_choose_cash(client, db_session, monkeypatch):
+    from app.services.payway import PayWayError
+
+    _configure_payway(monkeypatch)
+
+    def _boom(amount, tran_id):
+        raise PayWayError("gateway down")
+
+    monkeypatch.setattr("app.routers.orders.create_payway_khqr", _boom)
+    make_admin(db_session, email="pwadmin2@example.com", password="password123")
+    admin_headers = auth_header(client, "pwadmin2@example.com", "password123")
+    product = _make_order_product(client, admin_headers, name="PwWidget2")
+
+    make_customer(db_session, email="pwcust2@example.com", password="customerpass1", access_permission=True)
+    cust_headers = customer_auth_header(client, "pwcust2@example.com", "customerpass1")
+
+    resp = client.post(
+        "/orders/", json=_order_payload(product["id"], payment_method="khqr"), headers=cust_headers
+    )
+    assert resp.status_code == 400
+    assert "choose Cash" in resp.json()["detail"]
+
+
+def test_payway_payment_status_poll_flips_to_paid(client, db_session, monkeypatch):
+    _fast_alert_wait(monkeypatch)
+    _configure_payway(monkeypatch)
+    monkeypatch.setattr(
+        "app.routers.orders.create_payway_khqr", lambda amount, tran_id: "FAKEQR"
+    )
+    make_admin(db_session, email="pwadmin3@example.com", password="password123")
+    admin_headers = auth_header(client, "pwadmin3@example.com", "password123")
+    product = _make_order_product(client, admin_headers, name="PwWidget3")
+
+    make_customer(db_session, email="pwcust3@example.com", password="customerpass1", access_permission=True)
+    cust_headers = customer_auth_header(client, "pwcust3@example.com", "customerpass1")
+
+    order = client.post(
+        "/orders/", json=_order_payload(product["id"], payment_method="khqr"), headers=cust_headers
+    ).json()
+
+    async def _not_paid(tran_id):
+        return False
+
+    async def _paid(tran_id):
+        assert tran_id == order["order_number"]  # checked by tran_id, not md5
+        return True
+
+    monkeypatch.setattr("app.routers.orders.check_payway_payment", _not_paid)
+    resp = client.get(f"/orders/{order['id']}/payment-status", headers=cust_headers)
+    assert resp.json() == {"payment_status": "unpaid"}
+
+    monkeypatch.setattr("app.routers.orders.check_payway_payment", _paid)
+    resp = client.get(f"/orders/{order['id']}/payment-status", headers=cust_headers)
+    assert resp.json() == {"payment_status": "paid"}
+
+    # Paid state is persisted, not just reported.
+    resp = client.get(f"/orders/{order['id']}", headers=admin_headers)
+    assert resp.json()["payment_status"] == "paid"
+    assert resp.json()["paid_at"] is not None
+
+
+def test_payment_status_rejected_on_non_khqr_rows(client, db_session, monkeypatch):
+    _fast_alert_wait(monkeypatch)
+    make_admin(db_session, email="npadmin@example.com", password="password123")
+    admin_headers = auth_header(client, "npadmin@example.com", "password123")
+    product = _make_order_product(client, admin_headers, name="NpWidget")
+
+    quote = client.post("/orders/", json=_order_payload(product["id"]), headers=admin_headers).json()
+
+    # A quote has no QR payment to poll...
+    resp = client.get(f"/orders/{quote['id']}/payment-status", headers=admin_headers)
+    assert resp.status_code == 400
+
+    # ...and can't be marked paid either.
+    resp = client.put(f"/orders/{quote['id']}", json={"payment_status": "paid"}, headers=admin_headers)
+    assert resp.status_code == 400
 
 
 # ---------------------------------------------------------------------------

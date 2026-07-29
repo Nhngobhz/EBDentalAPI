@@ -68,6 +68,89 @@ class Settings(BaseSettings):
     # Generate a random string for this, e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
     TELEGRAM_WEBHOOK_SECRET: str = ""
 
+    # --- KHQR payments -------------------------------------------------------
+    # Two interchangeable providers; the frontend/API behave identically either way.
+    #
+    # 1. ABA PayWay (preferred when configured): ABA Bank's merchant gateway
+    #    generates the KHQR and confirms payment automatically. Credentials come from
+    #    registering as a PayWay merchant with ABA (their integration team also
+    #    whitelists your server's IP/domain - calls fail until they do).
+    # 2. Bakong-direct: we build the KHQR payload ourselves from BAKONG_ACCOUNT_ID
+    #    (any Bakong-member bank account id, e.g. "yourname@aba" from the ABA app's
+    #    KHQR screen). Payments arrive fine without any registration; automatic
+    #    confirmation additionally needs a BAKONG_API_TOKEN from
+    #    https://api-bakong.nbc.gov.kh - without it staff confirm via "Mark as Paid".
+    #
+    # If neither is configured, KHQR checkout is disabled (customers are told to
+    # choose Cash instead).
+    PAYWAY_MERCHANT_ID: str = ""
+    # PayWay profile's API key (some PayWay docs call it the "public key").
+    PAYWAY_API_KEY: str = ""
+    # Sandbox: https://checkout-sandbox.payway.com.kh - switch to
+    # https://checkout.payway.com.kh when ABA moves you to production. Only the
+    # scheme+host is used (see payway_base_url); pasting a full endpoint URL here
+    # by mistake is tolerated rather than silently producing a doubled path.
+    PAYWAY_API_BASE: str = "https://checkout-sandbox.payway.com.kh"
+
+    @property
+    def payway_base_url(self) -> str:
+        """PAYWAY_API_BASE reduced to scheme://host. PayWay's docs list the base URL
+        and the endpoint path separately, so it's an easy mistake to paste the whole
+        `.../api/payment-gateway/v1/payments/purchase` URL into the base - which
+        would otherwise append the path twice and 404."""
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(self.PAYWAY_API_BASE.strip())
+        if parts.scheme and parts.netloc:
+            return f"{parts.scheme}://{parts.netloc}"
+        return self.PAYWAY_API_BASE.strip().rstrip("/")
+
+    # Bakong-direct comes in two flavours, both handled by services/khqr.py:
+    #  - KHQR_STATIC_TEMPLATE: paste the full payload of your bank app's own static
+    #    "receive money" QR (decode it with scripts/decode_khqr.py). Its payee
+    #    routing data is copied into every generated QR. Use this for a bank's
+    #    personal/P2P QR, where the account is NOT a plain name@bank alias - ABA's
+    #    dual-currency QR is exactly that case.
+    #  - BAKONG_ACCOUNT_ID: a true Bakong alias (`name@bank`), when you have one.
+    # KHQR_STATIC_TEMPLATE wins if both are set.
+    KHQR_STATIC_TEMPLATE: str = ""
+    BAKONG_ACCOUNT_ID: str = ""
+    KHQR_MERCHANT_NAME: str = "EB DENTAL"
+    KHQR_MERCHANT_CITY: str = "Phnom Penh"
+    BAKONG_API_TOKEN: str = ""
+    BAKONG_API_BASE: str = "https://api-bakong.nbc.gov.kh"
+
+    @property
+    def payway_configured(self) -> bool:
+        return bool(self.PAYWAY_MERCHANT_ID and self.PAYWAY_API_KEY)
+
+    # "auto" (default), "payway", or "bakong". An explicit value pins the provider
+    # even when both are configured - e.g. keeping PayWay credentials in place while
+    # testing against a personal Bakong/bank QR.
+    KHQR_PROVIDER: str = "auto"
+
+    @property
+    def qr_provider(self) -> str:
+        """"payway", "bakong", or "" (KHQR checkout disabled). On "auto", PayWay wins
+        when both are configured - it's the one that can also confirm payments by
+        itself. A provider named explicitly is only honoured if it's actually
+        configured, so a stale pin can't disable checkout outright."""
+        bakong_ready = bool(self.KHQR_STATIC_TEMPLATE or self.BAKONG_ACCOUNT_ID)
+        pinned = self.KHQR_PROVIDER.strip().lower()
+        if pinned == "payway" and self.payway_configured:
+            return "payway"
+        if pinned == "bakong" and bakong_ready:
+            return "bakong"
+        if self.payway_configured:
+            return "payway"
+        if bakong_ready:
+            return "bakong"
+        return ""
+
+    @property
+    def khqr_configured(self) -> bool:
+        return bool(self.qr_provider)
+
     # --- File uploads ------------------------------------------------------
     UPLOAD_DIR: str = "static/uploads"
     MAX_IMAGE_SIZE_MB: int = 5

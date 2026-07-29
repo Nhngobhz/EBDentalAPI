@@ -183,8 +183,63 @@ async def notify_error(error_type: str, message: str, path: str | None = None) -
     await send_telegram_message(text, topic_id=settings.TELEGRAM_ERROR_TOPIC_ID)
 
 
+def _order_alert_caption(order: "OrderOut") -> tuple[str, str]:
+    """Returns (caption, document_word) for an order's Telegram alert. Three shapes:
+    a QUOTE (staff cart, or a customer who chose Cash - explicitly flagged so staff
+    never mistake it for a paid sale), a PAID KHQR order (sent from the payment-status
+    check / manual Mark-as-Paid, carrying the receipt), and the plain new-order shape
+    kept as a fallback for anything else."""
+    if order.order_type == "quote":
+        payment_line = (
+            "Payment: Cash (to be collected)\n" if order.payment_method == "cash" else ""
+        )
+        caption = (
+            f"\U0001F4C4 <b>New QUOTE</b>\n"
+            f"Quote No: {order.order_number} (Code: {order.quote_code})\n"
+            f"Clinic: {order.clinic_name}\n"
+            f"Salesperson: {order.salesperson or '-'}\n"
+            f"{payment_line}"
+            f"Grand Total: $ {order.grand_total:.2f}\n"
+            f"ℹ️ This is a quotation - no payment has been made."
+        )
+        return caption, "Quotation"
+    if order.payment_method == "khqr" and order.payment_status == "paid":
+        caption = (
+            f"✅ <b>Order PAID via KHQR</b>\n"
+            f"Order No: {order.order_number} (Code: {order.quote_code})\n"
+            f"Clinic: {order.clinic_name}\n"
+            f"Salesperson: {order.salesperson or '-'}\n"
+            f"Amount received: $ {order.grand_total:.2f}"
+        )
+        return caption, "Receipt"
+    caption = (
+        f"\U0001F6CD <b>New order</b>\n"
+        f"Order No: {order.order_number} (Code: {order.quote_code})\n"
+        f"Clinic: {order.clinic_name}\n"
+        f"Salesperson: {order.salesperson or '-'}\n"
+        f"Grand Total: $ {order.grand_total:.2f}"
+    )
+    return caption, "Quotation"
+
+
+async def send_khqr_pending_alert(order: "OrderOut") -> None:
+    """Text-only heads-up the moment a customer places a KHQR order - no PDF and no
+    Delivered/Cancelled buttons yet, because nothing should be delivered (and no
+    receipt exists) until the payment actually lands. The full PDF-carrying alert
+    with buttons goes out via deliver_order_alert() once the order flips to paid
+    (automatic Bakong check or staff Mark-as-Paid)."""
+    text = (
+        f"\U0001F551 <b>New order - awaiting KHQR payment</b>\n"
+        f"Order No: {order.order_number} (Code: {order.quote_code})\n"
+        f"Clinic: {order.clinic_name}\n"
+        f"Amount due: $ {order.grand_total:.2f}\n"
+        f"A paid confirmation with the receipt will follow once the transfer arrives."
+    )
+    await send_telegram_message(text, topic_id=settings.TELEGRAM_ORDER_TOPIC_ID)
+
+
 async def send_order_alert(order: "OrderOut", pdf_bytes: bytes | None = None) -> None:
-    """Posts a new order to Telegram with its quotation PDF attached and
+    """Posts a new quote/paid order to Telegram with its PDF attached and
     Delivered/Cancelled buttons. Button presses come back on
     routers/telegram_webhook.py, which updates order.status directly and
     edits this message to remove the buttons - see
@@ -201,13 +256,7 @@ async def send_order_alert(order: "OrderOut", pdf_bytes: bytes | None = None) ->
 
     import httpx
 
-    caption = (
-        f"\U0001F6CD <b>New order</b>\n"
-        f"Order No: {order.order_number} (Code: {order.quote_code})\n"
-        f"Clinic: {order.clinic_name}\n"
-        f"Salesperson: {order.salesperson or '-'}\n"
-        f"Grand Total: $ {order.grand_total:.2f}"
-    )
+    caption, doc_word = _order_alert_caption(order)
     reply_markup = {
         "inline_keyboard": [[
             {"text": "✅ Delivered", "callback_data": f"order:{order.id}:delivered"},
@@ -233,7 +282,7 @@ async def send_order_alert(order: "OrderOut", pdf_bytes: bytes | None = None) ->
             "Sending Telegram order alert for order %s (%s PDF, %.1f MB).",
             order.id, "client" if from_client else "server-rendered", len(pdf_bytes) / 1024 / 1024,
         )
-        files = {"document": (f"EB-Dental-Quotation-{order.quote_code}.pdf", pdf_bytes, "application/pdf")}
+        files = {"document": (f"EB-Dental-{doc_word}-{order.quote_code}.pdf", pdf_bytes, "application/pdf")}
         async with httpx.AsyncClient(timeout=httpx.Timeout(**_UPLOAD_TIMEOUT_KWARGS)) as client:
             for attempt in range(1, _UPLOAD_ATTEMPTS + 1):
                 try:

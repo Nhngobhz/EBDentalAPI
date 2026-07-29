@@ -29,7 +29,13 @@ from app.core.security import decode_access_token
 from app.database import get_db
 from app.models import Customer, Order, OrderItem, Product, Promotion, Set, User
 from app.schemas import OrderCreate, OrderOut, OrderUpdate
-from app.services.telegram import deliver_order_alert, resolve_pending_quotation_pdf
+from app.services.khqr import build_khqr, check_bakong_payment
+from app.services.payway import PayWayError, check_payway_payment, create_payway_khqr
+from app.services.telegram import (
+    deliver_order_alert,
+    resolve_pending_quotation_pdf,
+    send_khqr_pending_alert,
+)
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
@@ -259,8 +265,54 @@ def create_order(
 
     grand_total = max(Decimal("0"), subtotal - discount_amount)
 
+    # Quote vs. real order. Staff carts ARE the quotation tool, so a staff-placed row is
+    # always a quote (payment_method doesn't apply). A customer must pick how they'll
+    # pay: Cash means payment happens offline later, so what they get is also a quote;
+    # KHQR is a real order that starts "unpaid" and carries a generated Bakong QR
+    # payload the customer pays against (receipt only exists once it flips to "paid").
+    order_number = _next_order_number(db)
+    khqr_string = khqr_md5 = None
+    if user is not None:
+        order_type = "quote"
+        payment_method = None
+        payment_status = None
+    else:
+        payment_method = payload.payment_method
+        if payment_method is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Please choose a payment method (Cash or KHQR).",
+            )
+        if payment_method == "khqr":
+            if not settings.khqr_configured:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="QR payment is not available right now - please choose Cash instead.",
+                )
+            order_type = "order"
+            payment_status = "unpaid"
+            # Two providers produce the same thing (a KHQR payload string the modal
+            # renders): ABA PayWay generates it upstream and keeps khqr_md5 NULL
+            # (payment is later checked by tran_id = order_number), Bakong-direct
+            # builds it locally and stores the md5 Bakong's check API keys on. The
+            # md5's presence is also how check_payment_status below knows which
+            # provider a historical order belongs to.
+            if settings.qr_provider == "payway":
+                try:
+                    khqr_string = create_payway_khqr(grand_total, tran_id=order_number)
+                except PayWayError:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="QR payment is temporarily unavailable - please choose Cash instead.",
+                    )
+            else:
+                khqr_string, khqr_md5 = build_khqr(grand_total, bill_number=order_number)
+        else:
+            order_type = "quote"
+            payment_status = None
+
     order = Order(
-        order_number=_next_order_number(db),
+        order_number=order_number,
         quote_code=_generate_quote_code(db),
         customer_id=customer.id if customer else None,
         created_by_user_id=user.id if user else None,
@@ -277,6 +329,11 @@ def create_order(
         discount_amount=discount_amount,
         subtotal=subtotal,
         grand_total=grand_total,
+        order_type=order_type,
+        payment_method=payment_method,
+        payment_status=payment_status,
+        khqr_string=khqr_string,
+        khqr_md5=khqr_md5,
         items=items,
     )
     db.add(order)
@@ -286,10 +343,19 @@ def create_order(
     # background task - the task runs after this request's db session may already be
     # torn down, so a lazy-loaded relationship access there would raise
     # DetachedInstanceError. OrderOut.model_validate() reads everything needed (incl.
-    # items) right now, while the session is still live. deliver_order_alert() briefly
+    # items) right now, while the session is still live.
+    #
+    # Quotes (staff or customer-cash) alert immediately: deliver_order_alert() briefly
     # waits for the browser to upload its real rendered PDF (see
-    # POST /{order_id}/quotation-pdf below) before falling back to a server-rendered one.
-    background_tasks.add_task(deliver_order_alert, OrderOut.model_validate(order))
+    # POST /{order_id}/quotation-pdf below) before falling back to a server-rendered
+    # one. A KHQR order instead gets a text-only "awaiting payment" alert now - its
+    # PDF-carrying alert (the receipt) only goes out once payment is confirmed, from
+    # check_payment_status/update_order below.
+    order_out = OrderOut.model_validate(order)
+    if payment_method == "khqr":
+        background_tasks.add_task(send_khqr_pending_alert, order_out)
+    else:
+        background_tasks.add_task(deliver_order_alert, order_out)
     return order
 
 
@@ -332,6 +398,56 @@ async def upload_quotation_pdf(
     return None
 
 
+@router.get("/{order_id}/payment-status")
+async def check_payment_status(
+    order_id: int,
+    background_tasks: BackgroundTasks,
+    principal: tuple[Customer | None, User | None] = Depends(_get_ordering_principal),
+    db: Session = Depends(get_db),
+):
+    """Polled by the browser while the KHQR modal is on screen (see the frontend's
+    QuoteCart KHQR flow). While the order is unpaid and a Bakong API token is
+    configured, each poll asks Bakong whether the transaction for this order's KHQR
+    MD5 has gone through; the first confirmed poll flips the order to "paid" and fires
+    the paid-order Telegram alert (which then waits ~20s for the browser to upload the
+    real receipt PDF it's about to render). Without a Bakong token this still works -
+    it just only ever reports what staff set manually via PUT /orders/{id}
+    ("Mark as Paid" on the admin Orders page). Same ownership gate as the
+    quotation-pdf upload: only the principal who placed the order may poll it."""
+    customer, user = principal
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    owns_order = (customer is not None and order.customer_id == customer.id) or (
+        user is not None and order.created_by_user_id == user.id
+    )
+    if not owns_order:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your order")
+    if order.payment_method != "khqr":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="This order has no QR payment to check"
+        )
+
+    if order.payment_status != "paid":
+        # A stored khqr_md5 marks a Bakong-direct order (the md5 is what Bakong's
+        # check API keys on); a PayWay order has none and is checked by
+        # tran_id = order_number instead. Branching on the order's own artifact (not
+        # the current settings) keeps historical orders checkable even if the
+        # configured provider changes later.
+        if order.khqr_md5:
+            paid = await check_bakong_payment(order.khqr_md5)
+        else:
+            paid = await check_payway_payment(order.order_number)
+        if paid:
+            order.payment_status = "paid"
+            order.paid_at = datetime.now(timezone.utc)
+            db.commit()
+            db.refresh(order)
+            background_tasks.add_task(deliver_order_alert, OrderOut.model_validate(order))
+
+    return {"payment_status": order.payment_status}
+
+
 @router.get("/", response_model=list[OrderOut])
 def list_orders(
     skip: int = 0,
@@ -358,14 +474,39 @@ def get_order(order_id: int, _: User = _perm, db: Session = Depends(get_db)):
 
 
 @router.put("/{order_id}", response_model=OrderOut)
-def update_order(order_id: int, payload: OrderUpdate, _: User = _perm, db: Session = Depends(get_db)):
+def update_order(
+    order_id: int,
+    payload: OrderUpdate,
+    background_tasks: BackgroundTasks,
+    _: User = _perm,
+    db: Session = Depends(get_db),
+):
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-    for field, value in payload.model_dump(exclude_unset=True).items():
+
+    fields = payload.model_dump(exclude_unset=True)
+    # payment_status only means anything on a KHQR order - the manual "Mark as Paid"
+    # fallback for setups without a Bakong API token. Flipping to paid stamps paid_at
+    # and sends the same paid-order alert the automatic Bakong check would (the
+    # customer's still-polling browser then sees "paid" and renders the receipt).
+    newly_paid = False
+    if "payment_status" in fields:
+        if order.payment_method != "khqr":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="payment_status only applies to KHQR orders",
+            )
+        newly_paid = fields["payment_status"] == "paid" and order.payment_status != "paid"
+
+    for field, value in fields.items():
         setattr(order, field, value)
+    if newly_paid:
+        order.paid_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(order)
+    if newly_paid:
+        background_tasks.add_task(deliver_order_alert, OrderOut.model_validate(order))
     return order
 
 

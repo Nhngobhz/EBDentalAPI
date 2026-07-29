@@ -33,12 +33,12 @@ confusing (not obviously wrong) results.
   not a typo - use the exact paths in section 6.
 - **10 "physical" entities**: `User` (staff), `Customer`, `Brand`,
   `Category`, `Product`, `Manual`, `Promotion`, `Set`, `Order`,
-  `OrderItem`. An
-  `Order` is a finalized storefront **quote** (see the EB Web Project
-  frontend's `quote_drawer.html`/`QuoteCart`), not a checkout/POS
-  transaction - there's no cart/payment/shipping concept, just a
-  server-priced snapshot of a quote once it's placed. See section 6's
-  Orders table.
+  `OrderItem`. An `Order` row is either a **quote** or a real **order**
+  (`order_type`): staff-placed rows and customer "cash" checkouts are
+  quotes (server-priced snapshots, payment happens offline later);
+  only a customer KHQR checkout is a real order, which starts
+  `payment_status: "unpaid"` and carries a generated Bakong QR payload.
+  See section 6's Orders table.
 
 ---
 
@@ -393,22 +393,55 @@ alongside `Promotion`. Same shape as `Promotion` minus `start_date`/
 | `DELETE /sets/{id}` | `price_listing` | - |
 
 ### Orders - `/orders`
-An `Order` is a finalized storefront **quote** - it only ever accepts
+An `Order` row is a **quote or a real order** (`order_type`) - it only ever accepts
 `{product_id|promotion_id|set_id}`+`qty` per line (exactly one id per line);
 every other value (price, discount, `salesperson`, `quoted_by_name`,
-`quote_code`, the computed discount) is derived/priced server-side and
-never trusted from the request body.
+`quote_code`, the computed discount, the KHQR payload) is derived/priced
+server-side and never trusted from the request body.
 
 | Method & path | Auth | Body / notes |
 |---|---|---|
-| `POST /orders/` | `Any user` with `price_listing` or `product_management`, OR `Any customer` with `access_permission` | JSON `OrderCreate` (`clinic_name`, `phone`, `address` - all **required**; `contact_person?`, `payment_term?`, `install_term?`; `discount_type`: `"percent"`\|`"cash"`, default `"cash"`; `discount_value` ≥0, default `0`; `items`: list of `{product_id\|promotion_id\|set_id, qty}`, at least 1). See notes below. |
+| `POST /orders/` | `Any user` with `price_listing` or `product_management`, OR `Any customer` with `access_permission` | JSON `OrderCreate` (`clinic_name`, `phone`, `address` - all **required**; `contact_person?`, `payment_term?`, `install_term?`; `payment_method`: `"cash"`\|`"khqr"` - **required for customers, ignored for staff**; `discount_type`: `"percent"`\|`"cash"`, default `"cash"`; `discount_value` ≥0, default `0`; `items`: list of `{product_id\|promotion_id\|set_id, qty}`, at least 1). See notes below. |
 | `GET /orders/` | `price_listing` | query `skip`, `limit`, `status`, `customer_id` |
 | `GET /orders/{id}` | `price_listing` | - |
-| `PUT /orders/{id}` | `price_listing` | JSON `{"status"}` - the only thing editable after creation; everything else is an immutable record of what was actually quoted |
+| `GET /orders/{id}/payment-status` | Same principal who placed the order | KHQR orders only (`400` otherwise). Returns `{"payment_status": "unpaid"\|"paid"}`; while unpaid and `BAKONG_API_TOKEN` is configured, each call checks Bakong for the transaction and the first confirmed one flips the order to paid (stamping `paid_at`, firing the paid-order Telegram alert). Meant to be polled by the paying customer's browser. |
+| `PUT /orders/{id}` | `price_listing` | JSON `{"status"?, "payment_status"?}` - the only things editable after creation. `payment_status` is only accepted on KHQR orders (`400` otherwise); setting `"paid"` stamps `paid_at` and fires the paid-order alert - the manual fallback when no Bakong API token is configured. |
 | `DELETE /orders/{id}` | `price_listing` | hard delete, cascades to `OrderItem` rows |
 | `POST /orders/{id}/quotation-pdf` | Same principal who placed the order | `multipart/form-data`, field `file` (a PDF) - see notes below |
 
 Notes an agent should know before calling this:
+- **`order_type` is derived, never sent**: a staff caller always creates a
+  `"quote"` (their cart IS the quotation tool - `payment_method` is ignored
+  for them and stored as `null`); a customer must send `payment_method` -
+  `"cash"` also creates a `"quote"` (payment is collected offline later),
+  `"khqr"` creates a real `"order"` with `payment_status: "unpaid"` and a
+  server-generated `khqr_string` (a KHQR/EMV payload the frontend renders
+  as a QR code). Two interchangeable providers produce it (see
+  `settings.qr_provider`): **ABA PayWay** (`PAYWAY_MERCHANT_ID`/`PAYWAY_API_KEY`,
+  wins when both are configured - generates the QR upstream, keeps
+  `khqr_md5` NULL, and payment is checked by `tran_id` = `order_number`)
+  or **Bakong-direct** (payload built locally by `services/khqr.py`,
+  `khqr_md5` stored for Bakong's check_transaction_by_md5). `KHQR_PROVIDER`
+  pins one explicitly; "auto" (default) prefers PayWay. The stored
+  `khqr_md5`'s presence is how a historical order's provider is
+  recognized. If neither is configured, a `"khqr"` request gets a `400`
+  telling the customer to choose Cash.
+- **Bakong-direct has two configuration shapes**, because a bank's own
+  personal QR often isn't a plain `name@bank` alias: `KHQR_STATIC_TEMPLATE`
+  (paste the full payload of the bank app's static "receive money" QR -
+  every tag in the EMV merchant-account range 26-51 is copied through
+  verbatim, so bank-proprietary routing survives) or `BAKONG_ACCOUNT_ID` (a
+  real alias). ABA's dual-currency personal QR is exactly the first case:
+  tag 29 sub-00 holds the *institution* id `abaakhppxxx@abaa`, the account
+  number is in sub-01, and a proprietary tag 40 carries the P2P token -
+  building from sub-00 alone yields a QR naming the bank but no account.
+  `scripts/decode_khqr.py` dumps any KHQR (image or payload string)
+  field-by-field and is the fastest way to inspect either side.
+- **Receipts vs. quotations**: the printed document for a quote is a
+  Quotation; a KHQR order only ever gets a Receipt, and only after
+  `payment_status` is `"paid"` (the frontend generates it when the
+  payment-status poll flips; the server-side fallback PDF titles itself
+  the same way).
 - **`salesperson`/`quoted_by_name` are never accepted from the client** -
   `OrderCreate` doesn't even have those fields. They're derived from
   whoever's bearer token is calling: a staff `User` → their `user_name`

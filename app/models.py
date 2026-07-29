@@ -276,6 +276,27 @@ class Order(Base):
     # requested. Defaults to "pending"; staff can update it via PUT /orders/{id}.
     status = Column(String(30), nullable=False, server_default="pending")
 
+    # "quote" or "order". Staff always produce quotes (their cart IS the quote tool),
+    # and a customer choosing Cash also gets a quote (payment happens offline later).
+    # Only a customer checking out with KHQR creates a real "order" - see
+    # routers/orders.py::create_order. Existing rows were backfilled to "quote" by the
+    # migration (nothing placed before this column existed ever took a payment).
+    order_type = Column(String(10), nullable=False, server_default="order")
+
+    # NULL for staff quotes (no payment concept there); "cash" or "khqr" for
+    # customer-placed rows. payment_status/paid_at only ever apply to KHQR orders:
+    # "unpaid" until the Bakong transaction is confirmed (GET /orders/{id}/payment-status
+    # polling) or staff mark it paid, then "paid".
+    payment_method = Column(String(10), nullable=True)
+    payment_status = Column(String(20), nullable=True)
+    paid_at = Column(DateTime(timezone=True), nullable=True)
+
+    # The generated KHQR (EMV) payload string shown to the customer as a QR code, and
+    # its MD5 - the MD5 is what Bakong's check_transaction_by_md5 API keys on, so both
+    # are persisted with the order (see app/services/khqr.py).
+    khqr_string = Column(String(512), nullable=True)
+    khqr_md5 = Column(String(32), nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     customer = relationship("Customer")
