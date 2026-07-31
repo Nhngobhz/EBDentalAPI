@@ -9,6 +9,12 @@ from the request body. This keeps historical orders accurate even if a product's
 later changes or the product itself is deleted, and prevents a tampered request from
 recording a fabricated discount.
 
+A submitted line can also produce extra lines the client never asked for: a
+Promotion/Set is a collection of products, and a Product may come with freebies, so
+each of those expands into $0 COMPONENT lines under the paid one (see _component_items
+and OrderItem.parent_item_id). Components are priced at zero by construction, so they
+can never be used to shift a total - the "free" flag is not something a client can set.
+
 Creating an order accepts either a staff (User) or Customer bearer token, mirroring how
 POST /auth/login tries both - see _get_ordering_principal. Whichever kind of account is
 calling must also meet the same "can place an order" bar the frontend enforces before
@@ -23,6 +29,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Up
 from sqlalchemy.orm import Session, joinedload
 
 from app.config import settings
+from app.core.bundles import bundle_old_price
 from app.core.deps import oauth2_scheme, require_permission
 from app.core.files import ALLOWED_PDF_TYPES
 from app.core.security import decode_access_token
@@ -105,6 +112,37 @@ def _get_ordering_principal(
     return customer, None
 
 
+def _component_items(rows, parent_qty: int) -> list[OrderItem]:
+    """Expands a bundle's contents into the $0 lines that go on the order under
+    the paid line - the member products of a Promotion/Set, or the freebies a
+    Product comes with (see PromotionItem/SetItem/ProductFreeItem).
+
+    Snapshotted like any other line (name/code/uom copied, never re-derived), but
+    always at unit_price/discount/line_amount = 0: the bundle's own price already
+    covers them, so they must not move subtotal, the discount base, or the grand
+    total. Quantities multiply - 2 of a set that contains 3 gloves is 6 gloves.
+    """
+    components = []
+    for row in rows:
+        product = row.product
+        if product is None:  # defensive: ON DELETE CASCADE should have removed the row
+            continue
+        components.append(
+            OrderItem(
+                product_id=product.id,
+                product_name=product.product_name,
+                product_code=product.product_code,
+                uom=product.uom,
+                unit_price=Decimal("0"),
+                discount_type="percent",
+                discount=Decimal("0"),
+                qty=row.qty * parent_qty,
+                line_amount=Decimal("0"),
+            )
+        )
+    return components
+
+
 def _next_order_number(db: Session) -> str:
     last = db.query(Order).order_by(Order.id.desc()).first()
     return f"{(last.id + 1) if last else 1:06d}"
@@ -161,6 +199,18 @@ def create_order(
     subtotal = Decimal("0")
     discountable_subtotal = Decimal("0")
     now = datetime.now(timezone.utc)
+
+    def add_line(parent: OrderItem, contents) -> None:
+        """Records a paid line plus the $0 component lines spelling out what it
+        includes. Components go into BOTH parent.components (so SQLAlchemy
+        inserts the parent first and fills in their parent_item_id) and the flat
+        `items` list (so they get order_id and show up in OrderOut.items),
+        immediately after their parent so id order == print order."""
+        components = _component_items(contents, parent.qty)
+        parent.components = components
+        items.append(parent)
+        items.extend(components)
+
     for line in payload.items:
         if line.product_id is not None:
             product = db.query(Product).filter(Product.id == line.product_id).first()
@@ -170,7 +220,8 @@ def create_order(
                     detail=f"product_id {line.product_id} does not exist",
                 )
             line_amount = product.price * line.qty
-            items.append(
+            # Whatever this product comes with for free rides along as $0 lines.
+            add_line(
                 OrderItem(
                     product_id=product.id,
                     product_name=product.product_name,
@@ -181,7 +232,8 @@ def create_order(
                     discount=product.discount,
                     qty=line.qty,
                     line_amount=line_amount,
-                )
+                ),
+                product.free_items,
             )
             subtotal += line_amount
             discountable_subtotal += line_amount
@@ -204,12 +256,18 @@ def create_order(
             # discount/discount_type) - reproduce it via the same discount_type="cash"
             # snapshot shape a product line uses, so deriveOldUnitPrice()/
             # derive_old_price() reconstruct it identically without a schema change.
+            # bundle_old_price (not the raw column): for a promotion that lists
+            # its contents, the "was" price is what those members cost
+            # separately, so the saving printed on the quote is the real one.
+            old_price = bundle_old_price(promotion)
             discount = (
-                promotion.old_price - promotion.price
-                if promotion.old_price and promotion.old_price > promotion.price
+                old_price - promotion.price
+                if old_price and old_price > promotion.price
                 else Decimal("0")
             )
-            items.append(
+            # A promotion is a collection of products: its members go on the
+            # order as $0 lines under it, so the quote lists what's inside.
+            add_line(
                 OrderItem(
                     promotion_id=promotion.id,
                     product_name=promotion.promotion_name,
@@ -220,7 +278,8 @@ def create_order(
                     discount=discount,
                     qty=line.qty,
                     line_amount=line_amount,
-                )
+                ),
+                promotion.items,
             )
             subtotal += line_amount
             # A promotion is already a special deal price - the order-level discount
@@ -236,12 +295,15 @@ def create_order(
                     detail=f"set_id {line.set_id} does not exist",
                 )
             line_amount = set_.price * line.qty
+            # Same contents-derived "was" price as a promotion line above.
+            old_price = bundle_old_price(set_)
             discount = (
-                set_.old_price - set_.price
-                if set_.old_price and set_.old_price > set_.price
+                old_price - set_.price
+                if old_price and old_price > set_.price
                 else Decimal("0")
             )
-            items.append(
+            # Same collection-of-products expansion as a promotion above.
+            add_line(
                 OrderItem(
                     set_id=set_.id,
                     product_name=set_.set_name,
@@ -252,7 +314,8 @@ def create_order(
                     discount=discount,
                     qty=line.qty,
                     line_amount=line_amount,
-                )
+                ),
+                set_.items,
             )
             subtotal += line_amount
             # Same reasoning as a promotion: already a fixed deal price, excluded from

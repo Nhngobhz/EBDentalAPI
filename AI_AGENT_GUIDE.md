@@ -33,7 +33,10 @@ confusing (not obviously wrong) results.
   not a typo - use the exact paths in section 6.
 - **10 "physical" entities**: `User` (staff), `Customer`, `Brand`,
   `Category`, `Product`, `Manual`, `Promotion`, `Set`, `Order`,
-  `OrderItem`. An `Order` row is either a **quote** or a real **order**
+  `OrderItem`. Three join tables hang off them and are never addressed
+  directly (they're edited as a field of their owner - see "Bundle
+  contents" in section 6): `PromotionItem`, `SetItem`, `ProductFreeItem`.
+  An `Order` row is either a **quote** or a real **order**
   (`order_type`): staff-placed rows and customer "cash" checkouts are
   quotes (server-priced snapshots, payment happens offline later);
   only a customer KHQR checkout is a real order, which starts
@@ -348,11 +351,11 @@ record only.
 |---|---|---|
 | `GET /products/` | Public | query `skip`, `limit`, `brand_id`, `category_id`, `q` (name substring); price masking applies, see section 4 |
 | `GET /products/{id}` | Public | same masking |
-| `POST /products/` | `product_management` | JSON `ProductCreate` (`product_name`, `description?`, `badge?`, `product_code?` (SKU, must be globally unique or `400`), `uom?` (unit of measure, free text e.g. `"pcs"`/`"box"`), `price` >0, `discount?` (integer percent, `0`-`100`, defaults `0`), `brand_id` - must reference an existing brand or `400`, `category_id?` - must reference an existing category or `400`) |
+| `POST /products/` | `product_management` | JSON `ProductCreate` (`product_name`, `description?`, `badge?`, `product_code?` (SKU, must be globally unique or `400`), `uom?` (unit of measure, free text e.g. `"pcs"`/`"box"`), `price` >0, `discount?` (integer percent, `0`-`100`, defaults `0`), `brand_id` - must reference an existing brand or `400`, `category_id?` - must reference an existing category or `400`, `free_items?` - products given away free with this one, see "Bundle contents" below) |
 | `PUT /products/{id}` | `product_management`, **+`price_listing` if the body includes `price` or `discount`** | JSON `ProductUpdate`, all fields optional |
-| `PATCH /products/{id}/price` | `price_listing` only | JSON `{"price"?, "discount"?}` - use this instead of `PUT` if the caller only has `price_listing` |
+| `PATCH /products/{id}/price` | `price_listing` only | JSON `{"price"?, "discount"?}` - use this instead of `PUT` if the caller only has `price_listing` (it can't touch `free_items` - use `PUT` for that) |
 | `POST /products/{id}/image` | `product_management` | multipart `file` |
-| `DELETE /products/{id}` | `product_management` | cascades: deletes the product's `Manual`s too |
+| `DELETE /products/{id}` | `product_management` | cascades: deletes the product's `Manual`s too, and drops it from any bundle/free-item list it appears in |
 
 ### Manuals - `/manuals`
 | Method & path | Auth | Body / notes |
@@ -370,7 +373,7 @@ record only.
 |---|---|---|
 | `GET /promotions/` | Public | query `skip`, `limit`, `active_only` (bool - filters to `start_date <= now <= end_date`); price masking applies, see section 4 |
 | `GET /promotions/{id}` | Public | price masking applies, see section 4 |
-| `POST /promotions/` | `price_listing` | JSON `PromotionCreate` (`promotion_name`, `description?`, `price` >0, `old_price?` >0, `start_date`, `end_date` - must be after `start_date` or `422`) |
+| `POST /promotions/` | `price_listing` | JSON `PromotionCreate` (`promotion_name`, `description?`, `price` >0, `old_price?` >0, `start_date`, `end_date` - must be after `start_date` or `422`, `items?` - see "Bundle contents" below) |
 | `PUT /promotions/{id}` | `price_listing` | JSON `PromotionUpdate`, all optional; if you change only one of `start_date`/`end_date`, the other's current value is still validated against it |
 | `DELETE /promotions/{id}` | `price_listing` | - |
 
@@ -387,10 +390,43 @@ alongside `Promotion`. Same shape as `Promotion` minus `start_date`/
 |---|---|---|
 | `GET /sets/` | Public | query `skip`, `limit`; price masking applies, see section 4 |
 | `GET /sets/{id}` | Public | price masking applies, see section 4 |
-| `POST /sets/` | `price_listing` | JSON `SetCreate` (`set_name`, `description?`, `price` >0, `old_price?` >0) |
+| `POST /sets/` | `price_listing` | JSON `SetCreate` (`set_name`, `description?`, `price` >0, `old_price?` >0, `items?` - see "Bundle contents" below) |
 | `PUT /sets/{id}` | `price_listing` | JSON `SetUpdate`, all optional |
 | `POST /sets/{id}/image` | `price_listing` | multipart `file` |
+| `POST /sets/{id}/detail-image` | `price_listing` | multipart `file` (the optional second image under the name/description) |
 | `DELETE /sets/{id}` | `price_listing` | - |
+
+### Bundle contents - `Promotion.items` / `Set.items` / `Product.free_items`
+
+**A `Promotion` and a `Set` are collections of products**, and a `Product`
+may come with other products for free. All three use the same field shape:
+
+- **Writing** (`POST`/`PUT`): `[{"product_id": 12, "qty": 2}, ...]`.
+  `qty` defaults to `1`. A `400` comes back for an unknown `product_id`, the
+  same product listed twice, or a product listed as its own freebie.
+- **Reading** (`GET`): `[{"product_id", "product_name", "product_code",
+  "uom", "qty"}, ...]` - name/code/uom are read from the **live** `Product`
+  row, so renaming a product updates every bundle it appears in. Contents
+  are **not** price-masked (what a deal contains isn't a price).
+- **Update semantics**: omit the field to leave the contents alone; send it
+  (**including `[]`**) to replace them wholesale.
+- Deleting a `Product` removes it from every bundle (`ON DELETE CASCADE` on
+  the join row) - it never blocks the delete, and never touches an
+  already-placed order, which carries its own snapshot.
+- The bundle's `price` is always the admin-entered bundle price. It is
+  **never** summed from its members, and the members are never charged for -
+  see "component lines" under Orders.
+- **`old_price` on a bundle WITH contents is computed, not stored**: it's the
+  members priced separately (each member's current `price` × its `qty`), which
+  is what the customer would otherwise have paid. It therefore moves on its own
+  whenever a member is repriced, and whatever is in the `old_price` column is
+  ignored - that column is the fallback only for a bundle with no contents.
+  This holds even when the contents add up to LESS than the bundle price; the
+  figure stays truthful about what's inside, and it can't become a negative
+  discount, because an order line only treats a positive
+  `old_price - price` difference as one. The same computed figure is what an
+  order line snapshots as its cash `discount`, so the printed quote's "UP
+  before discount" shows it too.
 
 ### Orders - `/orders`
 An `Order` row is a **quote or a real order** (`order_type`) - it only ever accepts
@@ -457,6 +493,21 @@ Notes an agent should know before calling this:
   caller can't place the order at all, just that they can't apply a cash
   discount to it (a percent discount is fine for anyone who can already
   place an order). Read the `detail` message to tell the two apart.
+- **One submitted line can produce several `OrderItem` rows.** A
+  `Promotion`/`Set` line expands into its member products, and a `Product`
+  line into whatever that product comes with for free (see "Bundle
+  contents" above). Those extra rows are **component lines**: they carry
+  `parent_item_id` (the id of the paid line they belong to),
+  `unit_price`/`discount`/`line_amount` of `0`, and `qty` multiplied by the
+  parent's qty (2 sets containing 3 gloves → one component row with
+  `qty: 6`). Because they're zero-priced by construction, they can't move
+  `subtotal`, the discount base, or `grand_total` - and a client cannot
+  fabricate one, since expansion happens entirely server-side from the
+  bundle's current contents.
+  `items` in the response is a **flat** list of both kinds, ordered for
+  display: each paid line immediately followed by its own components. Group
+  or indent by `parent_item_id`; a line with `parent_item_id: null` is a
+  real, charged line.
 - **`Promotion`/`Set` lines are excluded from the discount calculation
   entirely** - both percent and cash discounts are computed only against
   the subtotal of `Product` lines, then subtracted from the full order

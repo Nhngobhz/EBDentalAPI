@@ -831,19 +831,22 @@ def test_admin_set_password_requires_user_management(client, db_session):
 # ---------------------------------------------------------------------------
 # Orders (quotes)
 # ---------------------------------------------------------------------------
-def _make_order_product(client, headers, name="Quoted Widget", price="100.00"):
+def _make_order_product(client, headers, name="Quoted Widget", price="100.00", free_items=None):
     brand_id = client.post("/brands/", data={"brand_name": f"OrderCo-{name}"}, headers=headers).json()["id"]
-    return client.post(
-        "/products/",
-        json={"product_name": name, "price": price, "brand_id": brand_id},
-        headers=headers,
-    ).json()
+    payload = {"product_name": name, "price": price, "brand_id": brand_id}
+    if free_items is not None:
+        payload["free_items"] = free_items
+    resp = client.post("/products/", json=payload, headers=headers)
+    assert resp.status_code == 201, resp.text
+    return resp.json()
 
 
-def _make_set(client, headers, name="Order Set", price="50.00", old_price=None):
+def _make_set(client, headers, name="Order Set", price="50.00", old_price=None, items=None):
     payload = {"set_name": name, "price": price}
     if old_price is not None:
         payload["old_price"] = old_price
+    if items is not None:
+        payload["items"] = items
     resp = client.post("/sets/", json=payload, headers=headers)
     assert resp.status_code == 201, resp.text
     return resp.json()
@@ -860,7 +863,7 @@ def _order_payload(product_id, **overrides):
     return payload
 
 
-def _make_promotion(client, headers, name="Order Promo", price="50.00", old_price=None, start_offset_days=-1, end_offset_days=1):
+def _make_promotion(client, headers, name="Order Promo", price="50.00", old_price=None, start_offset_days=-1, end_offset_days=1, items=None):
     now = datetime.now(timezone.utc)
     payload = {
         "promotion_name": name,
@@ -870,6 +873,8 @@ def _make_promotion(client, headers, name="Order Promo", price="50.00", old_pric
     }
     if old_price is not None:
         payload["old_price"] = old_price
+    if items is not None:
+        payload["items"] = items
     resp = client.post("/promotions/", json=payload, headers=headers)
     assert resp.status_code == 201, resp.text
     return resp.json()
@@ -1186,6 +1191,363 @@ def test_order_item_requires_exactly_one_of_product_promotion_or_set(client, db_
         headers=headers,
     )
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Bundle contents (Promotion/Set members) and product free items
+# ---------------------------------------------------------------------------
+def _components_of(body, parent_index=0):
+    parent = body["items"][parent_index]
+    return parent, [i for i in body["items"] if i["parent_item_id"] == parent["id"]]
+
+
+def test_set_contents_expand_into_zero_priced_component_lines(client, db_session):
+    make_admin(db_session, email="bundle1@example.com", password="password123")
+    headers = auth_header(client, "bundle1@example.com", "password123")
+    glove = _make_order_product(client, headers, name="Glove", price="10.00")
+    mirror = _make_order_product(client, headers, name="Mirror", price="7.00")
+    set_ = _make_set(
+        client, headers, name="Starter Set", price="50.00",
+        items=[{"product_id": glove["id"], "qty": 3}, {"product_id": mirror["id"], "qty": 1}],
+    )
+    assert [i["product_name"] for i in set_["items"]] == ["Glove", "Mirror"]
+
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(None, items=[{"set_id": set_["id"], "qty": 2}]),
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+
+    parent, components = _components_of(body)
+    assert parent["product_name"] == "Starter Set"
+    assert parent["parent_item_id"] is None
+    assert len(body["items"]) == 3  # the set + its two members
+
+    # Member quantities multiply by how many of the set were bought, and every
+    # member is $0 - the set's own price already covers them.
+    assert [(c["product_name"], c["qty"], c["unit_price"], c["line_amount"]) for c in components] == [
+        ("Glove", 6, "0.00", "0.00"),
+        ("Mirror", 2, "0.00", "0.00"),
+    ]
+    assert all(c["product_id"] is not None and c["discount"] == "0.00" for c in components)
+    # Totals see only the set's own price.
+    assert body["subtotal"] == "100.00"
+    assert body["grand_total"] == "100.00"
+
+
+def test_order_items_come_back_with_components_under_their_own_line(client, db_session):
+    """The printed quote, the admin order view and the fallback PDF all just walk
+    order["items"] in order, so a component has to arrive directly under the line
+    it belongs to - NOT after every paid line, which is the order the rows are
+    actually INSERTed in (see Order.items' order_by)."""
+    make_admin(db_session, email="bundleorder@example.com", password="password123")
+    headers = auth_header(client, "bundleorder@example.com", "password123")
+    gift = _make_order_product(client, headers, name="Ride-Along", price="5.00")
+    paid = _make_order_product(
+        client, headers, name="Paid Thing", price="50.00",
+        free_items=[{"product_id": gift["id"], "qty": 1}],
+    )
+    member = _make_order_product(client, headers, name="Set Member", price="9.00")
+    set_ = _make_set(
+        client, headers, name="Ordered Set", price="20.00",
+        items=[{"product_id": member["id"], "qty": 1}],
+    )
+
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(
+            None,
+            items=[{"product_id": paid["id"], "qty": 1}, {"set_id": set_["id"], "qty": 1}],
+        ),
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    names = [i["product_name"] for i in resp.json()["items"]]
+    assert names == ["Paid Thing", "Ride-Along", "Ordered Set", "Set Member"]
+
+    # Re-reading the order (a different query path) must group them the same way.
+    order_id = resp.json()["id"]
+    fetched = client.get(f"/orders/{order_id}", headers=headers).json()
+    assert [i["product_name"] for i in fetched["items"]] == names
+
+
+def test_promotion_contents_expand_into_component_lines(client, db_session):
+    make_admin(db_session, email="bundle2@example.com", password="password123")
+    headers = auth_header(client, "bundle2@example.com", "password123")
+    tip = _make_order_product(client, headers, name="Scaler Tip", price="20.00")
+    promo = _make_promotion(
+        client, headers, name="Scaler Deal", price="80.00",
+        items=[{"product_id": tip["id"], "qty": 2}],
+    )
+
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(None, items=[{"promotion_id": promo["id"], "qty": 1}]),
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+
+    parent, components = _components_of(body)
+    assert parent["promotion_id"] == promo["id"]
+    assert [(c["product_name"], c["qty"], c["line_amount"]) for c in components] == [("Scaler Tip", 2, "0.00")]
+    assert body["subtotal"] == "80.00"
+
+
+def test_product_free_items_ride_along_at_zero(client, db_session):
+    make_admin(db_session, email="bundle3@example.com", password="password123")
+    headers = auth_header(client, "bundle3@example.com", "password123")
+    gift = _make_order_product(client, headers, name="Free Bur", price="5.00")
+    main = _make_order_product(
+        client, headers, name="Handpiece", price="100.00",
+        free_items=[{"product_id": gift["id"], "qty": 2}],
+    )
+    assert main["free_items"][0]["product_name"] == "Free Bur"
+
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(None, items=[{"product_id": main["id"], "qty": 3}]),
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+
+    parent, components = _components_of(body)
+    assert parent["line_amount"] == "300.00"
+    assert [(c["product_name"], c["qty"], c["line_amount"]) for c in components] == [("Free Bur", 6, "0.00")]
+    # The freebie is free: it never reaches the subtotal, so it can't be
+    # discounted or paid for either.
+    assert body["subtotal"] == "300.00"
+
+
+def test_bundle_components_never_enter_the_discount_base(client, db_session):
+    make_admin(db_session, email="bundle4@example.com", password="password123")
+    headers = auth_header(client, "bundle4@example.com", "password123")
+    member = _make_order_product(client, headers, name="Member Item", price="40.00")
+    regular = _make_order_product(client, headers, name="Regular Item", price="100.00")
+    set_ = _make_set(
+        client, headers, name="Discount Set", price="60.00",
+        items=[{"product_id": member["id"], "qty": 1}],
+    )
+
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(
+            None,
+            discount_type="percent",
+            discount_value=10,
+            items=[
+                {"product_id": regular["id"], "qty": 1},
+                {"set_id": set_["id"], "qty": 1},
+            ],
+        ),
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    # Only the $100 regular line is discountable: the set is a fixed deal price
+    # and its $0 member line adds nothing to either total.
+    assert body["subtotal"] == "160.00"
+    assert body["discount_amount"] == "10.00"
+    assert body["grand_total"] == "150.00"
+
+
+def test_bundle_old_price_is_the_combined_price_of_its_contents(client, db_session):
+    """A bundle's "was" price is what its members cost bought separately - not
+    the stored old_price column, which only survives as the fallback for a
+    bundle that lists no contents (see bundle_old_price)."""
+    make_admin(db_session, email="bundleprice@example.com", password="password123")
+    headers = auth_header(client, "bundleprice@example.com", "password123")
+    big = _make_order_product(client, headers, name="Big Part", price="70.00")
+    small = _make_order_product(client, headers, name="Small Part", price="15.00")
+
+    # Stored old_price is deliberately wrong here - the contents must win.
+    set_ = _make_set(
+        client, headers, name="Combined Set", price="80.00", old_price="90.00",
+        items=[{"product_id": big["id"], "qty": 1}, {"product_id": small["id"], "qty": 2}],
+    )
+    assert set_["old_price"] == "100.00"  # 70 + 15x2
+    assert client.get(f"/sets/{set_['id']}", headers=headers).json()["old_price"] == "100.00"
+
+    # It tracks the members' current prices - repricing one reprices the bundle's
+    # "was" figure, with no edit to the set itself.
+    client.patch(f"/products/{small['id']}/price", json={"price": "25.00"}, headers=headers)
+    assert client.get(f"/sets/{set_['id']}", headers=headers).json()["old_price"] == "120.00"
+
+    # And it's what the order line snapshots as its discount, so the printed
+    # quote shows the real saving.
+    order = client.post(
+        "/orders/", json=_order_payload(None, items=[{"set_id": set_["id"], "qty": 2}]), headers=headers
+    ).json()
+    parent = order["items"][0]
+    assert parent["discount_type"] == "cash"
+    assert parent["discount"] == "40.00"  # 120 combined - 80 charged
+    assert order["subtotal"] == "160.00"  # still only the bundle price x2
+
+    # No contents -> the manually entered old_price still stands.
+    plain = _make_set(client, headers, name="Plain Set", price="30.00", old_price="45.00")
+    assert plain["old_price"] == "45.00"
+
+
+def test_bundle_old_price_still_reports_contents_that_cost_less_than_the_bundle(client, db_session):
+    """Contents win even when they add up to less than the bundle's own price -
+    the figure stays truthful about what's inside. It must not leak out as a
+    negative discount: the order line just books at the bundle price."""
+    make_admin(db_session, email="bundleprice2@example.com", password="password123")
+    headers = auth_header(client, "bundleprice2@example.com", "password123")
+    cheap = _make_order_product(client, headers, name="Cheap Part", price="5.00")
+
+    set_ = _make_set(
+        client, headers, name="Overpriced Set", price="50.00", old_price="60.00",
+        items=[{"product_id": cheap["id"], "qty": 1}],
+    )
+    assert set_["old_price"] == "5.00"  # contents, not the stored 60.00
+
+    order = client.post(
+        "/orders/", json=_order_payload(None, items=[{"set_id": set_["id"], "qty": 1}]), headers=headers
+    ).json()
+    parent = order["items"][0]
+    assert parent["discount"] == "0.00"
+    assert parent["line_amount"] == "50.00"
+    assert order["grand_total"] == "50.00"
+
+
+def test_bundle_contents_reject_unknown_and_duplicate_products(client, db_session):
+    make_admin(db_session, email="bundle5@example.com", password="password123")
+    headers = auth_header(client, "bundle5@example.com", "password123")
+    product = _make_order_product(client, headers, name="Real Item", price="10.00")
+
+    unknown = client.post(
+        "/sets/", json={"set_name": "Bad Set", "price": "10.00", "items": [{"product_id": 999999, "qty": 1}]},
+        headers=headers,
+    )
+    assert unknown.status_code == 400
+    assert "does not exist" in unknown.json()["detail"]
+
+    duplicate = client.post(
+        "/sets/",
+        json={
+            "set_name": "Dup Set", "price": "10.00",
+            "items": [{"product_id": product["id"], "qty": 1}, {"product_id": product["id"], "qty": 2}],
+        },
+        headers=headers,
+    )
+    assert duplicate.status_code == 400
+    assert "more than once" in duplicate.json()["detail"]
+
+
+def test_product_cannot_come_free_with_itself(client, db_session):
+    make_admin(db_session, email="bundle6@example.com", password="password123")
+    headers = auth_header(client, "bundle6@example.com", "password123")
+    product = _make_order_product(client, headers, name="Self Gift", price="10.00")
+
+    resp = client.put(
+        f"/products/{product['id']}",
+        json={"free_items": [{"product_id": product["id"], "qty": 1}]},
+        headers=headers,
+    )
+    assert resp.status_code == 400
+    assert "itself" in resp.json()["detail"]
+
+
+def test_updating_contents_replaces_them_but_omitting_leaves_them_alone(client, db_session):
+    make_admin(db_session, email="bundle7@example.com", password="password123")
+    headers = auth_header(client, "bundle7@example.com", "password123")
+    first = _make_order_product(client, headers, name="First Item", price="10.00")
+    second = _make_order_product(client, headers, name="Second Item", price="20.00")
+    set_ = _make_set(
+        client, headers, name="Editable Set", price="25.00",
+        items=[{"product_id": first["id"], "qty": 1}],
+    )
+
+    # Sent -> replaced wholesale.
+    replaced = client.put(
+        f"/sets/{set_['id']}", json={"items": [{"product_id": second["id"], "qty": 4}]}, headers=headers
+    )
+    assert replaced.status_code == 200, replaced.text
+    assert [(i["product_name"], i["qty"]) for i in replaced.json()["items"]] == [("Second Item", 4)]
+
+    # Omitted -> left alone.
+    renamed = client.put(f"/sets/{set_['id']}", json={"set_name": "Renamed Set"}, headers=headers)
+    assert renamed.status_code == 200, renamed.text
+    assert [i["product_name"] for i in renamed.json()["items"]] == ["Second Item"]
+
+    # Emptied explicitly.
+    emptied = client.put(f"/sets/{set_['id']}", json={"items": []}, headers=headers)
+    assert emptied.status_code == 200, emptied.text
+    assert emptied.json()["items"] == []
+
+
+def test_editing_contents_can_keep_a_product_that_is_already_in_the_bundle(client, db_session):
+    """The most ordinary edit there is - "add one more product to this set" -
+    resubmits the members that are already saved. Replacing the collection by
+    plain assignment made SQLAlchemy INSERT those before DELETEing the old rows,
+    which tripped the (owner, product_id) unique constraint as a 500; see
+    replace_bundle_rows."""
+    make_admin(db_session, email="bundlekeep@example.com", password="password123")
+    headers = auth_header(client, "bundlekeep@example.com", "password123")
+    kept = _make_order_product(client, headers, name="Kept Item", price="10.00")
+    added = _make_order_product(client, headers, name="Added Item", price="20.00")
+    dropped = _make_order_product(client, headers, name="Dropped Item", price="30.00")
+
+    set_ = _make_set(
+        client, headers, name="Growing Set", price="25.00",
+        items=[{"product_id": kept["id"], "qty": 1}, {"product_id": dropped["id"], "qty": 1}],
+    )
+
+    resp = client.put(
+        f"/sets/{set_['id']}",
+        json={"items": [
+            {"product_id": kept["id"], "qty": 3},      # kept, quantity changed
+            {"product_id": added["id"], "qty": 1},     # new
+        ]},                                            # `dropped` falls out
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert [(i["product_name"], i["qty"]) for i in resp.json()["items"]] == [
+        ("Kept Item", 3), ("Added Item", 1)
+    ]
+
+    # Same edit shape on a product's free items, which has its own unique constraint.
+    paid = _make_order_product(
+        client, headers, name="Gift Giver", price="99.00",
+        free_items=[{"product_id": kept["id"], "qty": 1}],
+    )
+    resp = client.put(
+        f"/products/{paid['id']}",
+        json={"free_items": [
+            {"product_id": kept["id"], "qty": 2},
+            {"product_id": added["id"], "qty": 1},
+        ]},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert [(i["product_name"], i["qty"]) for i in resp.json()["free_items"]] == [
+        ("Kept Item", 2), ("Added Item", 1)
+    ]
+
+
+def test_deleting_a_product_drops_it_from_bundles_but_not_from_history(client, db_session):
+    make_admin(db_session, email="bundle8@example.com", password="password123")
+    headers = auth_header(client, "bundle8@example.com", "password123")
+    member = _make_order_product(client, headers, name="Doomed Item", price="15.00")
+    set_ = _make_set(
+        client, headers, name="Surviving Set", price="30.00",
+        items=[{"product_id": member["id"], "qty": 1}],
+    )
+    order = client.post(
+        "/orders/", json=_order_payload(None, items=[{"set_id": set_["id"], "qty": 1}]), headers=headers
+    ).json()
+
+    assert client.delete(f"/products/{member['id']}", headers=headers).status_code == 204
+
+    # The set simply loses that member (ON DELETE CASCADE on the join row)...
+    assert client.get(f"/sets/{set_['id']}", headers=headers).json()["items"] == []
+    # ...while the already-placed order keeps its snapshot of what was included.
+    placed = client.get(f"/orders/{order['id']}", headers=headers).json()
+    assert [i["product_name"] for i in placed["items"]] == ["Surviving Set", "Doomed Item"]
 
 
 # ---------------------------------------------------------------------------

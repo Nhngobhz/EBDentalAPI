@@ -3,10 +3,11 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
+from app.core.bundles import build_bundle_rows, bundle_old_price, replace_bundle_rows
 from app.core.deps import get_price_visibility, require_permission
 from app.core.files import save_named_image
 from app.database import get_db
-from app.models import Promotion, User
+from app.models import Promotion, PromotionItem, User
 from app.schemas import PromotionCreate, PromotionOut, PromotionUpdate
 
 router = APIRouter(prefix="/promotions", tags=["Promotions"])
@@ -21,6 +22,9 @@ def _serialize_promotion(promotion: Promotion, can_view_price: bool) -> dict:
     only staff and customers with access_permission=True get the real
     price/old_price."""
     data = PromotionOut.model_validate(promotion).model_dump()
+    # A promotion that lists its contents prices its "was" figure off them
+    # rather than off the stored column - see bundle_old_price.
+    data["old_price"] = bundle_old_price(promotion)
     if not can_view_price:
         data["price"] = _MASKED_PRICE
         data["old_price"] = None
@@ -61,11 +65,15 @@ def get_promotion(
 
 @router.post("/", response_model=PromotionOut, status_code=status.HTTP_201_CREATED)
 def create_promotion(payload: PromotionCreate, _: User = _perm, db: Session = Depends(get_db)):
-    promotion = Promotion(**payload.model_dump())
+    data = payload.model_dump(exclude={"items"})
+    promotion = Promotion(**data, items=build_bundle_rows(db, payload.items, PromotionItem))
     db.add(promotion)
     db.commit()
     db.refresh(promotion)
-    return promotion
+    # Serialized (not returned raw) so old_price is the contents-derived figure
+    # here too, exactly as a later GET would report it. can_view_price=True:
+    # every write endpoint below is already price_listing-gated staff.
+    return _serialize_promotion(promotion, True)
 
 
 @router.put("/{promotion_id}", response_model=PromotionOut)
@@ -85,11 +93,17 @@ def update_promotion(
     if new_end <= new_start:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="end_date must be after start_date")
 
+    # Contents are replaced wholesale when sent and left alone when omitted -
+    # see replace_bundle_rows for why this can't just be an assignment.
+    if "items" in data:
+        replace_bundle_rows(db, promotion, "items", payload.items or [], PromotionItem)
+        del data["items"]
+
     for field, value in data.items():
         setattr(promotion, field, value)
     db.commit()
     db.refresh(promotion)
-    return promotion
+    return _serialize_promotion(promotion, True)
 
 
 @router.post("/{promotion_id}/image", response_model=PromotionOut)
@@ -102,7 +116,7 @@ async def upload_promotion_image(
     promotion.promotion_image = await save_named_image(file, "promotions", promotion.promotion_name)
     db.commit()
     db.refresh(promotion)
-    return promotion
+    return _serialize_promotion(promotion, True)
 
 
 @router.delete("/{promotion_id}", status_code=status.HTTP_204_NO_CONTENT)

@@ -1,11 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session, joinedload
 
+from app.core.bundles import build_bundle_rows, replace_bundle_rows
 from app.core.deps import get_price_visibility, get_verified_user, require_permission
 from app.core.files import save_named_image
 from app.core.query import OptionalInt
 from app.database import get_db
-from app.models import Brand, Category, Product, User
+from app.models import Brand, Category, Product, ProductFreeItem, User
 from app.schemas import ProductCreate, ProductOut, ProductPriceUpdate, ProductUpdate
 
 router = APIRouter(prefix="/products", tags=["Products"])
@@ -16,10 +17,17 @@ _price_perm = Depends(require_permission("price_listing"))
 _MASKED_PRICE = "XXXX"
 
 
+def _free_item_loader():
+    """free_items -> the freebie Product itself, which BundleItemOut reads
+    name/code/uom off (see BundleItemMixin) - without the second hop that's an
+    extra query per freebie on every product listed."""
+    return joinedload(Product.free_items).joinedload(ProductFreeItem.product)
+
+
 def _get_product_or_404(db: Session, product_id: int) -> Product:
     product = (
         db.query(Product)
-        .options(joinedload(Product.brand), joinedload(Product.category))
+        .options(joinedload(Product.brand), joinedload(Product.category), _free_item_loader())
         .filter(Product.id == product_id)
         .first()
     )
@@ -53,7 +61,9 @@ def list_products(
     """Public: product catalog browsing needs no account. Price/discount
     are masked unless the caller is staff or a customer with
     access_permission=True."""
-    query = db.query(Product).options(joinedload(Product.brand), joinedload(Product.category))
+    query = db.query(Product).options(
+        joinedload(Product.brand), joinedload(Product.category), _free_item_loader()
+    )
     if brand_id is not None:
         query = query.filter(Product.brand_id == brand_id)
     if category_id is not None:
@@ -85,7 +95,8 @@ def create_product(
     if payload.product_code and db.query(Product).filter(Product.product_code == payload.product_code).first():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="product_code already in use")
 
-    product = Product(**payload.model_dump())
+    data = payload.model_dump(exclude={"free_items"})
+    product = Product(**data, free_items=build_bundle_rows(db, payload.free_items, ProductFreeItem))
     db.add(product)
     db.commit()
     db.refresh(product)
@@ -135,6 +146,15 @@ def update_product(
         .first()
     ):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="product_code already in use")
+
+    # Free items are replaced wholesale when sent and left alone when omitted -
+    # see replace_bundle_rows for why this can't just be an assignment.
+    if "free_items" in data:
+        replace_bundle_rows(
+            db, product, "free_items", payload.free_items or [], ProductFreeItem,
+            exclude_product_id=product_id,
+        )
+        del data["free_items"]
 
     for field, value in data.items():
         setattr(product, field, value)

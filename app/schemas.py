@@ -242,6 +242,28 @@ class CategoryMini(BaseModel):
 DiscountType = Literal["percent", "cash"]
 
 
+# ---------------------------------------------------------------------------
+# Bundle contents - the shared "this thing contains these products" shape used
+# by Promotion.items, Set.items and Product.free_items (see BundleItemMixin in
+# app/models.py). Only product_id + qty are ever accepted; everything shown back
+# is read from the live Product row, so renaming a product updates every bundle
+# it appears in.
+# ---------------------------------------------------------------------------
+class BundleItemIn(BaseModel):
+    product_id: int
+    qty: int = Field(1, gt=0)
+
+
+class BundleItemOut(BaseModel):
+    product_id: int
+    product_name: str
+    product_code: Optional[str] = None
+    uom: Optional[str] = None
+    qty: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class ProductBase(BaseModel):
     product_name: str = Field(..., min_length=1, max_length=200)
     description: Optional[str] = None
@@ -259,6 +281,9 @@ class ProductCreate(ProductBase):
     discount: Decimal = Field(Decimal("0"), ge=0)
     brand_id: int
     category_id: Optional[int] = None
+    # Products this one comes with for free. Each becomes a $0 line on any order
+    # containing this product - see routers/orders.py::create_order.
+    free_items: list[BundleItemIn] = []
 
     @field_validator("discount")
     @classmethod
@@ -283,6 +308,10 @@ class ProductUpdate(BaseModel):
     price: Optional[Decimal] = Field(None, gt=0)
     discount_type: Optional[DiscountType] = None
     discount: Optional[Decimal] = Field(None, ge=0)
+    # Omitted -> the product's existing free items are left alone; sent (even as
+    # []) -> they're replaced wholesale by what's sent. Same rule as
+    # PromotionUpdate.items/SetUpdate.items.
+    free_items: Optional[list[BundleItemIn]] = None
 
     @field_validator("discount")
     @classmethod
@@ -318,6 +347,7 @@ class ProductOut(ProductBase):
     product_image: Optional[str] = None
     brand: Optional[BrandMini] = None
     category: Optional[CategoryMini] = None
+    free_items: list[BundleItemOut] = []
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -373,6 +403,9 @@ class PromotionBase(BaseModel):
 class PromotionCreate(PromotionBase):
     price: Decimal = Field(..., gt=0)
     old_price: Optional[Decimal] = Field(None, gt=0)
+    # What's inside the deal. `price` stays the promotion's own fixed bundle
+    # price - it is never summed from these.
+    items: list[BundleItemIn] = []
 
 
 class PromotionUpdate(BaseModel):
@@ -382,6 +415,8 @@ class PromotionUpdate(BaseModel):
     old_price: Optional[Decimal] = Field(None, gt=0)
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
+    # Omitted -> contents left alone; sent (even as []) -> replaced wholesale.
+    items: Optional[list[BundleItemIn]] = None
 
 
 class PromotionOut(PromotionBase):
@@ -392,6 +427,10 @@ class PromotionOut(PromotionBase):
     price: Union[Decimal, str]
     old_price: Optional[Union[Decimal, str]] = None
     promotion_image: Optional[str] = None
+    # The member products, resolved through PromotionItem's read-through
+    # properties (see BundleItemMixin in app/models.py). Not price-masked: what a
+    # deal contains isn't a price, so everyone can see it.
+    items: list[BundleItemOut] = []
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -410,6 +449,7 @@ class SetBase(BaseModel):
 class SetCreate(SetBase):
     price: Decimal = Field(..., gt=0)
     old_price: Optional[Decimal] = Field(None, gt=0)
+    items: list[BundleItemIn] = []
 
 
 class SetUpdate(BaseModel):
@@ -417,6 +457,8 @@ class SetUpdate(BaseModel):
     description: Optional[str] = None
     price: Optional[Decimal] = Field(None, gt=0)
     old_price: Optional[Decimal] = Field(None, gt=0)
+    # Omitted -> contents left alone; sent (even as []) -> replaced wholesale.
+    items: Optional[list[BundleItemIn]] = None
 
 
 class SetOut(SetBase):
@@ -428,6 +470,8 @@ class SetOut(SetBase):
     old_price: Optional[Union[Decimal, str]] = None
     set_image: Optional[str] = None
     detail_image: Optional[str] = None
+    # Member products - same shape/reasoning as PromotionOut.items.
+    items: list[BundleItemOut] = []
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -504,6 +548,10 @@ class OrderItemOut(BaseModel):
     product_id: Optional[int] = None
     promotion_id: Optional[int] = None
     set_id: Optional[int] = None
+    # Set on the $0 component lines a bundle/free-gift line expands into (see
+    # OrderItem.parent_item_id). `items` below is a flat list of both kinds -
+    # group by this to render components under the line they belong to.
+    parent_item_id: Optional[int] = None
     product_name: str
     product_code: Optional[str] = None
     uom: Optional[str] = None

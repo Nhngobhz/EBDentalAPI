@@ -235,22 +235,35 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
     # into this aggregate too would double-count the same discount.
     cash_discount_total = Decimal("0")
     item_rows = []
-    for i, item in enumerate(order.items, start=1):
+    # Component lines (a promotion/set's member products, a product's free
+    # gifts - see OrderItem.parent_item_id) are $0 sub-lines of the paid line
+    # above them: they don't get their own No., and their price columns read
+    # "Free"/$0.00. Numbering therefore counts only real, priced lines.
+    line_no = 0
+    for item in order.items:
+        is_component = getattr(item, "parent_item_id", None) is not None
         old_unit_price = _derive_old_unit_price(item.unit_price, item.discount, item.discount_type)
         undiscounted_subtotal += old_unit_price * item.qty
         if item.discount_type == "cash":
             cash_discount_total += (old_unit_price - Decimal(item.unit_price)) * item.qty
+        if is_component:
+            line_no_text = ""
+        else:
+            line_no += 1
+            line_no_text = str(line_no)
         code = item.product_code or "—"
         # Product code/name are plain free text - unlike Clinic/Address, the website
         # doesn't tag this column .qpt-khmer either, but a browser still auto-falls-back
         # per-glyph to a font that has it, which fpdf2 won't do on its own - so any cell
         # that actually contains Khmer script gets the Khmer font+shaping explicitly.
         display_amount = _item_display_amount(old_unit_price, item.line_amount, item.qty, item.discount_type)
+        description = f"    • {item.product_name}" if is_component else item.product_name
+        discount_text = "—" if is_component else _format_item_discount(item.discount, item.discount_type)
         item_rows.append((
-            (str(i), None), (code, khmer_style if _has_khmer(code) else None),
-            (item.product_name, khmer_style if _has_khmer(item.product_name) else None),
+            (line_no_text, None), (code, khmer_style if _has_khmer(code) else None),
+            (description, khmer_style if _has_khmer(item.product_name) else None),
             (str(item.qty), None), (item.uom or "PCS", None), (_money(old_unit_price), None),
-            (_format_item_discount(item.discount, item.discount_type), None), (_money(display_amount), None),
+            (discount_text, None), (_money(display_amount), None),
         ))
 
     item_discount_total = cash_discount_total

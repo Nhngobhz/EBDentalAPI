@@ -152,6 +152,39 @@ CRUD → file upload → error handling), not just written from memory - see
     discount base for the same reason a `Promotion` line is - it already
     carries its own deal price.
 
+14. **Bundle contents & free items (added 2026-07-31):** a `Promotion` and a
+    `Set` are now **collections of products** (`PromotionItem`/`SetItem`
+    join rows: owner + `product_id` + `qty`), and a `Product` can list other
+    products it comes with for free (`ProductFreeItem`, where `product_id`
+    is the freebie and `parent_product_id` the paid product). Three
+    deliberate choices here:
+    - **The bundle keeps its own fixed `price`** - it is never summed from
+      its members. Members are what the customer *receives*; the bundle
+      price is what they *pay*. Its **`old_price` is the opposite**: for a
+      bundle with contents it's computed as those members priced separately
+      (what the customer would otherwise have paid), so the advertised
+      saving is real and re-prices itself whenever a member's price
+      changes. The stored `old_price` column survives only as the fallback
+      for a bundle that lists no contents (`bundle_old_price` in
+      `core/bundles.py`). Contents win even when they total *less* than the
+      bundle price - the figure stays truthful about what's inside, and it
+      can't turn into a negative discount, since an order line only counts a
+      positive `old_price - price` difference as one.
+    - **Contents are a live reference, not a snapshot.** Only
+      `product_id`/`qty` are stored, so name/code/uom always describe the
+      product as it is today, and deleting a product just drops it from the
+      bundle (`ON DELETE CASCADE`) instead of blocking the delete. Orders
+      are the opposite - they snapshot, and are untouched by any of this.
+    - **On an order, contents expand into $0 "component" lines**
+      (`OrderItem.parent_item_id`, a self-FK): buying a set records the set
+      line at its price plus one zero-priced line per member, quantities
+      multiplied by the parent's qty, so the printed quote lists exactly
+      what's included without any of it affecting subtotal, the discount
+      base, or the grand total. Expansion is entirely server-side - a
+      client can't mark a line free. `Order.items` is ordered for display
+      (each parent immediately followed by its own components), not by id,
+      since components are physically INSERTed after every parent row.
+
 ---
 
 ## 2. Project structure
@@ -305,6 +338,7 @@ auth flows), see [`AI_AGENT_GUIDE.md`](AI_AGENT_GUIDE.md). Summary:
 | `PUT/DELETE /brands/...`, `PUT/DELETE /categories/...`, `PUT/DELETE /manuals/...` | `product_management` | Deleting a `Category` that still has `Product`s assigned is rejected (400), same as `Brand` |
 | `POST/DELETE /products/...` | `product_management` (+`price_listing` if price included) | Optional `category_id` is set here |
 | `GET/POST/PUT/DELETE /sets/...`, `POST /sets/{id}/image` | `price_listing` for writes | Same shape as `/promotions/...` - see point 13 above |
+| `items` on `/promotions/`+`/sets/`, `free_items` on `/products/` | Same permission as editing that resource | What the bundle contains / what a product comes with free. Write `[{product_id, qty}]`; omit to leave alone, send `[]` to clear - see point 14 above |
 | `PATCH /products/{id}/price` | `price_listing` | |
 | `POST/PUT/DELETE /promotions/...` | `price_listing` | |
 | `POST .../{id}/image`, `.../{id}/pdf` | Same permission as editing that resource | File uploads (still available for setting/replacing an image after creation) |

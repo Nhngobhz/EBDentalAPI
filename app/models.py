@@ -8,6 +8,7 @@ README.md under "Design decisions & assumptions".
 """
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     ForeignKey,
@@ -15,11 +16,39 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import backref, relationship
 from sqlalchemy.sql import func
 
 from app.database import Base
+
+
+class BundleItemMixin:
+    """Shared shape of the three "this thing contains these products" join
+    tables - PromotionItem, SetItem, ProductFreeItem. Each row is always
+    (owner, product_id, qty), so these read-through properties let any of them
+    be serialized straight into BundleItemOut (see app/schemas.py) without the
+    router re-joining Product itself.
+
+    A member product's name/code/uom are deliberately NOT copied onto the join
+    row: unlike OrderItem (a historical snapshot that must never change), a
+    bundle's contents should always describe the product as it is *today*.
+    Deleting a product removes its membership rows via ON DELETE CASCADE, so
+    `product` being None shouldn't happen - the fallbacks just keep an
+    in-session delete from raising mid-serialization."""
+
+    @property
+    def product_name(self) -> str:
+        return self.product.product_name if self.product else ""
+
+    @property
+    def product_code(self):
+        return self.product.product_code if self.product else None
+
+    @property
+    def uom(self):
+        return self.product.uom if self.product else None
 
 
 class User(Base):
@@ -164,6 +193,49 @@ class Product(Base):
     category = relationship("Category", back_populates="products")
     manuals = relationship("Manual", back_populates="product", cascade="all, delete-orphan")
 
+    # Other products this one comes with for free (see ProductFreeItem) - added to
+    # the order as $0 lines whenever this product is bought.
+    free_items = relationship(
+        "ProductFreeItem",
+        foreign_keys="ProductFreeItem.parent_product_id",
+        back_populates="parent_product",
+        cascade="all, delete-orphan",
+        order_by="ProductFreeItem.id",
+    )
+
+
+class ProductFreeItem(BundleItemMixin, Base):
+    """A free product that comes with a paid one ("buy this, get that free").
+    Both sides are real Products - the freebie is never a separate free-text
+    line, so its name/code/uom always stay in sync with the catalog.
+
+    Note which column is which: `product_id` is the FREE product (uniform with
+    PromotionItem/SetItem, so BundleItemMixin works for all three), and
+    `parent_product_id` is the paid product it rides along with."""
+
+    __tablename__ = "product_free_items"
+    __table_args__ = (
+        UniqueConstraint("parent_product_id", "product_id", name="uq_product_free_item"),
+        CheckConstraint("parent_product_id <> product_id", name="ck_product_free_item_not_self"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    parent_product_id = Column(
+        Integer, ForeignKey("products.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # CASCADE (not RESTRICT): deleting a product that happens to be somebody's
+    # freebie just drops it from that bundle rather than blocking the delete -
+    # historical orders are unaffected, they carry their own snapshot.
+    product_id = Column(
+        Integer, ForeignKey("products.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    qty = Column(Integer, nullable=False, server_default="1")
+
+    parent_product = relationship(
+        "Product", foreign_keys=[parent_product_id], back_populates="free_items"
+    )
+    product = relationship("Product", foreign_keys=[product_id])
+
 
 class Manual(Base):
     __tablename__ = "manuals"
@@ -183,6 +255,12 @@ class Manual(Base):
 
 
 class Promotion(Base):
+    """A time-boxed deal, and a COLLECTION OF PRODUCTS (see PromotionItem):
+    the promotion carries its own fixed price, and buying it puts every member
+    product on the order as a $0 component line so the quote spells out exactly
+    what the customer gets. `price` is always the admin-entered bundle price -
+    it is never summed from the members."""
+
     __tablename__ = "promotions"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -195,12 +273,40 @@ class Promotion(Base):
     promotion_image = Column(String(500), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    items = relationship(
+        "PromotionItem",
+        back_populates="promotion",
+        cascade="all, delete-orphan",
+        order_by="PromotionItem.id",
+    )
+
+
+class PromotionItem(BundleItemMixin, Base):
+    """One product included in a Promotion, with how many of it the deal
+    includes. Contents only - the money lives on Promotion.price."""
+
+    __tablename__ = "promotion_items"
+    __table_args__ = (UniqueConstraint("promotion_id", "product_id", name="uq_promotion_item"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    promotion_id = Column(
+        Integer, ForeignKey("promotions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    product_id = Column(
+        Integer, ForeignKey("products.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    qty = Column(Integer, nullable=False, server_default="1")
+
+    promotion = relationship("Promotion", back_populates="items")
+    product = relationship("Product")
+
 
 class Set(Base):
     """A bundle deal shown on the Promotions page, styled like a Promotion
     (fixed price + optional old_price, image) but always on sale - unlike
     Promotion there's no start_date/end_date, since a set isn't time-boxed.
-    Bought the same way a Promotion is (see OrderItem.set_id)."""
+    Also a collection of products (see SetItem), same as Promotion. Bought the
+    same way a Promotion is (see OrderItem.set_id)."""
 
     __tablename__ = "sets"
 
@@ -215,6 +321,31 @@ class Set(Base):
     # a set without one just renders the card without it.
     detail_image = Column(String(500), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    items = relationship(
+        "SetItem",
+        back_populates="set",
+        cascade="all, delete-orphan",
+        order_by="SetItem.id",
+    )
+
+
+class SetItem(BundleItemMixin, Base):
+    """One product included in a Set - same shape and reasoning as
+    PromotionItem."""
+
+    __tablename__ = "set_items"
+    __table_args__ = (UniqueConstraint("set_id", "product_id", name="uq_set_item"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    set_id = Column(Integer, ForeignKey("sets.id", ondelete="CASCADE"), nullable=False, index=True)
+    product_id = Column(
+        Integer, ForeignKey("products.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    qty = Column(Integer, nullable=False, server_default="1")
+
+    set = relationship("Set", back_populates="items")
+    product = relationship("Product")
 
 
 class Order(Base):
@@ -301,8 +432,18 @@ class Order(Base):
 
     customer = relationship("Customer")
     created_by = relationship("User")
+    # Ordered for DISPLAY, not by insert order. Plain id order would be wrong:
+    # SQLAlchemy inserts every paid line before any component line (components
+    # depend on their parent's id), so the $0 lines would all pile up at the end
+    # instead of sitting under the line they belong to. Grouping by
+    # coalesce(parent_item_id, id) puts each group together, and within a group
+    # the parent always has the lowest id - it has to exist before its
+    # components can reference it - so it still comes first.
     items = relationship(
-        "OrderItem", back_populates="order", cascade="all, delete-orphan", order_by="OrderItem.id"
+        "OrderItem",
+        back_populates="order",
+        cascade="all, delete-orphan",
+        order_by="[func.coalesce(OrderItem.parent_item_id, OrderItem.id), OrderItem.id]",
     )
 
 
@@ -320,6 +461,18 @@ class OrderItem(Base):
     product_id = Column(Integer, ForeignKey("products.id", ondelete="SET NULL"), nullable=True)
     promotion_id = Column(Integer, ForeignKey("promotions.id", ondelete="SET NULL"), nullable=True)
     set_id = Column(Integer, ForeignKey("sets.id", ondelete="SET NULL"), nullable=True)
+
+    # Set on a COMPONENT line - the $0 rows that spell out what a paid line
+    # includes: the member products a Promotion/Set expands into, and the
+    # freebies a Product "comes with" (see PromotionItem/SetItem/ProductFreeItem).
+    # NULL on a normal, independently-priced line. A component always carries
+    # unit_price/discount/line_amount = 0, so it can never move subtotal,
+    # discount or grand_total - it exists purely so the quote/invoice lists what
+    # the customer actually receives. Clients never send these: create_order
+    # expands them server-side from the bundle's current contents.
+    parent_item_id = Column(
+        Integer, ForeignKey("order_items.id", ondelete="CASCADE"), nullable=True, index=True
+    )
 
     # Snapshotted at order-creation time from the Product/Promotion/Set row - never
     # re-derived later, so a historical order stays accurate even if the product's
@@ -340,3 +493,13 @@ class OrderItem(Base):
     line_amount = Column(Numeric(10, 2), nullable=False)
 
     order = relationship("Order", back_populates="items")
+    # Adjacency list: the parent line owns its components, so building an order can
+    # just assign them and let SQLAlchemy insert the parent first and fill in
+    # parent_item_id. Components are ALSO in Order.items (they carry order_id like any
+    # other row), which is what keeps OrderOut.items a flat, complete list.
+    components = relationship(
+        "OrderItem",
+        cascade="all, delete-orphan",
+        backref=backref("parent", remote_side=[id]),
+        order_by="OrderItem.id",
+    )
