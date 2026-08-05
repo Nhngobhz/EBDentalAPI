@@ -10,6 +10,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     Column,
+    Date,
     DateTime,
     ForeignKey,
     Integer,
@@ -67,6 +68,14 @@ class User(Base):
     role_title = Column(String(100), nullable=False, default="Staff")
     creation_date = Column(DateTime(timezone=True), server_default=func.now())
 
+    # --- Optional demographics ---------------------------------------------
+    # Same pair, same rules, as Customer.date_of_birth/gender below - see the
+    # comment there. Kept as two separate columns per table rather than a
+    # shared mixin because `users` and `customers` are independent principal
+    # types with no common base.
+    date_of_birth = Column(Date, nullable=True)
+    gender = Column(String(10), nullable=True)
+
     # --- Permissions (the actual RBAC source of truth) ---------------------
     # role_title is a free-text label (e.g. "Sales Manager"). What a user
     # can actually DO is controlled by these four explicit flags.
@@ -104,6 +113,16 @@ class Customer(Base):
     customer_image = Column(String(500), nullable=True)
     access_permission = Column(Boolean, default=False, nullable=False)
     creation_date = Column(DateTime(timezone=True), server_default=func.now())
+
+    # --- Optional demographics (self-editable via PUT /customers/me) --------
+    # Both nullable: every customer that existed before these columns did has
+    # them empty, self-registration doesn't ask for them, and a customer is
+    # never forced to fill them in. `gender` is a free String rather than a DB
+    # enum for the same reason discount_type/order_type are - the allowed set
+    # ("male"/"female"/"other") is enforced by the Pydantic Literal in
+    # schemas.py, so widening it later needs no migration.
+    date_of_birth = Column(Date, nullable=True)
+    gender = Column(String(10), nullable=True)
 
     # --- Added: self-service login support ---------------------------------
     # NULL hashed_password means this Customer record was created by staff

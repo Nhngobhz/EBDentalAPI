@@ -122,6 +122,8 @@ async def create_user(
         email=payload.email,
         address=payload.address,
         phone_num=payload.phone_num,
+        date_of_birth=payload.date_of_birth,
+        gender=payload.gender,
         hashed_password=hash_password(payload.password),
         role_title=payload.role_title,
         user_management=payload.user_management,

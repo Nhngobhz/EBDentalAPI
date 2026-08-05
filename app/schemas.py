@@ -6,11 +6,19 @@ Naming convention used throughout:
   *Update        -> payload to update an existing record (all fields optional)
   *Out           -> what gets returned to the client
 """
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import Literal, Optional, Union
+from typing import Annotated, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +42,29 @@ class PasswordResetConfirm(BaseModel):
     new_password: str = Field(..., min_length=8, max_length=72)
 
 
+# --- Optional demographics, shared by User and Customer --------------------
+# Both principal types carry the same pair of columns; these two aliases are
+# what keeps the validation identical on all six payload schemas below.
+Gender = Literal["male", "female", "other"]
+
+
+def _validate_date_of_birth(value: Optional[date]) -> Optional[date]:
+    """Both bounds exist only to catch typos (a mistyped year is the common
+    one) - the field is optional and clearing it back to null is always
+    allowed."""
+    if value is None:
+        return value
+    if value > date.today():
+        raise ValueError("Date of birth cannot be in the future")
+    if value.year < 1900:
+        raise ValueError("Date of birth must be on or after 1900-01-01")
+    return value
+
+
+# Attached via Annotated rather than a @field_validator repeated in each class.
+DateOfBirth = Annotated[Optional[date], AfterValidator(_validate_date_of_birth)]
+
+
 # ---------------------------------------------------------------------------
 # User (staff / admin accounts)
 # ---------------------------------------------------------------------------
@@ -42,6 +73,8 @@ class UserBase(BaseModel):
     email: EmailStr
     address: Optional[str] = Field(None, max_length=255)
     phone_num: Optional[str] = Field(None, max_length=30)
+    date_of_birth: DateOfBirth = None
+    gender: Optional[Gender] = None
 
 
 class UserCreateByAdmin(UserBase):
@@ -61,6 +94,8 @@ class UserUpdateSelf(BaseModel):
     email: Optional[EmailStr] = None
     address: Optional[str] = Field(None, max_length=255)
     phone_num: Optional[str] = Field(None, max_length=30)
+    date_of_birth: DateOfBirth = None
+    gender: Optional[Gender] = None
 
 
 class ChangePassword(BaseModel):
@@ -80,6 +115,8 @@ class UserUpdateByAdmin(BaseModel):
     user_name: Optional[str] = Field(None, min_length=2, max_length=100)
     address: Optional[str] = Field(None, max_length=255)
     phone_num: Optional[str] = Field(None, max_length=30)
+    date_of_birth: DateOfBirth = None
+    gender: Optional[Gender] = None
     role_title: Optional[str] = Field(None, max_length=100)
     is_active: Optional[bool] = None
     user_management: Optional[bool] = None
@@ -111,6 +148,8 @@ class CustomerBase(BaseModel):
     email: EmailStr
     address: Optional[str] = Field(None, max_length=255)
     phone_num: Optional[str] = Field(None, max_length=30)
+    date_of_birth: DateOfBirth = None
+    gender: Optional[Gender] = None
 
 
 class CustomerCreate(CustomerBase):
@@ -126,6 +165,8 @@ class CustomerUpdate(BaseModel):
     email: Optional[EmailStr] = None
     address: Optional[str] = Field(None, max_length=255)
     phone_num: Optional[str] = Field(None, max_length=30)
+    date_of_birth: DateOfBirth = None
+    gender: Optional[Gender] = None
     access_permission: Optional[bool] = None
 
 
@@ -154,12 +195,21 @@ class CustomerSelfUpdate(BaseModel):
     email: Optional[EmailStr] = None
     address: Optional[str] = Field(None, max_length=255)
     phone_num: Optional[str] = Field(None, max_length=30)
+    date_of_birth: DateOfBirth = None
+    gender: Optional[Gender] = None
 
 
 class CustomerLoginResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     customer: CustomerOut
+
+
+class GoogleAuthRequest(BaseModel):
+    """Body of POST /auth/google. `credential` is the ID token Google
+    Identity Services handed the browser - see app/core/google_auth.py."""
+
+    credential: str = Field(..., min_length=1)
 
 
 class LoginResponse(BaseModel):

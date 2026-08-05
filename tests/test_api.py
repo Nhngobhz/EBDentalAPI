@@ -77,6 +77,112 @@ def test_login_wrong_password(client, db_session):
     assert resp.status_code == 401
 
 
+# ---------------------------------------------------------------------------
+# Google sign-in (POST /auth/google)
+#
+# The real credential is a JWT signed by Google, so every test here stubs out
+# verify_google_id_token - what's under test is the account matching/creation
+# that happens AFTER a token verifies, not PyJWT's signature check.
+# ---------------------------------------------------------------------------
+def _stub_google(monkeypatch, email, name="Google Person", picture=None):
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_ID", "test-client-id.apps.googleusercontent.com")
+    monkeypatch.setattr(
+        "app.routers.auth.verify_google_id_token",
+        lambda credential: {
+            "iss": "https://accounts.google.com",
+            "email": email,
+            "email_verified": True,
+            "name": name,
+            "picture": picture,
+        },
+    )
+
+
+def test_google_login_creates_verified_customer(client, db_session, monkeypatch):
+    _stub_google(monkeypatch, "newgoogle@example.com", picture="https://lh3.example.com/a/pic")
+
+    resp = client.post("/auth/google", json={"credential": "stub"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["account_type"] == "customer"
+    assert "access_token" in body
+    # Google confirming the address stands in for our own emailed link, but it
+    # grants no price visibility - staff still have to turn that on.
+    assert body["customer"]["is_verified"] is True
+    assert body["customer"]["access_permission"] is False
+    assert body["customer"]["customer_image"] == "https://lh3.example.com/a/pic"
+
+    from app.models import Customer
+
+    customer = db_session.query(Customer).filter(Customer.email == "newgoogle@example.com").first()
+    assert customer.hashed_password is None  # no password: this account signs in with Google
+
+
+def test_google_login_matches_existing_staff_by_email(client, db_session, monkeypatch):
+    make_admin(db_session, email="GoogleStaff@example.com", password="password123")
+    # Google always reports a lowercase address; the stored row keeps its casing.
+    _stub_google(monkeypatch, "googlestaff@example.com")
+
+    resp = client.post("/auth/google", json={"credential": "stub"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["account_type"] == "user"
+    assert body["user"]["email"] == "GoogleStaff@example.com"
+
+    from app.models import Customer
+
+    # Matching a staff account must not also spawn a customer for that email.
+    assert db_session.query(Customer).count() == 0
+
+
+def test_google_login_verifies_and_reuses_existing_customer(client, db_session, monkeypatch):
+    from app.models import Customer
+
+    existing = Customer(
+        customer_name="Already Here",
+        email="existing@example.com",
+        access_permission=True,
+        is_active=True,
+        is_verified=False,
+    )
+    db_session.add(existing)
+    db_session.commit()
+
+    _stub_google(monkeypatch, "existing@example.com", name="Different Google Name")
+    resp = client.post("/auth/google", json={"credential": "stub"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["customer"]["id"] == existing.id
+    assert body["customer"]["customer_name"] == "Already Here"  # never overwritten
+    assert body["customer"]["is_verified"] is True  # Google proved the address
+    assert body["customer"]["access_permission"] is True  # granted access survives
+    assert db_session.query(Customer).count() == 1
+
+
+def test_google_login_rejects_deactivated_customer(client, db_session, monkeypatch):
+    customer = make_customer(db_session, email="gone@example.com", password="customerpass1")
+    customer.is_active = False
+    db_session.commit()
+
+    _stub_google(monkeypatch, "gone@example.com")
+    resp = client.post("/auth/google", json={"credential": "stub"})
+    assert resp.status_code == 403
+    assert "deactivated" in resp.json()["detail"].lower()
+
+
+def test_google_login_disabled_when_client_id_unset(client, monkeypatch):
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_ID", "")
+    resp = client.post("/auth/google", json={"credential": "stub"})
+    assert resp.status_code == 400
+
+
+def test_google_login_rejects_unverified_google_token(client, monkeypatch):
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_ID", "test-client-id.apps.googleusercontent.com")
+    resp = client.post("/auth/google", json={"credential": "not-a-real-token"})
+    # Nothing stubbed here: the real verifier runs and refuses it.
+    assert resp.status_code == 401
+
+
 def test_duplicate_staff_email_rejected(client, db_session):
     make_admin(db_session, email="dupadmin@example.com", password="password123")
     headers = auth_header(client, "dupadmin@example.com", "password123")
@@ -324,6 +430,167 @@ def test_customer_crud(client, db_session):
 
     # Customers endpoints are NOT public
     assert client.get("/customers/").status_code == 401
+
+
+def test_staff_date_of_birth_and_gender(client, db_session):
+    """`users` carries the same optional pair as `customers` - settable by a
+    user_management admin on create/update, and by the staff member themselves
+    via PUT /users/me."""
+    make_admin(db_session, email="staffdob@example.com", password="password123")
+    headers = auth_header(client, "staffdob@example.com", "password123")
+
+    resp = client.post(
+        "/users/",
+        json={
+            "user_name": "Dated Staff",
+            "email": "datedstaff@example.com",
+            "password": "supersecret1",
+            "date_of_birth": "1979-02-20",
+            "gender": "other",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    user_id = resp.json()["id"]
+    assert resp.json()["date_of_birth"] == "1979-02-20"
+    assert resp.json()["gender"] == "other"
+
+    resp = client.put(
+        f"/users/{user_id}",
+        json={"date_of_birth": "1980-06-06", "gender": "male"},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["date_of_birth"] == "1980-06-06"
+    assert resp.json()["gender"] == "male"
+
+    # Explicit nulls clear them again (how the admin modal blanks a value out).
+    resp = client.put(
+        f"/users/{user_id}", json={"date_of_birth": None, "gender": None}, headers=headers
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["date_of_birth"] is None
+    assert resp.json()["gender"] is None
+
+    # Same validation as customers.
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
+    assert client.put(f"/users/{user_id}", json={"date_of_birth": tomorrow}, headers=headers).status_code == 422
+    assert client.put(f"/users/{user_id}", json={"gender": "banana"}, headers=headers).status_code == 422
+
+    # And the staff member can edit their own via /users/me.
+    resp = client.put(
+        "/users/me", json={"date_of_birth": "1991-09-09", "gender": "female"}, headers=headers
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["date_of_birth"] == "1991-09-09"
+    assert resp.json()["gender"] == "female"
+
+    resp = client.get("/users/me", headers=headers)
+    assert resp.json()["date_of_birth"] == "1991-09-09"
+    assert resp.json()["gender"] == "female"
+
+    # A self-update that doesn't mention them leaves them alone (exclude_unset).
+    resp = client.put("/users/me", json={"phone_num": "012345678"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["date_of_birth"] == "1991-09-09"
+    assert resp.json()["gender"] == "female"
+
+
+def test_staff_can_set_customer_date_of_birth_and_gender(client, db_session):
+    make_admin(db_session, email="dobadmin@example.com", password="password123")
+    headers = auth_header(client, "dobadmin@example.com", "password123")
+
+    # Both fields are optional - a customer created without them comes back null.
+    resp = client.post(
+        "/customers/",
+        json={"customer_name": "No Demographics", "email": "nodemo@example.com"},
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["date_of_birth"] is None
+    assert resp.json()["gender"] is None
+
+    resp = client.post(
+        "/customers/",
+        json={
+            "customer_name": "Dated Customer",
+            "email": "dated@example.com",
+            "date_of_birth": "1990-05-14",
+            "gender": "female",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    customer_id = resp.json()["id"]
+    assert resp.json()["date_of_birth"] == "1990-05-14"
+    assert resp.json()["gender"] == "female"
+
+    # Explicit nulls clear them again (this is how both the profile page and the
+    # admin customer modal blank a wrong value out).
+    resp = client.put(
+        f"/customers/{customer_id}",
+        json={"date_of_birth": None, "gender": None},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["date_of_birth"] is None
+    assert resp.json()["gender"] is None
+
+
+def test_customer_date_of_birth_and_gender_are_validated(client, db_session):
+    make_admin(db_session, email="dobvalidator@example.com", password="password123")
+    headers = auth_header(client, "dobvalidator@example.com", "password123")
+
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
+    resp = client.post(
+        "/customers/",
+        json={"customer_name": "Time Traveller", "email": "future@example.com", "date_of_birth": tomorrow},
+        headers=headers,
+    )
+    assert resp.status_code == 422, resp.text
+
+    resp = client.post(
+        "/customers/",
+        json={"customer_name": "Typo Year", "email": "typo@example.com", "date_of_birth": "0199-05-14"},
+        headers=headers,
+    )
+    assert resp.status_code == 422, resp.text
+
+    resp = client.post(
+        "/customers/",
+        json={"customer_name": "Bad Gender", "email": "badgender@example.com", "gender": "banana"},
+        headers=headers,
+    )
+    assert resp.status_code == 422, resp.text
+
+
+def test_customer_can_edit_own_date_of_birth_and_gender(client, db_session):
+    make_customer(db_session, email="selfdemo@example.com", password="password123")
+    headers = customer_auth_header(client, "selfdemo@example.com", "password123")
+
+    resp = client.put(
+        "/customers/me",
+        json={"date_of_birth": "1985-11-02", "gender": "male"},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["date_of_birth"] == "1985-11-02"
+    assert resp.json()["gender"] == "male"
+
+    resp = client.get("/customers/me", headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["date_of_birth"] == "1985-11-02"
+    assert resp.json()["gender"] == "male"
+
+    # A self-update that doesn't mention them leaves them alone (exclude_unset),
+    # so editing just the phone number on the profile page can't wipe a birthday.
+    resp = client.put("/customers/me", json={"phone_num": "012345678"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["date_of_birth"] == "1985-11-02"
+    assert resp.json()["gender"] == "male"
+
+    resp = client.put("/customers/me", json={"gender": "unicorn"}, headers=headers)
+    assert resp.status_code == 422, resp.text
 
 
 # ---------------------------------------------------------------------------

@@ -32,6 +32,23 @@ class Settings(BaseSettings):
     EMAIL_VERIFICATION_EXPIRE_MINUTES: int = 60 * 24  # 24 hours
     PASSWORD_RESET_EXPIRE_MINUTES: int = 30
 
+    # --- Google Sign-In --------------------------------------------------------
+    # The OAuth 2.0 *Web application* client ID from Google Cloud Console
+    # (APIs & Services -> Credentials), e.g. "1234-abc.apps.googleusercontent.com".
+    # Only the client ID is needed, never the client secret: the browser-side
+    # Google Identity Services button does the OAuth dance and hands the page a
+    # signed ID token, which this server verifies against Google's public keys
+    # (app/core/google_auth.py). The same value must be set on the Flask app so
+    # it can render the button, and every origin the button is served from
+    # (e.g. http://localhost:5000) must be listed as an Authorized JavaScript
+    # origin on that same credential.
+    # Leave empty to disable Google sign-in - POST /auth/google then 400s.
+    GOOGLE_CLIENT_ID: str = ""
+
+    @property
+    def google_auth_configured(self) -> bool:
+        return bool(self.GOOGLE_CLIENT_ID)
+
     # --- CORS ------------------------------------------------------------------
     # Comma-separated list of allowed origins, e.g. "https://app.example.com,https://admin.example.com"
     # A plain string (not List[str]) on purpose: pydantic-settings tries to

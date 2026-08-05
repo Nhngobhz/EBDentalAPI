@@ -8,6 +8,10 @@ pydantic==2.13.4
 pydantic-settings==2.14.2
 email-validator==2.3.0
 pyjwt==2.13.0
+# Only an indirect dependency (of fastapi-mail) until Google sign-in landed -
+# pinned explicitly now because app/core/google_auth.py needs it directly, to
+# verify the RS256 signature on Google's ID tokens.
+cryptography==49.0.0
 bcrypt==5.0.0
 python-multipart==0.0.32
 fastapi-mail==1.6.5

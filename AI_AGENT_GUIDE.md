@@ -49,14 +49,19 @@ confusing (not obviously wrong) results.
 
 ### 1.1 Token endpoints (OAuth2 "password" flow)
 
-Three endpoints issue a JWT access token. All three expect
-`application/x-www-form-urlencoded` (the standard OAuth2 password-grant
-shape), **not JSON** - field names are fixed by the OAuth2 spec:
+Two endpoints issue a JWT access token from an email + password. Both
+expect `application/x-www-form-urlencoded` (the standard OAuth2
+password-grant shape), **not JSON** - field names are fixed by the OAuth2
+spec:
 
 | Endpoint | Who it authenticates |
 |---|---|
 | `POST /auth/login` | Either staff or customer - tries `User` first, falls back to `Customer` |
 | `POST /auth/customer/login` | Customer only |
+
+(A third endpoint, `POST /auth/google`, issues the same kind of token from
+a Google ID token instead of a password - it takes a **JSON** body, see
+1.6.)
 
 Form fields required: `username` (the account's **email address** - not a
 separate username field, there isn't one) and `password`. Example:
@@ -125,6 +130,43 @@ customers: `access_permission`/`is_active` toggled via `PUT
 /customers/{id}`) blocks login and all authenticated calls with `403
 "Account is deactivated"`. This is distinct from the verification 403
 above - check the message text to tell them apart.
+
+### 1.6 Google sign-in (`POST /auth/google`)
+
+`{"credential": "<Google ID token>"}` in, the same body `POST /auth/login`
+returns out (`account_type` + the matching `user`/`customer`). The
+credential is the JWT that Google Identity Services hands the storefront
+page - **this server never sees a Google password, an authorization code,
+or the client secret**; it verifies the token's RS256 signature against
+Google's published keys and checks `aud == GOOGLE_CLIENT_ID`
+(`app/core/google_auth.py`). Unset `GOOGLE_CLIENT_ID` → `400`, a token
+that doesn't verify → `401`.
+
+What it does with a verified token, in order: an existing staff `User`
+with that email signs in as staff; otherwise an existing `Customer` does
+(**including one staff created by hand with no password** - the person who
+owns the mailbox is who that record was for); otherwise a **new
+`Customer`** is created. Things worth knowing before assuming a bug:
+
+- **Emails are matched case-insensitively here** (`func.lower(...)`),
+  unlike the password endpoints' exact match - Google always reports a
+  lowercase address, rows created elsewhere keep whatever casing was typed.
+- **It never creates a staff account** - 1.3 still holds. A Google sign-in
+  for an unknown email always lands on the customer side.
+- The account comes out `is_verified: true` (Google confirming the address
+  is the same proof the emailed link asks for) but still
+  `access_permission: false` - price visibility remains a
+  `customer_management` decision, exactly as with self-registration.
+- A customer created this way has **`hashed_password` NULL**, so they can't
+  use `POST /auth/customer/login` or the forgot-password flow (both of
+  which require a password to exist) - they sign in with the button. This
+  is the same NULL-password state as a staff-created record, and
+  `POST /customers/me/change-password` still 400s for them.
+- `email_verified: false` on the Google token is refused outright - that
+  claim is what makes matching an existing account by email safe.
+- Google's `picture` URL is copied into `user_image`/`customer_image`
+  **only when that field is empty**, so an uploaded avatar is never
+  overwritten.
 
 ---
 
@@ -275,6 +317,7 @@ record only.
 | Method & path | Auth | Body / notes |
 |---|---|---|
 | `POST /auth/login` | Public | form-encoded `username`+`password`; combined staff/customer login, see 1.1 |
+| `POST /auth/google` | Public | JSON `{"credential": "<Google ID token>"}`; same response shape as `/auth/login`. Signs in an existing staff/customer with that (Google-verified) email, or creates a customer for it. See 1.6 |
 | `GET /auth/verify-email?token=` | Public | returns HTML, not JSON (opened from an email link) |
 | `POST /auth/resend-verification` | Public | JSON `{"email": "..."}` |
 | `POST /auth/forgot-password` | Public | JSON `{"email": "..."}`; always returns the same generic message whether or not the email exists (no account enumeration) |
@@ -283,7 +326,7 @@ record only.
 ### Customer auth - `/auth/customer`
 | Method & path | Auth | Body / notes |
 |---|---|---|
-| `POST /auth/customer/register` | Public | JSON `CustomerRegister` (name/email/address/phone/password); starts `access_permission=false`, `is_verified=false` |
+| `POST /auth/customer/register` | Public | JSON `CustomerRegister` (name/email/address/phone/password, plus optional `date_of_birth`/`gender`); starts `access_permission=false`, `is_verified=false` |
 | `POST /auth/customer/login` | Public | form-encoded `username`+`password`; customer-only |
 | `GET /auth/customer/verify-email?token=` | Public | returns HTML |
 | `POST /auth/customer/resend-verification` | Public | JSON `{"email": "..."}` |
@@ -294,7 +337,7 @@ record only.
 | Method & path | Auth | Body / notes |
 |---|---|---|
 | `GET /users/me` | Any user | - |
-| `PUT /users/me` | Any user (verified) | JSON `UserUpdateSelf`, all fields optional; changing `email` flips `is_verified` back to `false` and re-sends a confirmation link - the account then can't hit verified-only endpoints (including this one again) until re-confirmed |
+| `PUT /users/me` | Any user (verified) | JSON `UserUpdateSelf` (`user_name`, `email`, `address`, `phone_num`, `date_of_birth`, `gender`), all optional; changing `email` flips `is_verified` back to `false` and re-sends a confirmation link - the account then can't hit verified-only endpoints (including this one again) until re-confirmed |
 | `POST /users/me/change-password` | Any user (verified) | JSON `{"current_password", "new_password"}` |
 | `POST /users/me/image` | Any user (verified) | multipart `file` |
 
@@ -303,8 +346,8 @@ record only.
 |---|---|---|
 | `GET /users/` | `user_management` | query `skip`, `limit` (default 0/50) |
 | `GET /users/{id}` | `user_management` | - |
-| `POST /users/` | `user_management` | JSON `UserCreateByAdmin` (name/email/address/phone/password/role_title + 4 permission booleans); new account still needs email confirmation before login |
-| `PUT /users/{id}` | `user_management` | JSON `UserUpdateByAdmin`; you cannot set `user_management: false` on your own account (self-lockout guard) |
+| `POST /users/` | `user_management` | JSON `UserCreateByAdmin` (name/email/address/phone/password/role_title + 4 permission booleans, plus optional `date_of_birth`/`gender`); new account still needs email confirmation before login. Note this router builds the `User` from an **explicit field list**, not `**payload.model_dump()` - a new column added to `UserBase` won't persist on create until it's added there too |
+| `PUT /users/{id}` | `user_management` | JSON `UserUpdateByAdmin` (adds `date_of_birth`/`gender` to the usual fields); you cannot set `user_management: false` on your own account (self-lockout guard) |
 | `PUT /users/{id}/password` | `user_management` | JSON `{"new_password"}`; an admin directly setting **another** staff member's password - no `current_password` check (unlike `POST /users/me/change-password`), since the caller isn't the account owner |
 | `DELETE /users/{id}` | `user_management` | soft-delete (`is_active=false`), not a real row deletion; you cannot deactivate your own account |
 
@@ -312,7 +355,7 @@ record only.
 | Method & path | Auth | Body / notes |
 |---|---|---|
 | `GET /customers/me` | Any customer | - |
-| `PUT /customers/me` | Any customer (verified) | JSON `CustomerSelfUpdate`; changing `email` re-triggers verification, same as staff |
+| `PUT /customers/me` | Any customer (verified) | JSON `CustomerSelfUpdate` (`customer_name`, `email`, `address`, `phone_num`, `date_of_birth`, `gender`); changing `email` re-triggers verification, same as staff |
 | `POST /customers/me/change-password` | Any customer (verified) | JSON `{"current_password", "new_password"}`; fails with 400 if the customer has no password (i.e. was created by staff, never self-registered) |
 | `POST /customers/me/image` | Any customer (verified) | multipart `file` |
 
@@ -325,6 +368,14 @@ record only.
 | `PUT /customers/{id}` | `customer_management` | JSON `CustomerUpdate`, all optional including `access_permission` - this is the only way a customer's price visibility gets turned on |
 | `POST /customers/{id}/image` | `customer_management` | multipart `file` |
 | `DELETE /customers/{id}` | `customer_management` | **hard delete**, unlike users - returns `204` with no body |
+
+**Both** `Customer` and `User` carry the same two optional demographic columns,
+`date_of_birth` (ISO `"YYYY-MM-DD"`, or `null`) and `gender` (`"male"` /
+`"female"` / `"other"`, or `null`). They're settable on create and on every
+update path (`PUT /customers/{id}`, `PUT /customers/me`, `PUT /users/{id}`,
+`PUT /users/me`), they're never required, and passing an explicit `null` clears
+one. Validation is shared - see the `Gender` / `DateOfBirth` aliases near the
+top of `app/schemas.py`, not a per-class `@field_validator`.
 
 ### Brands - `/brands`
 | Method & path | Auth | Body / notes |
@@ -546,6 +597,10 @@ Notes an agent should know before calling this:
 
 - Passwords (`password`, `new_password`): 8-72 characters.
 - `user_name`: 2-100 chars. `customer_name`: 2-150 chars.
+- `date_of_birth` (on both `User` and `Customer`): a plain date, not a
+  datetime. Must not be in the future and must be on or after `1900-01-01`
+  (both bounds only exist to catch a mistyped year). `gender` must be exactly
+  one of `"male"`, `"female"`, `"other"` - lowercase.
 - `email` fields: validated as real email syntax (`EmailStr`) - and note
   reserved test TLDs (`.test`, `.example`, `.invalid`, `.localhost`) are
   **rejected** by the validator. Use a realistic-looking domain even for

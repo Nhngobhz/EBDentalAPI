@@ -3,10 +3,12 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.responses import HTMLResponse
 from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.core.email import send_password_reset_email, send_verification_email
+from app.core.google_auth import GoogleAuthError, verify_google_id_token
 from app.core.logging_conf import get_logger
 from app.core.pages import render_reset_password_form, render_status_page
 from app.core.security import (
@@ -18,6 +20,7 @@ from app.core.security import (
 from app.database import get_db
 from app.models import Customer, User
 from app.schemas import (
+    GoogleAuthRequest,
     LoginResponse,
     Message,
     PasswordResetConfirm,
@@ -162,6 +165,123 @@ async def login(
         }
 
     raise unauthorized
+
+
+@router.post("/google", response_model=LoginResponse)
+def google_login(
+    payload: GoogleAuthRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """Sign in - or sign up - with a Google account. Same response shape as
+    POST /auth/login, so a caller can treat the two interchangeably.
+
+    `credential` is the ID token Google Identity Services handed the browser;
+    app/core/google_auth.py verifies Google signed it, that it was issued for
+    this app, and that the email on it is one Google has confirmed. Because
+    that email is proven, it's what the account is matched on:
+
+    - an existing staff `User` with that email signs in as staff (there's
+      still no way to *create* a staff account this way - section 1.3 of the
+      guide holds: only user_management staff can);
+    - otherwise an existing `Customer` with that email signs in, including a
+      record staff created by hand (`POST /customers/`) that never had a
+      password - the person who owns the mailbox is who that record is for;
+    - otherwise a new `Customer` is created, starting `access_permission=False`
+      exactly like `POST /auth/customer/register` does.
+
+    Either way the account comes out `is_verified=True`: Google confirming the
+    address is the same proof our own emailed link asks for, so there's
+    nothing left to confirm. Google accounts have no password here
+    (`hashed_password` stays NULL for one created this way), so they sign in
+    with this button rather than the password form.
+
+    Deliberately a sync `def`: verification can block on fetching Google's
+    signing keys, which FastAPI then runs in its threadpool.
+    """
+    if not settings.google_auth_configured:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Google sign-in is not available. Please sign in with your email and password.",
+        )
+
+    try:
+        claims = verify_google_id_token(payload.credential)
+    except GoogleAuthError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
+
+    email = claims["email"]  # already lowercased by the verifier
+    picture = claims.get("picture")
+    now = datetime.now(timezone.utc)
+
+    # Emails are matched case-insensitively: Google always reports a lowercase
+    # address, but rows created through the password/admin paths keep whatever
+    # casing was typed.
+    user = db.query(User).filter(func.lower(User.email) == email).first()
+    if user:
+        if not user.is_active:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated")
+        if not user.is_verified:
+            user.is_verified = True
+            user.verification_token = None
+            user.verification_token_expires = None
+        if picture and not user.user_image:
+            user.user_image = picture
+        user.last_login = now
+        db.commit()
+        db.refresh(user)
+
+        access_token = create_access_token(data={"sub": str(user.id), "type": "user"})
+        background_tasks.add_task(
+            notify_admin_login,
+            user.user_name,
+            user.email,
+            user.role_title,
+            bool(user.user_management),
+        )
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "account_type": "user",
+            "user": user,
+        }
+
+    customer = db.query(Customer).filter(func.lower(Customer.email) == email).first()
+    if customer is None:
+        # `name` is optional on an ID token (a Workspace account can withhold
+        # the profile scope), hence the local-part fallback - customer_name is
+        # NOT NULL and the column caps at 150.
+        name = (claims.get("name") or "").strip() or email.split("@")[0]
+        customer = Customer(
+            customer_name=name[:150],
+            email=email,
+            customer_image=picture,
+            access_permission=False,
+            is_active=True,
+            is_verified=True,
+        )
+        db.add(customer)
+    else:
+        if not customer.is_active:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated")
+        if not customer.is_verified:
+            customer.is_verified = True
+            customer.verification_token = None
+            customer.verification_token_expires = None
+        if picture and not customer.customer_image:
+            customer.customer_image = picture
+
+    customer.last_login = now
+    db.commit()
+    db.refresh(customer)
+
+    access_token = create_access_token(data={"sub": str(customer.id), "type": "customer"})
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "account_type": "customer",
+        "customer": customer,
+    }
 
 
 @router.post("/forgot-password", response_model=Message)
