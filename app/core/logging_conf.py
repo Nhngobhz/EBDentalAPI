@@ -9,12 +9,20 @@ in addition to going to the console and to app.log.
 The Telegram send happens in a short-lived daemon thread so a slow/broken
 Telegram API never blocks a request.
 """
+import html
 import logging
+import logging.handlers
 import threading
 
 import httpx
 
 from app.config import settings
+
+# app.log is written on every request path and nothing ever truncated it, so it
+# grew without bound for the lifetime of the container. Five 2 MB generations is
+# plenty to debug a recent incident with, and the ceiling is now fixed at 10 MB.
+_LOG_FILE_MAX_BYTES = 2 * 1024 * 1024
+_LOG_FILE_BACKUP_COUNT = 5
 
 _TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
@@ -35,7 +43,11 @@ class TelegramErrorHandler(logging.Handler):
     def _send(message: str, level: str) -> None:
         try:
             url = _TELEGRAM_URL.format(token=settings.TELEGRAM_BOT_TOKEN)
-            text = f"\U0001F6A8 <b>{level}</b>\n<pre>{message[:3500]}</pre>"
+            # Escaped: this is sent with parse_mode=HTML, and the log line it wraps
+            # routinely contains "<" (repr of an object, a generic type, a snippet
+            # of user input). Unescaped, Telegram rejected the whole message - so
+            # exactly the errors most worth seeing were the ones that never arrived.
+            text = f"\U0001F6A8 <b>{html.escape(level)}</b>\n<pre>{html.escape(message[:3500])}</pre>"
             payload = {
                 "chat_id": settings.TELEGRAM_CHAT_ID,
                 "text": text,
@@ -68,7 +80,12 @@ def setup_logging() -> None:
     console_handler.setFormatter(fmt)
     root_logger.addHandler(console_handler)
 
-    file_handler = logging.FileHandler("app.log")
+    file_handler = logging.handlers.RotatingFileHandler(
+        "app.log",
+        maxBytes=_LOG_FILE_MAX_BYTES,
+        backupCount=_LOG_FILE_BACKUP_COUNT,
+        encoding="utf-8",
+    )
     file_handler.setFormatter(fmt)
     root_logger.addHandler(file_handler)
 

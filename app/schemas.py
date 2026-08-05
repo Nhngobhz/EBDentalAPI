@@ -299,9 +299,17 @@ DiscountType = Literal["percent", "cash"]
 # is read from the live Product row, so renaming a product updates every bundle
 # it appears in.
 # ---------------------------------------------------------------------------
+# Upper bound on any client-supplied quantity. Every money column in the schema is
+# Numeric(10, 2), i.e. it tops out just under $100,000,000 - so an unbounded qty
+# turned "price x qty" into a Postgres numeric-overflow error, which surfaced as an
+# opaque 500 (and a Telegram error alert) rather than a validation message. 100,000
+# is far beyond any real dental order and far below the overflow point.
+MAX_QTY = 100_000
+
+
 class BundleItemIn(BaseModel):
     product_id: int
-    qty: int = Field(1, gt=0)
+    qty: int = Field(1, gt=0, le=MAX_QTY)
 
 
 class BundleItemOut(BaseModel):
@@ -540,7 +548,7 @@ class OrderItemCreate(BaseModel):
     product_id: Optional[int] = None
     promotion_id: Optional[int] = None
     set_id: Optional[int] = None
-    qty: int = Field(..., gt=0)
+    qty: int = Field(..., gt=0, le=MAX_QTY)
 
     @model_validator(mode="after")
     def _exactly_one_id(self):

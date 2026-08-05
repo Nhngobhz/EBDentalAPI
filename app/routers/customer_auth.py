@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
@@ -9,6 +9,11 @@ from app.config import settings
 from app.core.email import send_customer_password_reset_email, send_customer_verification_email
 from app.core.logging_conf import get_logger
 from app.core.pages import render_reset_password_form, render_status_page
+from app.core.ratelimit import (
+    check_login_allowed,
+    record_login_failure,
+    record_login_success,
+)
 from app.core.security import (
     create_access_token,
     generate_url_safe_token,
@@ -132,18 +137,25 @@ async def resend_verification(
 
 @router.post("/login", response_model=CustomerLoginResponse)
 async def login(
+    request: Request,
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db),
 ):
     """OAuth2 password flow. `username` = the customer's email. Customer
     records created directly by staff (POST /customers/) have no password
     and can't log in through here."""
+    # Same brute-force throttle as POST /auth/login - this endpoint accepts the
+    # exact same credentials, so leaving it unlimited would just move the attack
+    # here. See app/core/ratelimit.py.
+    check_login_allowed(request, form_data.username)
+
     customer = db.query(Customer).filter(Customer.email == form_data.username).first()
     if (
         not customer
         or not customer.hashed_password
         or not verify_password(form_data.password, customer.hashed_password)
     ):
+        record_login_failure(request, form_data.username)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
@@ -159,6 +171,7 @@ async def login(
 
     customer.last_login = datetime.now(timezone.utc)
     db.commit()
+    record_login_success(request, form_data.username)
 
     access_token = create_access_token(data={"sub": str(customer.id), "type": "customer"})
 

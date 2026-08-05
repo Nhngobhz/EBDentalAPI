@@ -33,6 +33,7 @@ back to the fpdf2 approximation only if it doesn't (browser closed/crashed/offli
 exactly one Telegram alert always goes out, never zero and never two.
 """
 import asyncio
+import html
 import json
 from typing import TYPE_CHECKING
 
@@ -113,6 +114,20 @@ def _api_url(method: str) -> str:
     return _API_BASE.format(token=settings.TELEGRAM_BOT_TOKEN, method=method)
 
 
+def _esc(value: object) -> str:
+    """Escape a value before it goes into a parse_mode=HTML message.
+
+    Every caption/message below is sent with parse_mode="HTML", and several
+    interpolate free text the *customer* typed (clinic_name, address) or that a
+    staff member chose (user_name, role_title). Telegram rejects a message whose
+    entities don't parse - so a clinic literally named "Smith <Dental>" didn't
+    produce a mangled alert, it produced NO alert (and the text-only fallback,
+    built from the same caption, failed identically). Escaping keeps the alert
+    deliverable whatever anyone types, and closes the matching injection of
+    arbitrary markup into the staff chat."""
+    return html.escape(str(value if value is not None else ""), quote=False)
+
+
 def _describe(exc: BaseException) -> str:
     """Renders an exception for a log line.
 
@@ -167,8 +182,8 @@ async def notify_admin_login(
     icon = "\U0001F6E1" if is_admin_level else "\U0001F464"
     text = (
         f"{icon} <b>Staff login</b>\n"
-        f"User: {user_name} ({email})\n"
-        f"Role: {role_title}\n"
+        f"User: {_esc(user_name)} ({_esc(email)})\n"
+        f"Role: {_esc(role_title)}\n"
         f"Admin-level (user_management): {'Yes' if is_admin_level else 'No'}"
     )
     await send_telegram_message(text, topic_id=settings.TELEGRAM_LOGIN_TOPIC_ID)
@@ -177,8 +192,8 @@ async def notify_admin_login(
 async def notify_error(error_type: str, message: str, path: str | None = None) -> None:
     text = (
         f"\U0001F6A8 <b>Application error</b>\n"
-        f"Type: {error_type}\n"
-        f"Message: {message}\n" + (f"Path: {path}" if path else "")
+        f"Type: {_esc(error_type)}\n"
+        f"Message: {_esc(message)}\n" + (f"Path: {_esc(path)}" if path else "")
     )
     await send_telegram_message(text, topic_id=settings.TELEGRAM_ERROR_TOPIC_ID)
 
@@ -195,9 +210,9 @@ def _order_alert_caption(order: "OrderOut") -> tuple[str, str]:
         )
         caption = (
             f"\U0001F4C4 <b>New QUOTE</b>\n"
-            f"Quote No: {order.order_number} (Code: {order.quote_code})\n"
-            f"Clinic: {order.clinic_name}\n"
-            f"Salesperson: {order.salesperson or '-'}\n"
+            f"Quote No: {_esc(order.order_number)} (Code: {_esc(order.quote_code)})\n"
+            f"Clinic: {_esc(order.clinic_name)}\n"
+            f"Salesperson: {_esc(order.salesperson or '-')}\n"
             f"{payment_line}"
             f"Grand Total: $ {order.grand_total:.2f}\n"
             f"ℹ️ This is a quotation - no payment has been made."
@@ -206,17 +221,17 @@ def _order_alert_caption(order: "OrderOut") -> tuple[str, str]:
     if order.payment_method == "khqr" and order.payment_status == "paid":
         caption = (
             f"✅ <b>Order PAID via KHQR</b>\n"
-            f"Order No: {order.order_number} (Code: {order.quote_code})\n"
-            f"Clinic: {order.clinic_name}\n"
-            f"Salesperson: {order.salesperson or '-'}\n"
+            f"Order No: {_esc(order.order_number)} (Code: {_esc(order.quote_code)})\n"
+            f"Clinic: {_esc(order.clinic_name)}\n"
+            f"Salesperson: {_esc(order.salesperson or '-')}\n"
             f"Amount received: $ {order.grand_total:.2f}"
         )
         return caption, "Receipt"
     caption = (
         f"\U0001F6CD <b>New order</b>\n"
-        f"Order No: {order.order_number} (Code: {order.quote_code})\n"
-        f"Clinic: {order.clinic_name}\n"
-        f"Salesperson: {order.salesperson or '-'}\n"
+        f"Order No: {_esc(order.order_number)} (Code: {_esc(order.quote_code)})\n"
+        f"Clinic: {_esc(order.clinic_name)}\n"
+        f"Salesperson: {_esc(order.salesperson or '-')}\n"
         f"Grand Total: $ {order.grand_total:.2f}"
     )
     return caption, "Quotation"
@@ -230,8 +245,8 @@ async def send_khqr_pending_alert(order: "OrderOut") -> None:
     (automatic Bakong check or staff Mark-as-Paid)."""
     text = (
         f"\U0001F551 <b>New order - awaiting KHQR payment</b>\n"
-        f"Order No: {order.order_number} (Code: {order.quote_code})\n"
-        f"Clinic: {order.clinic_name}\n"
+        f"Order No: {_esc(order.order_number)} (Code: {_esc(order.quote_code)})\n"
+        f"Clinic: {_esc(order.clinic_name)}\n"
         f"Amount due: $ {order.grand_total:.2f}\n"
         f"A paid confirmation with the receipt will follow once the transfer arrives."
     )

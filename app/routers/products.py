@@ -1,10 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
+﻿from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.bundles import build_bundle_rows, replace_bundle_rows
 from app.core.deps import get_price_visibility, get_verified_user, require_permission
 from app.core.files import save_named_image
-from app.core.query import OptionalInt
+from app.core.query import Limit, OptionalInt, Skip
 from app.database import get_db
 from app.models import Brand, Category, Product, ProductFreeItem, User
 from app.schemas import ProductCreate, ProductOut, ProductPriceUpdate, ProductUpdate
@@ -50,8 +50,8 @@ def _serialize_product(product: Product, can_view_price: bool) -> dict:
 
 @router.get("/", response_model=list[ProductOut])
 def list_products(
-    skip: int = 0,
-    limit: int = 50,
+    skip: Skip = 0,
+    limit: Limit = 50,
     brand_id: OptionalInt = None,
     category_id: OptionalInt = None,
     q: str | None = None,

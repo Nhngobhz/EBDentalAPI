@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+﻿from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, status
 from sqlalchemy import or_
@@ -9,6 +9,7 @@ from app.core.deps import get_verified_customer, require_permission
 from app.core.email import send_customer_verification_email
 from app.core.files import save_image
 from app.core.security import generate_url_safe_token, hash_password, verify_password
+from app.core.query import Limit, Skip
 from app.database import get_db
 from app.models import Customer, User
 from app.schemas import (
@@ -88,8 +89,8 @@ async def upload_my_image(
 
 @router.get("/", response_model=list[CustomerOut])
 def list_customers(
-    skip: int = 0,
-    limit: int = 50,
+    skip: Skip = 0,
+    limit: Limit = 50,
     q: str | None = None,
     _: User = _perm,
     db: Session = Depends(get_db),

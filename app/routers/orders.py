@@ -1,4 +1,4 @@
-"""
+﻿"""
 Order / OrderItem router.
 
 An Order is a finalized storefront quote (see partials/quote_drawer.html and the
@@ -30,9 +30,10 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.config import settings
 from app.core.bundles import bundle_old_price
-from app.core.deps import oauth2_scheme, require_permission
+from app.core.deps import oauth2_scheme, principal_id_from_token, require_permission
 from app.core.files import ALLOWED_PDF_TYPES
 from app.core.security import decode_access_token
+from app.core.query import Limit, Skip
 from app.database import get_db
 from app.models import Customer, Order, OrderItem, Product, Promotion, Set, User
 from app.schemas import OrderCreate, OrderOut, OrderUpdate
@@ -71,13 +72,15 @@ def _get_ordering_principal(
     except jwt.PyJWTError:
         raise credentials_exception
 
-    sub = payload.get("sub")
     principal_type = payload.get("type")
-    if sub is None or principal_type not in ("user", "customer"):
+    if principal_type not in ("user", "customer"):
+        raise credentials_exception
+    principal_id = principal_id_from_token(payload, principal_type)
+    if principal_id is None:
         raise credentials_exception
 
     if principal_type == "user":
-        user = db.query(User).filter(User.id == int(sub)).first()
+        user = db.query(User).filter(User.id == principal_id).first()
         if not user:
             raise credentials_exception
         if not user.is_active:
@@ -94,7 +97,7 @@ def _get_ordering_principal(
             )
         return None, user
 
-    customer = db.query(Customer).filter(Customer.id == int(sub)).first()
+    customer = db.query(Customer).filter(Customer.id == principal_id).first()
     if not customer:
         raise credentials_exception
     if not customer.is_active:
@@ -513,8 +516,8 @@ async def check_payment_status(
 
 @router.get("/", response_model=list[OrderOut])
 def list_orders(
-    skip: int = 0,
-    limit: int = 50,
+    skip: Skip = 0,
+    limit: Limit = 50,
     status: str | None = None,
     customer_id: int | None = None,
     _: User = _perm,

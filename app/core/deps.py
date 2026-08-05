@@ -1,4 +1,4 @@
-"""
+﻿"""
 Reusable FastAPI dependencies: who is calling, and are they allowed to.
 
 RBAC model used throughout the API:
@@ -36,6 +36,23 @@ PERMISSION_NAMES = (
 )
 
 
+def principal_id_from_token(payload: dict, expected_type: str) -> int | None:
+    """The `sub` claim as an int, or None if this token isn't a usable one of
+    `expected_type`.
+
+    `sub` is whatever was signed into the token, and a token signed with a
+    non-numeric sub (an older format, a hand-rolled one, a bug elsewhere) used to
+    reach `int(sub)` directly and raise ValueError - which surfaces as a 500 and a
+    Telegram error alert instead of the 401 it actually is."""
+    if payload.get("type") != expected_type:
+        return None
+    sub = payload.get("sub")
+    try:
+        return int(sub)
+    except (TypeError, ValueError):
+        return None
+
+
 def get_current_user(
     token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)
 ) -> User:
@@ -46,13 +63,13 @@ def get_current_user(
     )
     try:
         payload = decode_access_token(token)
-        user_id = payload.get("sub")
-        if user_id is None or payload.get("type") != "user":
-            raise credentials_exception
     except jwt.PyJWTError:
         raise credentials_exception
+    user_id = principal_id_from_token(payload, "user")
+    if user_id is None:
+        raise credentials_exception
 
-    user = db.query(User).filter(User.id == int(user_id)).first()
+    user = db.query(User).filter(User.id == user_id).first()
     if user is None:
         raise credentials_exception
     if not user.is_active:
@@ -85,13 +102,13 @@ def get_current_customer(
     )
     try:
         payload = decode_access_token(token)
-        customer_id = payload.get("sub")
-        if customer_id is None or payload.get("type") != "customer":
-            raise credentials_exception
     except jwt.PyJWTError:
         raise credentials_exception
+    customer_id = principal_id_from_token(payload, "customer")
+    if customer_id is None:
+        raise credentials_exception
 
-    customer = db.query(Customer).filter(Customer.id == int(customer_id)).first()
+    customer = db.query(Customer).filter(Customer.id == customer_id).first()
     if customer is None:
         raise credentials_exception
     if not customer.is_active:
@@ -126,15 +143,13 @@ def get_price_visibility(
     except jwt.PyJWTError:
         return False
 
-    sub = payload.get("sub")
-    if sub is None:
-        return False
-
-    if payload.get("type") == "user":
-        user = db.query(User).filter(User.id == int(sub)).first()
+    user_id = principal_id_from_token(payload, "user")
+    if user_id is not None:
+        user = db.query(User).filter(User.id == user_id).first()
         return bool(user and user.is_active)
-    if payload.get("type") == "customer":
-        customer = db.query(Customer).filter(Customer.id == int(sub)).first()
+    customer_id = principal_id_from_token(payload, "customer")
+    if customer_id is not None:
+        customer = db.query(Customer).filter(Customer.id == customer_id).first()
         return bool(customer and customer.is_active and customer.access_permission)
     return False
 

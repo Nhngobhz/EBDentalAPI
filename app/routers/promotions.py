@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+﻿from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.core.bundles import build_bundle_rows, bundle_old_price, replace_bundle_rows
 from app.core.deps import get_price_visibility, require_permission
 from app.core.files import save_named_image
+from app.core.query import Limit, Skip
 from app.database import get_db
 from app.models import Promotion, PromotionItem, User
 from app.schemas import PromotionCreate, PromotionOut, PromotionUpdate
@@ -33,8 +34,8 @@ def _serialize_promotion(promotion: Promotion, can_view_price: bool) -> dict:
 
 @router.get("/", response_model=list[PromotionOut])
 def list_promotions(
-    skip: int = 0,
-    limit: int = 50,
+    skip: Skip = 0,
+    limit: Limit = 50,
     active_only: bool = False,
     can_view_price: bool = Depends(get_price_visibility),
     db: Session = Depends(get_db),

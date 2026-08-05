@@ -13,6 +13,7 @@ os.environ["MAIL_PASSWORD"] = ""
 import pytest
 from fastapi.testclient import TestClient
 
+from app.core import ratelimit
 from app.database import Base, SessionLocal, engine
 from app.main import app
 from app.core.security import hash_password
@@ -30,6 +31,10 @@ def _create_schema():
 def _clean_tables():
     """Truncate all tables between tests so each test starts from empty."""
     yield
+    # The login throttle (app/core/ratelimit.py) is process-global, so without this
+    # one test's deliberate bad-password attempts would count against the next
+    # test's legitimate logins from the same TestClient address.
+    ratelimit.reset()
     db = SessionLocal()
     try:
         for table in reversed(Base.metadata.sorted_tables):

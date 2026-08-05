@@ -5,7 +5,12 @@ All settings are read from environment variables / a `.env` file so that no
 secret ever needs to be hard-coded. See `.env.example` for the full list of
 variables you can set.
 """
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# The value SECRET_KEY falls back to when nothing is configured. Named so the
+# production guard at the bottom of Settings can recognize "never changed".
+_PLACEHOLDER_SECRET_KEY = "CHANGE_ME_TO_A_LONG_RANDOM_SECRET"
 
 
 class Settings(BaseSettings):
@@ -26,7 +31,7 @@ class Settings(BaseSettings):
     AUTO_CREATE_TABLES: bool = False
 
     # --- Security / JWT ------------------------------------------------------
-    SECRET_KEY: str = "CHANGE_ME_TO_A_LONG_RANDOM_SECRET"
+    SECRET_KEY: str = _PLACEHOLDER_SECRET_KEY
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours
     EMAIL_VERIFICATION_EXPIRE_MINUTES: int = 60 * 24  # 24 hours
@@ -203,6 +208,36 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
+
+    @model_validator(mode="after")
+    def _reject_unsafe_production_config(self):
+        """Refuse to boot a *production* deployment on the development defaults.
+
+        Every setting above has a permissive default so a fresh checkout runs
+        with no .env at all - which is exactly what makes shipping one of those
+        defaults by accident easy. This only fires when ENVIRONMENT=production,
+        so local development and the test suite are untouched; it turns a silent
+        "anyone can forge a JWT" into a startup error naming what to fix.
+        """
+        if self.ENVIRONMENT.strip().lower() != "production":
+            return self
+
+        problems = []
+        if self.SECRET_KEY == _PLACEHOLDER_SECRET_KEY:
+            problems.append("SECRET_KEY is still the placeholder value")
+        elif len(self.SECRET_KEY) < 32:
+            problems.append("SECRET_KEY is shorter than 32 characters")
+        if self.DEBUG:
+            problems.append("DEBUG must be false")
+        if "*" in self.cors_origins_list:
+            problems.append('CORS_ORIGINS must name real origins instead of "*"')
+        if self.AUTO_CREATE_TABLES:
+            problems.append("AUTO_CREATE_TABLES must be false (use Alembic migrations)")
+        if problems:
+            raise ValueError(
+                "Refusing to start with ENVIRONMENT=production: " + "; ".join(problems)
+            )
+        return self
 
 
 settings = Settings()

@@ -1,9 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
+﻿from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.core.bundles import build_bundle_rows, bundle_old_price, replace_bundle_rows
 from app.core.deps import get_price_visibility, require_permission
 from app.core.files import save_named_image
+from app.core.query import Limit, Skip
 from app.database import get_db
 from app.models import Set, SetItem, User
 from app.schemas import SetCreate, SetOut, SetUpdate
@@ -31,8 +32,8 @@ def _serialize_set(set_: Set, can_view_price: bool) -> dict:
 
 @router.get("/", response_model=list[SetOut])
 def list_sets(
-    skip: int = 0,
-    limit: int = 50,
+    skip: Skip = 0,
+    limit: Limit = 50,
     can_view_price: bool = Depends(get_price_visibility),
     db: Session = Depends(get_db),
 ):

@@ -168,6 +168,21 @@ owns the mailbox is who that record was for); otherwise a **new
   **only when that field is empty**, so an uploaded avatar is never
   overwritten.
 
+### 1.7 Failed sign-ins are rate limited
+
+The password endpoints (`POST /auth/login` and `POST /auth/customer/login`)
+count **failed** attempts per (client IP, email) pair. After 10 within 15
+minutes that pair is locked out for 15 minutes and every further attempt gets
+`429` with a `Retry-After` header, *including one carrying the correct
+password* - so retrying a "wrong password" in a loop makes things worse, not
+better. A successful login clears the counter, and 403s for
+unverified/deactivated accounts don't count towards it (those callers already
+proved they know the password).
+
+`POST /auth/google` is deliberately **not** limited - it verifies a signature
+from Google rather than a guessable secret. The limit lives in-process
+(`app/core/ratelimit.py`), so behind multiple workers it applies per worker.
+
 ---
 
 ## 2. Authorization model (permissions)
@@ -280,7 +295,8 @@ and the global handler for anything unhandled):
 Status code varies by cause: `400` bad input/state (e.g. duplicate
 email), `401` bad/missing/expired credentials, `403` authenticated but
 not permitted (or unverified/deactivated - check the message text),
-`404` not found. Unhandled server exceptions always come back as a
+`404` not found, `429` too many failed sign-in attempts (see 1.7).
+Unhandled server exceptions always come back as a
 generic `500 {"detail": "Internal server error"}` - the real exception
 never reaches the client (it's logged server-side / forwarded to
 Telegram if configured), so don't expect stack traces or specific error
@@ -595,6 +611,13 @@ Notes an agent should know before calling this:
 
 (From `app/schemas.py` - violating these gets a `422`, not a `400`.)
 
+- **Pagination**: every list endpoint's `skip` must be `>= 0` and `limit` must
+  be `1`-`500` (`MAX_PAGE_SIZE` in `app/core/query.py`). To walk a table larger
+  than 500 rows, page with `skip`; there is no way to ask for it all at once.
+- **`qty`** on an order line and inside a bundle's `items`/`free_items` is
+  capped at `100000` (`MAX_QTY`). The ceiling exists because every money column
+  is `Numeric(10, 2)`, so a larger quantity would overflow `price x qty` in the
+  database rather than fail cleanly.
 - Passwords (`password`, `new_password`): 8-72 characters.
 - `user_name`: 2-100 chars. `customer_name`: 2-150 chars.
 - `date_of_birth` (on both `User` and `Customer`): a plain date, not a

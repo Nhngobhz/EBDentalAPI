@@ -12,7 +12,6 @@ app/core/storage.py). You can either:
       resulting URL/path for you.
 """
 import io
-import os
 import re
 import uuid
 
@@ -24,6 +23,24 @@ from app.core.storage import save_object
 
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 ALLOWED_PDF_TYPES = {"application/pdf"}
+
+# The extension a stored file gets, chosen from the content type we already
+# validated rather than from the client-supplied filename.
+#
+# This matters because of the local-disk fallback (app/core/storage.py): those
+# files are served back by StaticFiles, which picks the response Content-Type
+# purely from the extension on disk. Taking the extension from `file.filename`
+# meant an uploader could store active content - "payload.html", "payload.svg" -
+# under an image/* content type and get it served as HTML from this API's own
+# origin. Mapping the extension from the validated type instead makes that
+# impossible without changing anything about legitimate uploads.
+_EXTENSION_BY_CONTENT_TYPE = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "application/pdf": ".pdf",
+}
 
 # Longest side an uploaded image is downscaled to before saving, to keep
 # compressed file sizes down regardless of what the customer/staff uploads.
@@ -53,7 +70,7 @@ async def save_upload(
             detail=f"File too large. Maximum size is {max_size_mb} MB.",
         )
 
-    ext = os.path.splitext(file.filename or "")[1].lower() or ".bin"
+    ext = _EXTENSION_BY_CONTENT_TYPE.get(file.content_type, ".bin")
     filename = f"{uuid.uuid4().hex}{ext}"
     key = f"{category}/{filename}"
 

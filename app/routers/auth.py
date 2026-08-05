@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import func
@@ -11,6 +11,11 @@ from app.core.email import send_password_reset_email, send_verification_email
 from app.core.google_auth import GoogleAuthError, verify_google_id_token
 from app.core.logging_conf import get_logger
 from app.core.pages import render_reset_password_form, render_status_page
+from app.core.ratelimit import (
+    check_login_allowed,
+    record_login_failure,
+    record_login_success,
+)
 from app.core.security import (
     create_access_token,
     generate_url_safe_token,
@@ -97,6 +102,7 @@ async def resend_verification(
 
 @router.post("/login", response_model=LoginResponse)
 async def login(
+    request: Request,
     background_tasks: BackgroundTasks,
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db),
@@ -111,6 +117,9 @@ async def login(
         detail="Incorrect email or password",
         headers={"WWW-Authenticate": "Bearer"},
     )
+    # Checked before any password is hashed, so a locked-out caller can't use this
+    # endpoint's bcrypt cost as a CPU-burning tool - see app/core/ratelimit.py.
+    check_login_allowed(request, form_data.username)
 
     user = db.query(User).filter(User.email == form_data.username).first()
     if user and verify_password(form_data.password, user.hashed_password):
@@ -124,6 +133,7 @@ async def login(
 
         user.last_login = datetime.now(timezone.utc)
         db.commit()
+        record_login_success(request, form_data.username)
 
         access_token = create_access_token(data={"sub": str(user.id), "type": "user"})
 
@@ -154,6 +164,7 @@ async def login(
 
         customer.last_login = datetime.now(timezone.utc)
         db.commit()
+        record_login_success(request, form_data.username)
 
         access_token = create_access_token(data={"sub": str(customer.id), "type": "customer"})
 
@@ -164,6 +175,10 @@ async def login(
             "customer": customer,
         }
 
+    # Only a genuinely wrong email/password counts towards the lockout. The
+    # deactivated/unverified branches above raise 403 without recording anything -
+    # those callers proved they know the password, they just can't use it yet.
+    record_login_failure(request, form_data.username)
     raise unauthorized
 
 

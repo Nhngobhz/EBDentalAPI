@@ -1,4 +1,5 @@
 import os
+import secrets
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header, HTTPException, Request, status
@@ -57,10 +58,21 @@ app = FastAPI(
     openapi_url=None,
 )
 
+# allow_origins=["*"] together with allow_credentials=True is the classic CORS
+# footgun: Starlette then echoes the *caller's own* Origin back with
+# Access-Control-Allow-Credentials, so any website on the internet can make
+# credentialed cross-origin calls here. Nothing in this system needs that -
+# the browser talks to the Flask app, which holds the bearer token server-side
+# and calls this API server-to-server (no CORS involved at all). So credentials
+# are only offered once CORS_ORIGINS actually names the origins allowed to use
+# them; a wildcard stays anonymous-only.
+_cors_origins = settings.cors_origins_list
+_cors_allows_any_origin = "*" in _cors_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins_list,
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=not _cors_allows_any_origin,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -97,8 +109,11 @@ app.include_router(telegram_webhook.router)
 def health_check(x_telegram_bot_token: str | None = Header(default=None)):
     # Only the Telegram bot's /check command should be able to hit this -
     # it sends the bot token back as a header. Anyone else gets a 404 so the
-    # endpoint's existence isn't even revealed.
-    if not settings.TELEGRAM_BOT_TOKEN or x_telegram_bot_token != settings.TELEGRAM_BOT_TOKEN:
+    # endpoint's existence isn't even revealed. compare_digest, not ==, so the
+    # comparison can't be probed character-by-character through response timing.
+    if not settings.TELEGRAM_BOT_TOKEN or not secrets.compare_digest(
+        x_telegram_bot_token or "", settings.TELEGRAM_BOT_TOKEN
+    ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return {"status": "ok"}
 

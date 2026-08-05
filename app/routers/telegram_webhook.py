@@ -8,6 +8,9 @@ registered - see register_telegram_webhook() in app/main.py's lifespan) is verif
 Anyone who doesn't present both gets a 404, same "don't even reveal this exists" pattern
 as the /health endpoint's bot-token check.
 """
+import html
+import secrets
+
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
@@ -29,9 +32,16 @@ async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: str | None = Header(default=None),
 ):
-    if not settings.TELEGRAM_WEBHOOK_SECRET or secret != settings.TELEGRAM_WEBHOOK_SECRET:
+    # compare_digest, not ==: this endpoint is reachable by anyone on the internet,
+    # and a short-circuiting comparison leaks the secret one character at a time
+    # to whoever is willing to measure the response.
+    if not settings.TELEGRAM_WEBHOOK_SECRET or not secrets.compare_digest(
+        secret, settings.TELEGRAM_WEBHOOK_SECRET
+    ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    if x_telegram_bot_api_secret_token != settings.TELEGRAM_WEBHOOK_SECRET:
+    if not secrets.compare_digest(
+        x_telegram_bot_api_secret_token or "", settings.TELEGRAM_WEBHOOK_SECRET
+    ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     update = await request.json()
@@ -43,7 +53,15 @@ async def telegram_webhook(
 
     data = callback_query.get("data") or ""
     parts = data.split(":")
-    if len(parts) != 3 or parts[0] != "order" or parts[2] not in _VALID_STATUSES:
+    # The order id is validated as a number here rather than at int() below, so a
+    # malformed callback is answered politely instead of raising into a 500 (which
+    # would also page the error topic in Telegram for what is just noise).
+    if (
+        len(parts) != 3
+        or parts[0] != "order"
+        or not parts[1].isdigit()
+        or parts[2] not in _VALID_STATUSES
+    ):
         await answer_callback_query(callback_query["id"], "Unrecognized action.")
         return {"ok": True}
 
@@ -65,7 +83,11 @@ async def telegram_webhook(
         label = "Delivered ✅" if new_status == "delivered" else "Cancelled ❌"
         await answer_callback_query(callback_query["id"], f"Order marked {label}.")
         if chat_id is not None and message_id is not None:
-            original_caption = message.get("caption") or ""
+            # Telegram hands the caption back as PLAIN text (the HTML entities it
+            # parsed on the way in are gone), and editMessageCaption re-parses it as
+            # HTML - so it has to be re-escaped or a clinic name containing "<"
+            # makes the edit fail and the buttons stay clickable forever.
+            original_caption = html.escape(message.get("caption") or "", quote=False)
             await clear_order_alert_buttons(chat_id, message_id, f"{original_caption}\n\nStatus: {label}")
     finally:
         db.close()

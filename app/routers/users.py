@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+﻿from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
@@ -8,6 +8,7 @@ from app.core.deps import get_current_user, get_verified_user, require_permissio
 from app.core.email import send_verification_email
 from app.core.files import save_image
 from app.core.security import generate_url_safe_token, hash_password, verify_password
+from app.core.query import Limit, Skip
 from app.database import get_db
 from app.models import User
 from app.schemas import (
@@ -84,8 +85,8 @@ async def upload_my_image(
 
 @router.get("/", response_model=list[UserOut])
 def list_users(
-    skip: int = 0,
-    limit: int = 50,
+    skip: Skip = 0,
+    limit: Limit = 50,
     _: User = Depends(require_permission("user_management")),
     db: Session = Depends(get_db),
 ):
@@ -133,9 +134,7 @@ async def create_user(
         is_active=True,
         is_verified=False,
     )
-    import secrets
-
-    token = secrets.token_urlsafe(32)
+    token = generate_url_safe_token()
     user.verification_token = token
     user.verification_token_expires = datetime.now(timezone.utc) + timedelta(
         minutes=settings.EMAIL_VERIFICATION_EXPIRE_MINUTES

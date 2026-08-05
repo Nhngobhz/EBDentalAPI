@@ -1,9 +1,10 @@
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+﻿from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.deps import require_permission
 from app.core.files import save_image
+from app.core.query import Limit, Skip
 from app.database import get_db
 from app.models import Category, User
 from app.schemas import CategoryOut, CategoryUpdate
@@ -14,7 +15,7 @@ _perm = Depends(require_permission("product_management"))
 
 
 @router.get("/", response_model=list[CategoryOut])
-def list_categories(skip: int = 0, limit: int = 50, db: Session = Depends(get_db)):
+def list_categories(skip: Skip = 0, limit: Limit = 50, db: Session = Depends(get_db)):
     """Public: the product catalog is meant to be browsable without an account."""
     return db.query(Category).order_by(Category.category_name).offset(skip).limit(limit).all()
 
