@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.core.bundles import build_bundle_rows, bundle_old_price, replace_bundle_rows
+from app.core.audit import stamp_updated_by
 from app.core.deps import get_price_visibility, require_permission
 from app.core.files import save_named_image
 from app.core.query import Limit, Skip
@@ -65,9 +66,10 @@ def get_promotion(
 
 
 @router.post("/", response_model=PromotionOut, status_code=status.HTTP_201_CREATED)
-def create_promotion(payload: PromotionCreate, _: User = _perm, db: Session = Depends(get_db)):
+def create_promotion(payload: PromotionCreate, current_user: User = _perm, db: Session = Depends(get_db)):
     data = payload.model_dump(exclude={"items"})
     promotion = Promotion(**data, items=build_bundle_rows(db, payload.items, PromotionItem))
+    stamp_updated_by(promotion, current_user)
     db.add(promotion)
     db.commit()
     db.refresh(promotion)
@@ -81,7 +83,7 @@ def create_promotion(payload: PromotionCreate, _: User = _perm, db: Session = De
 def update_promotion(
     promotion_id: int,
     payload: PromotionUpdate,
-    _: User = _perm,
+    current_user: User = _perm,
     db: Session = Depends(get_db),
 ):
     promotion = db.query(Promotion).filter(Promotion.id == promotion_id).first()
@@ -102,6 +104,7 @@ def update_promotion(
 
     for field, value in data.items():
         setattr(promotion, field, value)
+    stamp_updated_by(promotion, current_user)
     db.commit()
     db.refresh(promotion)
     return _serialize_promotion(promotion, True)

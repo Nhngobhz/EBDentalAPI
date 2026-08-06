@@ -4,6 +4,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFi
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.core.audit import stamp_updated_by
 from app.core.deps import get_current_user, get_verified_user, require_permission
 from app.core.email import send_verification_email
 from app.core.files import save_image
@@ -53,6 +54,8 @@ def update_my_profile(
 
     for field, value in data.items():
         setattr(current_user, field, value)
+    # Editing your own profile still records a name - it just happens to be yours.
+    stamp_updated_by(current_user, current_user)
     db.commit()
     db.refresh(current_user)
     return current_user
@@ -78,6 +81,7 @@ async def upload_my_image(
     db: Session = Depends(get_db),
 ):
     current_user.user_image = await save_image(file, "users")
+    stamp_updated_by(current_user, current_user)
     db.commit()
     db.refresh(current_user)
     return current_user
@@ -109,7 +113,7 @@ def get_user(
 async def create_user(
     payload: UserCreateByAdmin,
     background_tasks: BackgroundTasks,
-    _: User = Depends(require_permission("user_management")),
+    current_user: User = Depends(require_permission("user_management")),
     db: Session = Depends(get_db),
 ):
     """An admin creates a staff account with role/permissions already set.
@@ -140,6 +144,7 @@ async def create_user(
         minutes=settings.EMAIL_VERIFICATION_EXPIRE_MINUTES
     )
 
+    stamp_updated_by(user, current_user)
     db.add(user)
     db.commit()
     db.refresh(user)
@@ -172,6 +177,7 @@ def update_user(
 
     for field, value in data.items():
         setattr(user, field, value)
+    stamp_updated_by(user, current_user)
     db.commit()
     db.refresh(user)
     return user
@@ -181,7 +187,7 @@ def update_user(
 def admin_set_user_password(
     user_id: int,
     payload: UserAdminSetPassword,
-    _: User = Depends(require_permission("user_management")),
+    current_user: User = Depends(require_permission("user_management")),
     db: Session = Depends(get_db),
 ):
     """An admin directly sets another staff member's password - no current_password
@@ -193,6 +199,7 @@ def admin_set_user_password(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
     user.hashed_password = hash_password(payload.new_password)
+    stamp_updated_by(user, current_user)
     db.commit()
     return {"detail": "Password updated successfully"}
 
@@ -213,6 +220,7 @@ def deactivate_user(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
     user.is_active = False
+    stamp_updated_by(user, current_user)
     db.commit()
     db.refresh(user)
     return user

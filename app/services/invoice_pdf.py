@@ -65,19 +65,17 @@ def _has_khmer(text) -> bool:
     return any("ក" <= ch <= "៿" for ch in str(text or ""))
 
 
-# Same reconstruction as EB Web Project/formatting.py's derive_old_price() and
-# main.js's deriveOldUnitPrice() - store-api only ever stores the final charged
-# unit_price + the discount that produced it, never a separate original-price column.
-def _derive_old_unit_price(unit_price: Decimal, discount: Decimal, discount_type: str) -> Decimal:
-    price = Decimal(unit_price)
-    d = Decimal(discount or 0)
-    if not d:
-        return price
-    if discount_type == "cash":
-        return price + d
-    if d >= 100:
-        return price
-    return price / (Decimal(1) - d / Decimal(100))
+# The line's price BEFORE its discount, read from the snapshot rather than
+# reconstructed. This used to divide the discount back out of unit_price, in a copy
+# of the same arithmetic that lived in main.js and formatting.py - all three had to
+# agree, and the figure moved whenever a price was edited. OrderItem.list_price now
+# stores it outright (see store-api's f2a9c4e18b73 migration); main.js's
+# deriveOldUnitPrice() reads the same field for the client-rendered PDF this one
+# stands in for.
+def _old_unit_price(item) -> Decimal:
+    unit_price = Decimal(item.unit_price)
+    list_price = Decimal(item.list_price or 0)
+    return list_price if list_price > unit_price else unit_price
 
 
 def _format_plain_number(value: Decimal) -> str:
@@ -242,7 +240,7 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
     line_no = 0
     for item in order.items:
         is_component = getattr(item, "parent_item_id", None) is not None
-        old_unit_price = _derive_old_unit_price(item.unit_price, item.discount, item.discount_type)
+        old_unit_price = _old_unit_price(item)
         undiscounted_subtotal += old_unit_price * item.qty
         if item.discount_type == "cash":
             cash_discount_total += (old_unit_price - Decimal(item.unit_price)) * item.qty

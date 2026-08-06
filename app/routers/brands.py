@@ -2,6 +2,7 @@
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.audit import stamp_updated_by
 from app.core.deps import require_permission
 from app.core.files import save_image
 from app.core.query import Limit, Skip
@@ -32,7 +33,7 @@ def get_brand(brand_id: int, db: Session = Depends(get_db)):
 async def create_brand(
     brand_name: str = Form(..., min_length=1, max_length=150),
     file: UploadFile | None = File(None),
-    _: User = _perm,
+    current_user: User = _perm,
     db: Session = Depends(get_db),
 ):
     """Accepts multipart/form-data so the brand image can be attached in
@@ -43,6 +44,7 @@ async def create_brand(
     brand = Brand(brand_name=brand_name)
     if file is not None:
         brand.brand_image = await save_image(file, "brands")
+    stamp_updated_by(brand, current_user)
     db.add(brand)
     db.commit()
     db.refresh(brand)
@@ -51,13 +53,14 @@ async def create_brand(
 
 @router.put("/{brand_id}", response_model=BrandOut)
 def update_brand(
-    brand_id: int, payload: BrandUpdate, _: User = _perm, db: Session = Depends(get_db)
+    brand_id: int, payload: BrandUpdate, current_user: User = _perm, db: Session = Depends(get_db)
 ):
     brand = db.query(Brand).filter(Brand.id == brand_id).first()
     if not brand:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand not found")
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(brand, field, value)
+    stamp_updated_by(brand, current_user)
     db.commit()
     db.refresh(brand)
     return brand
@@ -65,12 +68,13 @@ def update_brand(
 
 @router.post("/{brand_id}/image", response_model=BrandOut)
 async def upload_brand_image(
-    brand_id: int, file: UploadFile, _: User = _perm, db: Session = Depends(get_db)
+    brand_id: int, file: UploadFile, current_user: User = _perm, db: Session = Depends(get_db)
 ):
     brand = db.query(Brand).filter(Brand.id == brand_id).first()
     if not brand:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand not found")
     brand.brand_image = await save_image(file, "brands")
+    stamp_updated_by(brand, current_user)
     db.commit()
     db.refresh(brand)
     return brand

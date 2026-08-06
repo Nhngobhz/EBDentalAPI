@@ -136,6 +136,20 @@ class UserOut(UserBase):
     price_listing: bool
     product_management: bool
     customer_management: bool
+    updated_at: datetime
+    updated_by: Optional["UserMini"] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UserMini(BaseModel):
+    """Just enough of a `User` to name them. Used for the `updated_by` on every
+    audited row - the id alone would make an admin screen say "edited by 3", and
+    the full UserOut would leak a staff member's address/phone/permissions into
+    the response of anything they once touched (including public product reads)."""
+
+    id: int
+    user_name: str
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -177,6 +191,8 @@ class CustomerOut(CustomerBase):
     is_active: bool
     is_verified: bool
     creation_date: datetime
+    updated_at: datetime
+    updated_by: Optional[UserMini] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -240,6 +256,8 @@ class BrandOut(BrandBase):
     id: int
     brand_image: Optional[str] = None
     created_at: datetime
+    updated_at: datetime
+    updated_by: Optional[UserMini] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -269,6 +287,8 @@ class CategoryOut(CategoryBase):
     id: int
     category_image: Optional[str] = None
     created_at: datetime
+    updated_at: datetime
+    updated_by: Optional[UserMini] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -322,6 +342,17 @@ class BundleItemOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class ProductImageOut(BaseModel):
+    """An extra gallery photo. `image` is a full URL / store-api-relative path,
+    same as every other *_image field (see app/core/files.py)."""
+
+    id: int
+    image: str
+    sort_order: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class ProductBase(BaseModel):
     product_name: str = Field(..., min_length=1, max_length=200)
     description: Optional[str] = None
@@ -332,6 +363,10 @@ class ProductBase(BaseModel):
 
 class ProductCreate(ProductBase):
     price: Decimal = Field(..., gt=0)
+    # The pre-discount price. Optional: omit it and the router derives one from
+    # price+discount (so existing callers keep working unchanged), send it and it's
+    # stored verbatim. Must not be below `price` - see _resolve_list_price.
+    list_price: Optional[Decimal] = Field(None, gt=0)
     discount_type: DiscountType = "percent"
     # Decimal("0") not bare 0 - Pydantic v2 doesn't validate/coerce field defaults unless
     # asked to, so a bare int default would reach the DB as a Python int on a Numeric
@@ -364,6 +399,7 @@ class ProductUpdate(BaseModel):
     # product additionally requires the price_listing permission - enforced
     # in the router, not here.
     price: Optional[Decimal] = Field(None, gt=0)
+    list_price: Optional[Decimal] = Field(None, gt=0)
     discount_type: Optional[DiscountType] = None
     discount: Optional[Decimal] = Field(None, ge=0)
     # Omitted -> the product's existing free items are left alone; sent (even as
@@ -381,6 +417,7 @@ class ProductUpdate(BaseModel):
 
 class ProductPriceUpdate(BaseModel):
     price: Optional[Decimal] = Field(None, gt=0)
+    list_price: Optional[Decimal] = Field(None, gt=0)
     discount_type: Optional[DiscountType] = None
     discount: Optional[Decimal] = Field(None, ge=0)
 
@@ -400,13 +437,21 @@ class ProductOut(ProductBase):
     price: Union[Decimal, str]
     discount_type: DiscountType = "percent"
     # Masked to None for the same viewers, same reasoning as price - see
-    # app.routers.products._serialize_product.
+    # app.routers.products._serialize_product. list_price is masked too: it IS a
+    # price, so returning it to an unentitled viewer would hand back most of what
+    # masking `price` is meant to withhold.
     discount: Optional[Decimal] = None
+    list_price: Optional[Decimal] = None
     product_image: Optional[str] = None
+    # Additional photos for the storefront gallery. `product_image` above is
+    # still the primary one and is NOT repeated here - see models.ProductImage.
+    images: list[ProductImageOut] = []
     brand: Optional[BrandMini] = None
     category: Optional[CategoryMini] = None
     free_items: list[BundleItemOut] = []
     created_at: datetime
+    updated_at: datetime
+    updated_by: Optional[UserMini] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -436,6 +481,8 @@ class ManualOut(ManualBase):
     pdf: Optional[str] = None
     product: Optional[ProductMini] = None
     created_at: datetime
+    updated_at: datetime
+    updated_by: Optional[UserMini] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -490,6 +537,8 @@ class PromotionOut(PromotionBase):
     # deal contains isn't a price, so everyone can see it.
     items: list[BundleItemOut] = []
     created_at: datetime
+    updated_at: datetime
+    updated_by: Optional[UserMini] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -531,6 +580,8 @@ class SetOut(SetBase):
     # Member products - same shape/reasoning as PromotionOut.items.
     items: list[BundleItemOut] = []
     created_at: datetime
+    updated_at: datetime
+    updated_by: Optional[UserMini] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -614,6 +665,10 @@ class OrderItemOut(BaseModel):
     product_code: Optional[str] = None
     uom: Optional[str] = None
     unit_price: Decimal
+    # The pre-discount unit price as it stood when the order was placed. The
+    # printed quote's "UP before Discount" column reads this directly instead of
+    # dividing unit_price back out - see OrderItem.list_price.
+    list_price: Decimal
     discount_type: DiscountType = "percent"
     discount: Decimal
     qty: int
@@ -649,6 +704,10 @@ class OrderOut(BaseModel):
     khqr_string: Optional[str] = None
     khqr_md5: Optional[str] = None
     created_at: datetime
+    # On an order these track the staff member who last changed status/payment_status
+    # (PUT /orders/{id}) - the order's own content is never editable after creation.
+    updated_at: datetime
+    updated_by: Optional[UserMini] = None
     items: list[OrderItemOut] = []
 
     model_config = ConfigDict(from_attributes=True)

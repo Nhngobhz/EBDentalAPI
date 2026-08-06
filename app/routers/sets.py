@@ -2,6 +2,7 @@
 from sqlalchemy.orm import Session
 
 from app.core.bundles import build_bundle_rows, bundle_old_price, replace_bundle_rows
+from app.core.audit import stamp_updated_by
 from app.core.deps import get_price_visibility, require_permission
 from app.core.files import save_named_image
 from app.core.query import Limit, Skip
@@ -57,9 +58,10 @@ def get_set(
 
 
 @router.post("/", response_model=SetOut, status_code=status.HTTP_201_CREATED)
-def create_set(payload: SetCreate, _: User = _perm, db: Session = Depends(get_db)):
+def create_set(payload: SetCreate, current_user: User = _perm, db: Session = Depends(get_db)):
     data = payload.model_dump(exclude={"items"})
     set_ = Set(**data, items=build_bundle_rows(db, payload.items, SetItem))
+    stamp_updated_by(set_, current_user)
     db.add(set_)
     db.commit()
     db.refresh(set_)
@@ -73,7 +75,7 @@ def create_set(payload: SetCreate, _: User = _perm, db: Session = Depends(get_db
 def update_set(
     set_id: int,
     payload: SetUpdate,
-    _: User = _perm,
+    current_user: User = _perm,
     db: Session = Depends(get_db),
 ):
     set_ = db.query(Set).filter(Set.id == set_id).first()
@@ -89,6 +91,7 @@ def update_set(
 
     for field, value in data.items():
         setattr(set_, field, value)
+    stamp_updated_by(set_, current_user)
     db.commit()
     db.refresh(set_)
     return _serialize_set(set_, True)
@@ -96,12 +99,13 @@ def update_set(
 
 @router.post("/{set_id}/image", response_model=SetOut)
 async def upload_set_image(
-    set_id: int, file: UploadFile, _: User = _perm, db: Session = Depends(get_db)
+    set_id: int, file: UploadFile, current_user: User = _perm, db: Session = Depends(get_db)
 ):
     set_ = db.query(Set).filter(Set.id == set_id).first()
     if not set_:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Set not found")
     set_.set_image = await save_named_image(file, "sets", set_.set_name)
+    stamp_updated_by(set_, current_user)
     db.commit()
     db.refresh(set_)
     return _serialize_set(set_, True)
@@ -109,7 +113,7 @@ async def upload_set_image(
 
 @router.post("/{set_id}/detail-image", response_model=SetOut)
 async def upload_set_detail_image(
-    set_id: int, file: UploadFile, _: User = _perm, db: Session = Depends(get_db)
+    set_id: int, file: UploadFile, current_user: User = _perm, db: Session = Depends(get_db)
 ):
     """The optional second image shown under the name/description on the
     storefront set card (see Set.detail_image). Saved under a " detail"-suffixed
@@ -119,6 +123,7 @@ async def upload_set_detail_image(
     if not set_:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Set not found")
     set_.detail_image = await save_named_image(file, "sets", f"{set_.set_name} detail")
+    stamp_updated_by(set_, current_user)
     db.commit()
     db.refresh(set_)
     return _serialize_set(set_, True)

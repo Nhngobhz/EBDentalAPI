@@ -1,4 +1,4 @@
-"""
+﻿"""
 SQLAlchemy ORM models.
 
 These map directly to the tables requested, with a few deliberate additions
@@ -19,10 +19,51 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.ext.declarative import declared_attr
 from sqlalchemy.orm import backref, relationship
 from sqlalchemy.sql import func
 
 from app.database import Base
+
+
+class AuditedMixin:
+    """`updated_at` + `updated_by_user_id` for every editable entity table.
+
+    A mixin rather than two columns copied nine times, so the pair can't drift
+    apart (and `declared_attr` is what lets a ForeignKey be reused across
+    classes - a bare Column object can only belong to one table).
+
+    `updated_at` is maintained by `onupdate`, i.e. by SQLAlchemy on flush, not by
+    a database trigger. That's sufficient because every write in this system goes
+    through the ORM, but it has two consequences worth knowing: a hand-written
+    `UPDATE` in psql won't move it, and it moves on ANY write to the row - so a
+    login bumps a `User`'s updated_at (it stamps `last_login`) even though nobody
+    edited anything. Read it as "row last written", not "someone changed a field".
+
+    `updated_by_user_id` is the staff member who last wrote to the row, and it is
+    only as precise as that sounds: it's overwritten by the next write to ANY
+    field, and it never records the previous value. NULL is normal - a customer
+    editing their own profile isn't a `User`, and rows predating the column have
+    nobody recorded. See the f2a9c4e18b73 migration for the fuller caveat.
+    """
+
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    @declared_attr
+    def updated_by_user_id(cls):
+        return Column(
+            Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+        )
+
+    @declared_attr
+    def updated_by(cls):
+        # foreign_keys spelled out because `users` itself uses this mixin, which
+        # gives that table two paths to users.id (its own PK and this FK).
+        return relationship(
+            "User", foreign_keys=lambda: [cls.updated_by_user_id], remote_side="User.id"
+        )
 
 
 class BundleItemMixin:
@@ -52,7 +93,7 @@ class BundleItemMixin:
         return self.product.uom if self.product else None
 
 
-class User(Base):
+class User(AuditedMixin, Base):
     """Staff / admin accounts. This is the table the whole auth + RBAC
     system is built around."""
 
@@ -95,7 +136,7 @@ class User(Base):
     last_login = Column(DateTime(timezone=True), nullable=True)
 
 
-class Customer(Base):
+class Customer(AuditedMixin, Base):
     """Customers can either be plain records managed by staff (created via
     POST /customers/, no password) or self-service accounts that can log
     in (created via POST /auth/customer/register). `access_permission`
@@ -138,7 +179,7 @@ class Customer(Base):
     last_login = Column(DateTime(timezone=True), nullable=True)
 
 
-class Brand(Base):
+class Brand(AuditedMixin, Base):
     __tablename__ = "brands"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -149,7 +190,7 @@ class Brand(Base):
     products = relationship("Product", back_populates="brand")
 
 
-class Category(Base):
+class Category(AuditedMixin, Base):
     """Product category (e.g. "Curing Light", "Trolley"). Same shape/role as
     Brand - a proper table instead of a free-text column, for the same
     reason brand_name became brand_id (see README)."""
@@ -170,18 +211,32 @@ class Category(Base):
     products = relationship("Product", back_populates="category", passive_deletes=True)
 
 
-class Product(Base):
+class Product(AuditedMixin, Base):
     __tablename__ = "products"
 
     id = Column(Integer, primary_key=True, index=True)
     product_name = Column(String(200), nullable=False, index=True)
     description = Column(Text, nullable=True)
+
+    # The price actually charged, i.e. AFTER discount. This is the number that ends
+    # up on an order line.
     price = Column(Numeric(10, 2), nullable=False)
 
-    # Either a percentage (0-100) or a flat $ amount off price, per discount_type -
-    # replaces a separate old_price column (see ProductBase.discount for range
-    # validation). Not a value derived from anything else stored; Numeric (not Integer)
-    # so a cash discount can hold cents.
+    # The price before the discount - the "was $X" struck through on the storefront.
+    # Stored, not derived: it used to be recovered as price/(1 - discount/100) at
+    # display time, which meant it silently moved whenever `price` was edited (drop
+    # the price and the "was" figure dropped with it, with nobody having touched it).
+    # Kept consistent by the router, which derives it from price+discount when the
+    # caller doesn't send one, and rejects a value below `price`. See migration
+    # f2a9c4e18b73.
+    list_price = Column(Numeric(10, 2), nullable=False)
+
+    # Either a percentage (0-100) or a flat $ amount off list_price, per
+    # discount_type. Retained alongside list_price because it's what the storefront
+    # prints in the "Discount" column ("15%" reads better than making the reader
+    # compare two prices), and because percent-vs-cash changes how the printed quote
+    # groups the line - see printedItemDiscountText() in main.js. Numeric (not
+    # Integer) so a cash discount can hold cents.
     discount_type = Column(String(10), nullable=False, server_default="percent")
     discount = Column(Numeric(10, 2), nullable=False, server_default="0")
 
@@ -222,6 +277,47 @@ class Product(Base):
         order_by="ProductFreeItem.id",
     )
 
+    # Extra photos shown in the storefront's product-page gallery, alongside (not
+    # instead of) product_image - see ProductImage.
+    images = relationship(
+        "ProductImage",
+        back_populates="product",
+        cascade="all, delete-orphan",
+        order_by="ProductImage.sort_order, ProductImage.id",
+    )
+
+
+class ProductImage(Base):
+    """One extra photo of a product, for the detail page's gallery.
+
+    A separate table rather than more `*_image` columns on Product (the shape
+    Set uses for its single detail image) because the count isn't fixed - a
+    chair might be photographed from eight angles and a burr from one.
+
+    `product_image` on Product stays the *primary* image: it's what the catalog
+    card, the cart, the printed quote and the Telegram alert all show, and it's
+    the first frame of the gallery. Rows here are only ever the additional ones,
+    so nothing that reads `product_image` had to learn about this table.
+
+    Not AuditedMixin: a gallery row is created and deleted, never edited, so
+    "who last changed it" would only ever repeat who uploaded it."""
+
+    __tablename__ = "product_images"
+
+    id = Column(Integer, primary_key=True, index=True)
+    product_id = Column(
+        Integer, ForeignKey("products.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    image = Column(String(500), nullable=False)
+
+    # Display position within the gallery. Assigned by the router as
+    # max(existing) + 1 on upload, so images stay in the order they were added
+    # and a delete doesn't renumber the survivors.
+    sort_order = Column(Integer, nullable=False, server_default="0")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    product = relationship("Product", back_populates="images")
+
 
 class ProductFreeItem(BundleItemMixin, Base):
     """A free product that comes with a paid one ("buy this, get that free").
@@ -256,7 +352,7 @@ class ProductFreeItem(BundleItemMixin, Base):
     product = relationship("Product", foreign_keys=[product_id])
 
 
-class Manual(Base):
+class Manual(AuditedMixin, Base):
     __tablename__ = "manuals"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -273,7 +369,7 @@ class Manual(Base):
     product = relationship("Product", back_populates="manuals")
 
 
-class Promotion(Base):
+class Promotion(AuditedMixin, Base):
     """A time-boxed deal, and a COLLECTION OF PRODUCTS (see PromotionItem):
     the promotion carries its own fixed price, and buying it puts every member
     product on the order as a $0 component line so the quote spells out exactly
@@ -320,7 +416,7 @@ class PromotionItem(BundleItemMixin, Base):
     product = relationship("Product")
 
 
-class Set(Base):
+class Set(AuditedMixin, Base):
     """A bundle deal shown on the Promotions page, styled like a Promotion
     (fixed price + optional old_price, image) but always on sale - unlike
     Promotion there's no start_date/end_date, since a set isn't time-boxed.
@@ -367,7 +463,7 @@ class SetItem(BundleItemMixin, Base):
     product = relationship("Product")
 
 
-class Order(Base):
+class Order(AuditedMixin, Base):
     """A finalized storefront quote (see partials/quote_drawer.html on the frontend).
     Created only through the order-creation endpoint, which snapshots each line item's
     product data server-side - never from client-submitted prices (see OrderItem)."""
@@ -450,7 +546,10 @@ class Order(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     customer = relationship("Customer")
-    created_by = relationship("User")
+    # foreign_keys is required now that AuditedMixin gives `orders` a SECOND FK to
+    # users (updated_by_user_id) - without it SQLAlchemy can't tell which of the two
+    # this relationship means and raises AmbiguousForeignKeysError at mapper setup.
+    created_by = relationship("User", foreign_keys=[created_by_user_id])
     # Ordered for DISPLAY, not by insert order. Plain id order would be wrong:
     # SQLAlchemy inserts every paid line before any component line (components
     # depend on their parent's id), so the $0 lines would all pile up at the end
@@ -502,6 +601,12 @@ class OrderItem(Base):
     product_code = Column(String(50), nullable=True)
     uom = Column(String(20), nullable=True)
     unit_price = Column(Numeric(10, 2), nullable=False)
+    # The pre-discount unit price, snapshotted like everything else on this row -
+    # the "UP before Discount" column on the printed quote reads it directly rather
+    # than dividing unit_price back out (see Product.list_price). For a
+    # promotion/set line it's what the bundle's contents would have cost bought
+    # separately; for a $0 component line it's 0, same as unit_price.
+    list_price = Column(Numeric(10, 2), nullable=False)
     # Snapshotted from Product.discount/discount_type at quote time (see
     # routers/orders.py::create_order) - same percent-or-cash shape as the product it
     # came from, so the printed quote's "Discount" column stays meaningful even after the

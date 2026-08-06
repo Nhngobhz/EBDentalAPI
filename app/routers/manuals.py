@@ -3,6 +3,7 @@
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session, joinedload
 
+from app.core.audit import stamp_updated_by
 from app.core.deps import require_permission
 from app.core.files import save_image, save_pdf
 from app.core.query import Limit, OptionalInt, Skip
@@ -51,7 +52,7 @@ async def create_manual(
     product_id: int = Form(...),
     description: Optional[str] = Form(None),
     file: UploadFile | None = File(None),
-    _: User = _perm,
+    current_user: User = _perm,
     db: Session = Depends(get_db),
 ):
     """Accepts multipart/form-data so the PDF can be attached in the same
@@ -62,6 +63,7 @@ async def create_manual(
     manual = Manual(product_id=product_id, description=description)
     if file is not None:
         manual.pdf = await save_pdf(file, "manuals")
+    stamp_updated_by(manual, current_user)
     db.add(manual)
     db.commit()
     db.refresh(manual)
@@ -70,7 +72,7 @@ async def create_manual(
 
 @router.put("/{manual_id}", response_model=ManualOut)
 def update_manual(
-    manual_id: int, payload: ManualUpdate, _: User = _perm, db: Session = Depends(get_db)
+    manual_id: int, payload: ManualUpdate, current_user: User = _perm, db: Session = Depends(get_db)
 ):
     manual = db.query(Manual).filter(Manual.id == manual_id).first()
     if not manual:
@@ -82,30 +84,33 @@ def update_manual(
 
     for field, value in data.items():
         setattr(manual, field, value)
+    stamp_updated_by(manual, current_user)
     db.commit()
     return _get_manual_or_404(db, manual_id)
 
 
 @router.post("/{manual_id}/image", response_model=ManualOut)
 async def upload_manual_image(
-    manual_id: int, file: UploadFile, _: User = _perm, db: Session = Depends(get_db)
+    manual_id: int, file: UploadFile, current_user: User = _perm, db: Session = Depends(get_db)
 ):
     manual = db.query(Manual).filter(Manual.id == manual_id).first()
     if not manual:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Manual not found")
     manual.manual_image = await save_image(file, "manuals")
+    stamp_updated_by(manual, current_user)
     db.commit()
     return _get_manual_or_404(db, manual_id)
 
 
 @router.post("/{manual_id}/pdf", response_model=ManualOut)
 async def upload_manual_pdf(
-    manual_id: int, file: UploadFile, _: User = _perm, db: Session = Depends(get_db)
+    manual_id: int, file: UploadFile, current_user: User = _perm, db: Session = Depends(get_db)
 ):
     manual = db.query(Manual).filter(Manual.id == manual_id).first()
     if not manual:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Manual not found")
     manual.pdf = await save_pdf(file, "manuals")
+    stamp_updated_by(manual, current_user)
     db.commit()
     return _get_manual_or_404(db, manual_id)
 

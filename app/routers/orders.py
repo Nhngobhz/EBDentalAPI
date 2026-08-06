@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.config import settings
 from app.core.bundles import bundle_old_price
+from app.core.audit import stamp_updated_by
 from app.core.deps import oauth2_scheme, principal_id_from_token, require_permission
 from app.core.files import ALLOWED_PDF_TYPES
 from app.core.security import decode_access_token
@@ -137,6 +138,9 @@ def _component_items(rows, parent_qty: int) -> list[OrderItem]:
                 product_code=product.product_code,
                 uom=product.uom,
                 unit_price=Decimal("0"),
+                # A component line is free by construction, so there's no "before"
+                # price either - list_price matches unit_price at zero.
+                list_price=Decimal("0"),
                 discount_type="percent",
                 discount=Decimal("0"),
                 qty=row.qty * parent_qty,
@@ -231,6 +235,10 @@ def create_order(
                     product_code=product.product_code,
                     uom=product.uom,
                     unit_price=product.price,
+                    # Snapshotted like every other field on this row: the printed
+                    # quote's "UP before Discount" reads it directly instead of
+                    # dividing unit_price back out.
+                    list_price=product.list_price,
                     discount_type=product.discount_type,
                     discount=product.discount,
                     qty=line.qty,
@@ -277,6 +285,10 @@ def create_order(
                     product_code=None,
                     uom=None,
                     unit_price=promotion.price,
+                    # For a bundle the "before" price is what its contents would
+                    # have cost bought separately (or the entered old_price when it
+                    # lists none) - already computed above as `old_price`.
+                    list_price=old_price or promotion.price,
                     discount_type="cash",
                     discount=discount,
                     qty=line.qty,
@@ -313,6 +325,8 @@ def create_order(
                     product_code=None,
                     uom=None,
                     unit_price=set_.price,
+                    # Same contents-derived "before" price as a promotion line.
+                    list_price=old_price or set_.price,
                     discount_type="cash",
                     discount=discount,
                     qty=line.qty,
@@ -531,6 +545,57 @@ def list_orders(
     return query.order_by(Order.id.desc()).offset(skip).limit(limit).all()
 
 
+@router.get("/mine", response_model=list[OrderOut])
+def list_my_orders(
+    skip: Skip = 0,
+    limit: Limit = 50,
+    principal: tuple[Customer | None, User | None] = Depends(_get_ordering_principal),
+    db: Session = Depends(get_db),
+):
+    """The caller's OWN orders - what the storefront's account drawer ("Orders" tab)
+    lists. Deliberately not the same thing as GET /orders/: that one is the staff
+    back-office view and needs price_listing, which a customer never has, so a customer
+    could not otherwise see even their own history. Ownership is taken from the token
+    (the same _get_ordering_principal that gates placing an order), never from a query
+    parameter, so this can't be pointed at somebody else's account.
+
+    A staff member sees the quotes they themselves recorded (created_by_user_id); the
+    full list stays on the admin Orders page.
+
+    MUST stay declared above GET /{order_id} - FastAPI matches in declaration order and
+    would otherwise try to parse "mine" as an int order_id and 422."""
+    customer, user = principal
+    query = db.query(Order).options(joinedload(Order.items))
+    if customer is not None:
+        query = query.filter(Order.customer_id == customer.id)
+    else:
+        query = query.filter(Order.created_by_user_id == user.id)
+    return query.order_by(Order.id.desc()).offset(skip).limit(limit).all()
+
+
+@router.get("/mine/{order_id}", response_model=OrderOut)
+def get_my_order(
+    order_id: int,
+    principal: tuple[Customer | None, User | None] = Depends(_get_ordering_principal),
+    db: Session = Depends(get_db),
+):
+    """One of the caller's own orders, in full (line items included) - what the account
+    drawer opens when an order is tapped, and what it re-prints the PDF from.
+
+    Same ownership gate as the quotation-pdf upload and the payment-status poll: 404 (not
+    403) for somebody else's order, so this can't be used to probe which order ids exist.
+    A customer can't use GET /{order_id} for this - that one needs price_listing."""
+    customer, user = principal
+    order = db.query(Order).options(joinedload(Order.items)).filter(Order.id == order_id).first()
+    owns_order = order is not None and (
+        (customer is not None and order.customer_id == customer.id)
+        or (user is not None and order.created_by_user_id == user.id)
+    )
+    if not owns_order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    return order
+
+
 @router.get("/{order_id}", response_model=OrderOut)
 def get_order(order_id: int, _: User = _perm, db: Session = Depends(get_db)):
     order = db.query(Order).options(joinedload(Order.items)).filter(Order.id == order_id).first()
@@ -544,7 +609,7 @@ def update_order(
     order_id: int,
     payload: OrderUpdate,
     background_tasks: BackgroundTasks,
-    _: User = _perm,
+    current_user: User = _perm,
     db: Session = Depends(get_db),
 ):
     order = db.query(Order).filter(Order.id == order_id).first()
@@ -569,6 +634,9 @@ def update_order(
         setattr(order, field, value)
     if newly_paid:
         order.paid_at = datetime.now(timezone.utc)
+    # The only staff-editable thing about an order is its status/payment_status, so
+    # this records who marked it delivered, cancelled, or paid.
+    stamp_updated_by(order, current_user)
     db.commit()
     db.refresh(order)
     if newly_paid:

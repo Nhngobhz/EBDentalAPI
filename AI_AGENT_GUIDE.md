@@ -36,6 +36,8 @@ confusing (not obviously wrong) results.
   `OrderItem`. Three join tables hang off them and are never addressed
   directly (they're edited as a field of their owner - see "Bundle
   contents" in section 6): `PromotionItem`, `SetItem`, `ProductFreeItem`.
+  A fourth child table, `ProductImage`, holds a product's extra gallery
+  photos and is addressed only via `/products/{id}/gallery` (section 6).
   An `Order` row is either a **quote** or a real **order**
   (`order_type`): staff-placed rows and customer "cash" checkouts are
   quotes (server-priced snapshots, payment happens offline later);
@@ -240,6 +242,7 @@ sending JSON to them will fail:
 | `POST /categories/` | `multipart/form-data` (`category_name` field + optional `file`) | Same reasoning, for the category image |
 | `POST /manuals/` | `multipart/form-data` (`product_id`, optional `description`, optional `file`) | Same reasoning, for the manual's PDF |
 | `POST .../{id}/image`, `POST .../{id}/pdf` (on users, customers, brands, categories, products, manuals) | `multipart/form-data` (single `file` field) | Direct file upload |
+| `POST /products/{id}/gallery` | `multipart/form-data` (**`files`** - repeat the field once per file) | Several extra product photos in one request |
 
 Everything else - including `PUT /brands/{id}` / `PUT /categories/{id}`
 (metadata-only update, image unchanged) - is plain JSON.
@@ -421,8 +424,21 @@ top of `app/schemas.py`, not a per-class `@field_validator`.
 | `POST /products/` | `product_management` | JSON `ProductCreate` (`product_name`, `description?`, `badge?`, `product_code?` (SKU, must be globally unique or `400`), `uom?` (unit of measure, free text e.g. `"pcs"`/`"box"`), `price` >0, `discount?` (integer percent, `0`-`100`, defaults `0`), `brand_id` - must reference an existing brand or `400`, `category_id?` - must reference an existing category or `400`, `free_items?` - products given away free with this one, see "Bundle contents" below) |
 | `PUT /products/{id}` | `product_management`, **+`price_listing` if the body includes `price` or `discount`** | JSON `ProductUpdate`, all fields optional |
 | `PATCH /products/{id}/price` | `price_listing` only | JSON `{"price"?, "discount"?}` - use this instead of `PUT` if the caller only has `price_listing` (it can't touch `free_items` - use `PUT` for that) |
-| `POST /products/{id}/image` | `product_management` | multipart `file` |
-| `DELETE /products/{id}` | `product_management` | cascades: deletes the product's `Manual`s too, and drops it from any bundle/free-item list it appears in |
+| `POST /products/{id}/image` | `product_management` | multipart `file` - the **primary** picture (`product_image`) |
+| `POST /products/{id}/gallery` | `product_management` | multipart `files` (repeat the field for each file, ≤12 per request) - **appends** extra photos, see below |
+| `DELETE /products/{id}/gallery/{image_id}` | `product_management` | removes one gallery photo; `404` if that image id isn't on that product |
+| `DELETE /products/{id}` | `product_management` | cascades: deletes the product's `Manual`s and gallery images too, and drops it from any bundle/free-item list it appears in |
+
+**Product photos come in two kinds.** `product_image` is the single primary
+picture - it's what the catalog card, the cart, the printed quote and the
+Telegram alert show, and it's the first frame of the storefront gallery.
+`images` (read-only on `ProductOut`, `[{"id", "image", "sort_order"}, ...]`) are
+the *additional* photos shown on the product detail page, and the primary one is
+**not** repeated in that list. Gallery uploads append (posting 3 files to a
+product that has 2 leaves it with 5) and are ordered by `sort_order`, assigned
+`max(existing) + 1` at upload; deleting one never renumbers the rest. Unlike
+`product_image`, gallery files keep uuid names, so re-uploading doesn't
+overwrite. Not price-masked - a photo isn't a price.
 
 ### Manuals - `/manuals`
 | Method & path | Auth | Body / notes |
@@ -506,6 +522,8 @@ server-side and never trusted from the request body.
 |---|---|---|
 | `POST /orders/` | `Any user` with `price_listing` or `product_management`, OR `Any customer` with `access_permission` | JSON `OrderCreate` (`clinic_name`, `phone`, `address` - all **required**; `contact_person?`, `payment_term?`, `install_term?`; `payment_method`: `"cash"`\|`"khqr"` - **required for customers, ignored for staff**; `discount_type`: `"percent"`\|`"cash"`, default `"cash"`; `discount_value` ≥0, default `0`; `items`: list of `{product_id\|promotion_id\|set_id, qty}`, at least 1). See notes below. |
 | `GET /orders/` | `price_listing` | query `skip`, `limit`, `status`, `customer_id` |
+| `GET /orders/mine` | Same bar as `POST /orders/` (staff `price_listing`/`product_management`, or customer `access_permission`) | query `skip`, `limit`. The caller's OWN orders, scoped from the token (customer → `customer_id`, staff → `created_by_user_id`) - never from a query param. Exists because a customer has no `price_listing` and so can't use `GET /orders/` to see even their own history; powers the storefront's account drawer. Declared above `GET /{order_id}` so "mine" isn't parsed as an id. |
+| `GET /orders/mine/{id}` | Same, plus must own the order | The caller's own order in full (line items included) - what the account drawer's detail view shows and re-prints its PDF from. **404, not 403**, on an order the caller doesn't own, so it can't be used to probe which ids exist. |
 | `GET /orders/{id}` | `price_listing` | - |
 | `GET /orders/{id}/payment-status` | Same principal who placed the order | KHQR orders only (`400` otherwise). Returns `{"payment_status": "unpaid"\|"paid"}`; while unpaid and `BAKONG_API_TOKEN` is configured, each call checks Bakong for the transaction and the first confirmed one flips the order to paid (stamping `paid_at`, firing the paid-order Telegram alert). Meant to be polled by the paying customer's browser. |
 | `PUT /orders/{id}` | `price_listing` | JSON `{"status"?, "payment_status"?}` - the only things editable after creation. `payment_status` is only accepted on KHQR orders (`400` otherwise); setting `"paid"` stamps `paid_at` and fires the paid-order alert - the manual fallback when no Bakong API token is configured. |
@@ -611,6 +629,29 @@ Notes an agent should know before calling this:
 
 (From `app/schemas.py` - violating these gets a `422`, not a `400`.)
 
+- **`Product.list_price` is the price BEFORE the discount; `price` is what's
+  actually charged.** Both are stored. `list_price` is optional on create/update:
+  omit it and the server derives one from `price` + `discount`, send it and it's
+  stored verbatim (it must be `>= price`, or `400`). Two rules to know before
+  writing a price:
+  - **Updating `price` alone does NOT move `list_price`** - it stays where it is,
+    and `discount` is re-derived from the gap between the two. That's deliberate:
+    repricing an item says what it now sells for, not what it used to be worth.
+    Send `list_price` explicitly whenever you mean to change it.
+  - An explicitly sent `discount` always wins over the derived one.
+
+  `list_price` is **price-masked exactly like `price`** - unentitled viewers get
+  `null` (see section 4), so don't treat its absence as a missing field.
+- **`OrderItem.list_price`** is the same figure snapshotted at order time. Use it
+  for a printed "UP before discount" column; don't recompute it from
+  `unit_price`/`discount`.
+- **`updated_at` / `updated_by`** appear on every entity (`users`, `customers`,
+  `brands`, `categories`, `products`, `manuals`, `promotions`, `sets`, `orders`).
+  `updated_by` is `{id, user_name}` or `null`. It records the staff member who
+  last wrote to the row - **overwritten by the next write to any field**, and it
+  never says what changed, so don't read it as a price-change audit trail. `null`
+  is normal: a customer editing their own profile isn't a `User`, and rows
+  predating the column have nobody recorded.
 - **Pagination**: every list endpoint's `skip` must be `>= 0` and `limit` must
   be `1`-`500` (`MAX_PAGE_SIZE` in `app/core/query.py`). To walk a table larger
   than 500 rows, page with `skip`; there is no way to ask for it all at once.

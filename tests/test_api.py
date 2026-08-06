@@ -404,6 +404,143 @@ def test_price_listing_permission_required_for_price_changes(client, db_session)
 
 
 # ---------------------------------------------------------------------------
+# list_price (the stored pre-discount price - see migration f2a9c4e18b73)
+# ---------------------------------------------------------------------------
+def _price_test_setup(client, db_session, email):
+    make_admin(db_session, email=email, password="password123")
+    headers = auth_header(client, email, "password123")
+    brand_id = client.post("/brands/", data={"brand_name": f"LP {email}"}, headers=headers).json()["id"]
+    return headers, brand_id
+
+
+def test_list_price_is_derived_from_discount_when_not_sent(client, db_session):
+    headers, brand_id = _price_test_setup(client, db_session, "listprice1@example.com")
+    resp = client.post(
+        "/products/",
+        json={"product_name": "Derived", "price": "90.00", "discount": "10",
+              "discount_type": "percent", "brand_id": brand_id},
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    # 90 charged after a 10% discount implies a 100.00 list price.
+    assert resp.json()["list_price"] == "100.00"
+
+
+def test_repricing_does_not_move_an_existing_list_price(client, db_session):
+    """The regression this column exists for.
+
+    The pre-discount price used to be recomputed as price/(1 - discount/100) on
+    every read, so dropping the charged price silently dragged the "was" figure
+    down with it. It must now stay put, with the discount re-derived instead."""
+    headers, brand_id = _price_test_setup(client, db_session, "listprice2@example.com")
+    product = client.post(
+        "/products/",
+        json={"product_name": "Repriced", "price": "90.00", "discount": "10",
+              "discount_type": "percent", "brand_id": brand_id},
+        headers=headers,
+    ).json()
+    assert product["list_price"] == "100.00"
+
+    resp = client.patch(
+        f"/products/{product['id']}/price", json={"price": "80.00"}, headers=headers
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["price"] == "80.00"
+    # The old behaviour would have reported 88.89 here.
+    assert body["list_price"] == "100.00"
+    # ...and the discount now describes the real gap between the two prices.
+    assert body["discount"] == "20.00"
+
+
+def test_explicit_list_price_is_stored_verbatim_and_must_not_be_below_price(client, db_session):
+    headers, brand_id = _price_test_setup(client, db_session, "listprice3@example.com")
+    resp = client.post(
+        "/products/",
+        json={"product_name": "Explicit", "price": "80.00", "list_price": "129.99",
+              "discount": "10", "discount_type": "percent", "brand_id": brand_id},
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    # Sent explicitly, so it is NOT the 88.89 the discount would have implied.
+    assert resp.json()["list_price"] == "129.99"
+
+    resp = client.post(
+        "/products/",
+        json={"product_name": "Backwards", "price": "80.00", "list_price": "50.00",
+              "brand_id": brand_id},
+        headers=headers,
+    )
+    assert resp.status_code == 400
+    assert "list_price" in resp.json()["detail"]
+
+
+def test_list_price_is_masked_like_price(client, db_session):
+    headers, brand_id = _price_test_setup(client, db_session, "listprice4@example.com")
+    product = client.post(
+        "/products/",
+        json={"product_name": "Masked", "price": "90.00", "discount": "10",
+              "discount_type": "percent", "brand_id": brand_id},
+        headers=headers,
+    ).json()
+
+    anon = client.get(f"/products/{product['id']}").json()
+    assert anon["price"] == "XXXX"
+    # Returning the list price to an unentitled viewer would give away both the
+    # pre-discount figure and, with `discount`, the charged one.
+    assert anon["list_price"] is None
+    assert anon["discount"] is None
+
+
+def test_order_item_snapshots_list_price(client, db_session):
+    headers, brand_id = _price_test_setup(client, db_session, "listprice5@example.com")
+    product = client.post(
+        "/products/",
+        json={"product_name": "Ordered", "price": "90.00", "discount": "10",
+              "discount_type": "percent", "brand_id": brand_id},
+        headers=headers,
+    ).json()
+
+    order = client.post(
+        "/orders/",
+        json=_order_payload(None, items=[{"product_id": product["id"], "qty": 2}]),
+        headers=headers,
+    )
+    assert order.status_code == 201, order.text
+    item = order.json()["items"][0]
+    assert item["unit_price"] == "90.00"
+    # Snapshotted, so the printed quote's "UP before Discount" reads it directly
+    # instead of dividing the discount back out.
+    assert item["list_price"] == "100.00"
+
+    # ...and it stays put on the placed order even after the product is repriced.
+    client.patch(f"/products/{product['id']}/price", json={"price": "10.00"}, headers=headers)
+    reread = client.get(f"/orders/{order.json()['id']}", headers=headers).json()
+    assert reread["items"][0]["list_price"] == "100.00"
+
+
+def test_updated_by_records_the_staff_member_who_last_wrote(client, db_session):
+    headers, brand_id = _price_test_setup(client, db_session, "updatedby1@example.com")
+    product = client.post(
+        "/products/",
+        json={"product_name": "Audited", "price": "10.00", "brand_id": brand_id},
+        headers=headers,
+    ).json()
+    assert product["updated_by"]["user_name"] == "Admin User"
+    assert product["updated_at"] is not None
+
+    # A second admin edits it - updated_by follows the most recent writer.
+    make_admin(db_session, email="updatedby2@example.com", password="password123")
+    other = auth_header(client, "updatedby2@example.com", "password123")
+    resp = client.put(
+        f"/products/{product['id']}", json={"product_name": "Audited v2"}, headers=other
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["updated_by"]["user_name"] == "Admin User"
+    assert resp.json()["updated_by"]["id"] != product["updated_by"]["id"]
+
+
+# ---------------------------------------------------------------------------
 # Customers
 # ---------------------------------------------------------------------------
 def test_customer_crud(client, db_session):
@@ -971,6 +1108,140 @@ def test_category_image_upload(client, db_session):
         headers=headers,
     )
     assert resp.status_code == 400
+
+
+def test_product_gallery_upload_append_and_delete(client, db_session):
+    """Extra product photos: appended (never replaced), ordered, individually
+    removable, and separate from the primary product_image.
+
+    Deliberately asserts nothing about the returned URL's shape - these tests run
+    against whatever storage the environment has configured (R2 when credentials
+    are present, local disk otherwise), and either is a valid answer here."""
+    make_admin(db_session, email="gallery@example.com", password="password123")
+    headers = auth_header(client, "gallery@example.com", "password123")
+    brand_id = client.post("/brands/", data={"brand_name": "GalleryCo"}, headers=headers).json()["id"]
+    product_id = client.post(
+        "/products/",
+        json={"product_name": "Photogenic Widget", "price": "10.00", "brand_id": brand_id},
+        headers=headers,
+    ).json()["id"]
+
+    fake_png = b"\x89PNG\r\n\x1a\n" + b"0" * 100
+    resp = client.post(
+        f"/products/{product_id}/gallery",
+        files=[
+            ("files", ("one.png", fake_png, "image/png")),
+            ("files", ("two.png", fake_png, "image/png")),
+        ],
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    images = resp.json()["images"]
+    assert len(images) == 2
+    assert [i["sort_order"] for i in images] == [0, 1]
+    assert all(i["image"] for i in images)
+    # The gallery never touches the primary picture.
+    assert resp.json()["product_image"] is None
+
+    # A second upload appends rather than replacing.
+    resp = client.post(
+        f"/products/{product_id}/gallery",
+        files=[("files", ("three.png", fake_png, "image/png"))],
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert [i["sort_order"] for i in resp.json()["images"]] == [0, 1, 2]
+
+    # Non-images are refused, same as every other upload endpoint.
+    resp = client.post(
+        f"/products/{product_id}/gallery",
+        files=[("files", ("notes.txt", b"not an image", "text/plain"))],
+        headers=headers,
+    )
+    assert resp.status_code == 400
+
+    # Public reads carry the gallery.
+    listed = client.get(f"/products/{product_id}").json()["images"]
+    assert len(listed) == 3
+
+    # Deleting one leaves the others (and their sort_order) alone.
+    resp = client.delete(f"/products/{product_id}/gallery/{listed[1]['id']}", headers=headers)
+    assert resp.status_code == 204
+    remaining = client.get(f"/products/{product_id}").json()["images"]
+    assert [i["id"] for i in remaining] == [listed[0]["id"], listed[2]["id"]]
+    assert [i["sort_order"] for i in remaining] == [0, 2]
+
+
+def test_product_gallery_delete_is_scoped_to_its_product(client, db_session):
+    """An image id belonging to another product can't be deleted through this
+    product's path."""
+    make_admin(db_session, email="gallery2@example.com", password="password123")
+    headers = auth_header(client, "gallery2@example.com", "password123")
+    brand_id = client.post("/brands/", data={"brand_name": "GalleryCo2"}, headers=headers).json()["id"]
+
+    def make_product(name):
+        return client.post(
+            "/products/",
+            json={"product_name": name, "price": "10.00", "brand_id": brand_id},
+            headers=headers,
+        ).json()["id"]
+
+    fake_png = b"\x89PNG\r\n\x1a\n" + b"0" * 100
+    owner_id = make_product("Owner")
+    other_id = make_product("Other")
+    image_id = client.post(
+        f"/products/{owner_id}/gallery",
+        files=[("files", ("one.png", fake_png, "image/png"))],
+        headers=headers,
+    ).json()["images"][0]["id"]
+
+    resp = client.delete(f"/products/{other_id}/gallery/{image_id}", headers=headers)
+    assert resp.status_code == 404
+    assert len(client.get(f"/products/{owner_id}").json()["images"]) == 1
+
+    # Deleting the product takes its gallery with it (ON DELETE CASCADE).
+    assert client.delete(f"/products/{owner_id}", headers=headers).status_code == 204
+    from app.models import ProductImage
+
+    assert db_session.query(ProductImage).filter(ProductImage.id == image_id).first() is None
+
+
+def test_product_gallery_upload_requires_product_management(client, db_session):
+    make_admin(db_session, email="galleryowner@example.com", password="password123")
+    owner_headers = auth_header(client, "galleryowner@example.com", "password123")
+    brand_id = client.post(
+        "/brands/", data={"brand_name": "GalleryCo3"}, headers=owner_headers
+    ).json()["id"]
+    product_id = client.post(
+        "/products/",
+        json={"product_name": "Guarded Widget", "price": "10.00", "brand_id": brand_id},
+        headers=owner_headers,
+    ).json()["id"]
+
+    from app.core.security import hash_password
+    from app.models import User
+
+    db_session.add(
+        User(
+            user_name="Pricing Only",
+            email="galleryPricer@example.com",
+            hashed_password=hash_password("password123"),
+            is_active=True,
+            is_verified=True,
+            price_listing=True,
+        )
+    )
+    db_session.commit()
+    headers = auth_header(client, "galleryPricer@example.com", "password123")
+
+    fake_png = b"\x89PNG\r\n\x1a\n" + b"0" * 100
+    resp = client.post(
+        f"/products/{product_id}/gallery",
+        files=[("files", ("one.png", fake_png, "image/png"))],
+        headers=headers,
+    )
+    assert resp.status_code == 403
+    assert "product_management" in resp.json()["detail"]
 
 
 def test_create_category_with_image_in_one_request(client, db_session):
@@ -2368,3 +2639,66 @@ def test_unhandled_exception_returns_generic_500():
         assert "RuntimeError" not in resp.text  # internals must not leak
     finally:
         app.dependency_overrides.pop(get_db, None)
+
+
+def test_orders_mine_is_scoped_to_the_caller(client, db_session):
+    """GET /orders/mine is what the storefront's account drawer lists. A customer
+    has no price_listing permission, so it must work off the token's own principal
+    rather than the staff-only GET /orders/, and must never leak another account's
+    orders."""
+    make_admin(db_session, email="mineadmin@example.com", password="password123")
+    admin_headers = auth_header(client, "mineadmin@example.com", "password123")
+    product = _make_order_product(client, admin_headers, name="Mine Widget")
+
+    make_customer(db_session, email="minecust@example.com", password="customerpass1", access_permission=True)
+    cust_headers = customer_auth_header(client, "minecust@example.com", "customerpass1")
+    make_customer(db_session, email="othercust@example.com", password="customerpass1", access_permission=True)
+    other_headers = customer_auth_header(client, "othercust@example.com", "customerpass1")
+
+    staff_order = client.post("/orders/", json=_order_payload(product["id"]), headers=admin_headers)
+    assert staff_order.status_code == 201, staff_order.text
+    mine = client.post(
+        "/orders/", json=_order_payload(product["id"], payment_method="cash"), headers=cust_headers
+    )
+    assert mine.status_code == 201, mine.text
+    theirs = client.post(
+        "/orders/", json=_order_payload(product["id"], payment_method="cash"), headers=other_headers
+    )
+    assert theirs.status_code == 201, theirs.text
+
+    cust_ids = [o["id"] for o in client.get("/orders/mine", headers=cust_headers).json()]
+    assert cust_ids == [mine.json()["id"]]
+
+    # Staff see the quotes they recorded themselves, not every order in the system.
+    staff_ids = [o["id"] for o in client.get("/orders/mine", headers=admin_headers).json()]
+    assert staff_ids == [staff_order.json()["id"]]
+
+
+def test_orders_mine_requires_a_token(client):
+    assert client.get("/orders/mine").status_code == 401
+
+
+def test_orders_mine_detail_is_scoped_to_the_caller(client, db_session):
+    """GET /orders/mine/{id} backs the account drawer's order detail view and the PDF it
+    re-prints from, so it must return the full line items - and 404 (not 403) on an
+    order the caller doesn't own, so it can't be used to probe which ids exist."""
+    make_admin(db_session, email="minedetailadmin@example.com", password="password123")
+    admin_headers = auth_header(client, "minedetailadmin@example.com", "password123")
+    product = _make_order_product(client, admin_headers, name="Mine Detail Widget")
+
+    make_customer(db_session, email="minedetail@example.com", password="customerpass1", access_permission=True)
+    cust_headers = customer_auth_header(client, "minedetail@example.com", "customerpass1")
+
+    staff_order = client.post("/orders/", json=_order_payload(product["id"]), headers=admin_headers)
+    assert staff_order.status_code == 201, staff_order.text
+    mine = client.post(
+        "/orders/", json=_order_payload(product["id"], payment_method="cash"), headers=cust_headers
+    )
+    assert mine.status_code == 201, mine.text
+
+    resp = client.get(f"/orders/mine/{mine.json()['id']}", headers=cust_headers)
+    assert resp.status_code == 200, resp.text
+    assert [i["product_id"] for i in resp.json()["items"]] == [product["id"]]
+
+    assert client.get(f"/orders/mine/{staff_order.json()['id']}", headers=cust_headers).status_code == 404
+    assert client.get(f"/orders/mine/{mine.json()['id']}", headers=admin_headers).status_code == 404

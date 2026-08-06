@@ -185,6 +185,27 @@ CRUD → file upload → error handling), not just written from memory - see
       (each parent immediately followed by its own components), not by id,
       since components are physically INSERTed after every parent row.
 
+15. **`ProductImage` (added 2026-08-06):** extra photos for the storefront's
+    product page gallery, as a child table rather than more `*_image`
+    columns on `Product` (the shape `Set` uses for its one detail image) -
+    the number of angles a product is photographed from isn't fixed.
+    `products.product_image` is unchanged and stays the **primary** picture:
+    it's what the catalog card, the cart, the printed quote and the Telegram
+    alert show, and it's the first frame of the gallery, so it is never
+    repeated in `images`. Consequences worth knowing:
+    - Uploads through `POST /products/{id}/gallery` (multipart, repeated
+      `files` field) **append**; `sort_order` is `max(existing) + 1` at
+      upload time and deleting one never renumbers the rest, so the gallery
+      keeps the order photos were added in.
+    - Gallery files keep uuid names (`save_image`), unlike the primary
+      picture's product-name-derived one (`save_named_image`) - a fixed name
+      can only identify one file, so a second gallery upload would otherwise
+      overwrite the first.
+    - `images` is read-only on `ProductOut` and not price-masked (a photo
+      isn't pricing data), and the list endpoint loads it with
+      `selectinload`, not `joinedload`: `free_items` is already joined, and
+      two joined collections multiply each other's rows.
+
 ---
 
 ## 2. Project structure
@@ -342,6 +363,7 @@ auth flows), see [`AI_AGENT_GUIDE.md`](AI_AGENT_GUIDE.md). Summary:
 | `PATCH /products/{id}/price` | `price_listing` | |
 | `POST/PUT/DELETE /promotions/...` | `price_listing` | |
 | `POST .../{id}/image`, `.../{id}/pdf` | Same permission as editing that resource | File uploads (still available for setting/replacing an image after creation) |
+| `POST /products/{id}/gallery`, `DELETE /products/{id}/gallery/{image_id}` | `product_management` | The product page's extra photos - multipart, repeated `files` field, appends rather than replaces. See point 15 above |
 
 ---
 

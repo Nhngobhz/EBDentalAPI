@@ -5,6 +5,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.core.audit import stamp_updated_by
 from app.core.deps import get_verified_customer, require_permission
 from app.core.email import send_customer_verification_email
 from app.core.files import save_image
@@ -92,7 +93,7 @@ def list_customers(
     skip: Skip = 0,
     limit: Limit = 50,
     q: str | None = None,
-    _: User = _perm,
+    current_user: User = _perm,
     db: Session = Depends(get_db),
 ):
     query = db.query(Customer)
@@ -112,10 +113,11 @@ def get_customer(customer_id: int, _: User = _perm, db: Session = Depends(get_db
 
 
 @router.post("/", response_model=CustomerOut, status_code=status.HTTP_201_CREATED)
-def create_customer(payload: CustomerCreate, _: User = _perm, db: Session = Depends(get_db)):
+def create_customer(payload: CustomerCreate, current_user: User = _perm, db: Session = Depends(get_db)):
     if db.query(Customer).filter(Customer.email == payload.email).first():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already in use")
     customer = Customer(**payload.model_dump())
+    stamp_updated_by(customer, current_user)
     db.add(customer)
     db.commit()
     db.refresh(customer)
@@ -126,7 +128,7 @@ def create_customer(payload: CustomerCreate, _: User = _perm, db: Session = Depe
 def update_customer(
     customer_id: int,
     payload: CustomerUpdate,
-    _: User = _perm,
+    current_user: User = _perm,
     db: Session = Depends(get_db),
 ):
     customer = db.query(Customer).filter(Customer.id == customer_id).first()
@@ -134,6 +136,7 @@ def update_customer(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(customer, field, value)
+    stamp_updated_by(customer, current_user)
     db.commit()
     db.refresh(customer)
     return customer
@@ -141,12 +144,13 @@ def update_customer(
 
 @router.post("/{customer_id}/image", response_model=CustomerOut)
 async def upload_customer_image(
-    customer_id: int, file: UploadFile, _: User = _perm, db: Session = Depends(get_db)
+    customer_id: int, file: UploadFile, current_user: User = _perm, db: Session = Depends(get_db)
 ):
     customer = db.query(Customer).filter(Customer.id == customer_id).first()
     if not customer:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
     customer.customer_image = await save_image(file, "customers")
+    stamp_updated_by(customer, current_user)
     db.commit()
     db.refresh(customer)
     return customer
