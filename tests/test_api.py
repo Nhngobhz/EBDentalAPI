@@ -2594,7 +2594,10 @@ def test_payway_payment_status_poll_flips_to_paid(client, db_session, monkeypatc
     assert resp.json()["paid_at"] is not None
 
 
-def test_payment_status_rejected_on_non_khqr_rows(client, db_session, monkeypatch):
+def test_payment_status_poll_rejected_on_non_khqr_rows(client, db_session, monkeypatch):
+    """There is nothing for the QR poll to ask about on a row with no QR - that's
+    still a 400. Marking it paid is a different matter and is allowed now (staff take
+    cash against a quote); see test_any_order_can_be_marked_paid."""
     _fast_alert_wait(monkeypatch)
     make_admin(db_session, email="npadmin@example.com", password="password123")
     admin_headers = auth_header(client, "npadmin@example.com", "password123")
@@ -2602,12 +2605,7 @@ def test_payment_status_rejected_on_non_khqr_rows(client, db_session, monkeypatc
 
     quote = client.post("/orders/", json=_order_payload(product["id"]), headers=admin_headers).json()
 
-    # A quote has no QR payment to poll...
     resp = client.get(f"/orders/{quote['id']}/payment-status", headers=admin_headers)
-    assert resp.status_code == 400
-
-    # ...and can't be marked paid either.
-    resp = client.put(f"/orders/{quote['id']}", json={"payment_status": "paid"}, headers=admin_headers)
     assert resp.status_code == 400
 
 
@@ -2702,3 +2700,313 @@ def test_orders_mine_detail_is_scoped_to_the_caller(client, db_session):
 
     assert client.get(f"/orders/mine/{staff_order.json()['id']}", headers=cust_headers).status_code == 404
     assert client.get(f"/orders/mine/{mine.json()['id']}", headers=admin_headers).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Editing an order, and the freeze that lands with payment
+# ---------------------------------------------------------------------------
+def test_staff_can_edit_an_unpaid_order(client, db_session, monkeypatch):
+    """The admin Orders page's edit modal: clinic details, terms and the item list
+    itself. Items are REPLACED wholesale and re-priced from the current catalogue -
+    the request only ever carries ids and quantities."""
+    _fast_alert_wait(monkeypatch)
+    make_admin(db_session, email="editadmin@example.com", password="password123")
+    headers = auth_header(client, "editadmin@example.com", "password123")
+    widget = _make_order_product(client, headers, name="EditWidget", price="100.00")
+    gadget = _make_order_product(client, headers, name="EditGadget", price="25.00")
+
+    order = client.post("/orders/", json=_order_payload(widget["id"]), headers=headers).json()
+    assert order["grand_total"] == "200.00"  # 2 x $100
+
+    resp = client.put(
+        f"/orders/{order['id']}",
+        json={
+            "clinic_name": "Renamed Clinic",
+            "contact_person": "Dr Edit",
+            "address": "9 New Street",
+            "payment_term": "Net 30",
+            "items": [
+                {"product_id": widget["id"], "qty": 3},
+                {"product_id": gadget["id"], "qty": 2},
+            ],
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["clinic_name"] == "Renamed Clinic"
+    assert body["contact_person"] == "Dr Edit"
+    assert body["address"] == "9 New Street"
+    assert body["payment_term"] == "Net 30"
+    # Re-priced server-side: 3 x $100 + 2 x $25.
+    assert body["subtotal"] == "350.00"
+    assert body["grand_total"] == "350.00"
+    assert sorted((i["product_id"], i["qty"]) for i in body["items"]) == sorted(
+        [(gadget["id"], 2), (widget["id"], 3)]
+    )
+    # The replaced rows are really gone, not just detached.
+    assert len(client.get(f"/orders/{order['id']}", headers=headers).json()["items"]) == 2
+
+
+def test_editing_an_order_re_expands_bundle_contents(client, db_session, monkeypatch):
+    """A product's freebies are regenerated from the parent line on every edit, so an
+    edited order carries the same $0 component rows a freshly placed one does."""
+    _fast_alert_wait(monkeypatch)
+    make_admin(db_session, email="editbundle@example.com", password="password123")
+    headers = auth_header(client, "editbundle@example.com", "password123")
+    freebie = _make_order_product(client, headers, name="EditFreebie", price="10.00")
+    main = _make_order_product(
+        client, headers, name="EditMain", price="100.00",
+        free_items=[{"product_id": freebie["id"], "qty": 1}],
+    )
+    plain = _make_order_product(client, headers, name="EditPlain", price="40.00")
+
+    order = client.post(
+        "/orders/",
+        json=_order_payload(plain["id"], items=[{"product_id": plain["id"], "qty": 1}]),
+        headers=headers,
+    ).json()
+    assert len(order["items"]) == 1
+
+    body = client.put(
+        f"/orders/{order['id']}",
+        json={"items": [{"product_id": main["id"], "qty": 2}]},
+        headers=headers,
+    ).json()
+    paid_lines = [i for i in body["items"] if i["parent_item_id"] is None]
+    components = [i for i in body["items"] if i["parent_item_id"] is not None]
+    assert len(paid_lines) == 1 and paid_lines[0]["qty"] == 2
+    # 2 of a product that comes with 1 freebie = 2 freebies, at $0.
+    assert len(components) == 1
+    assert components[0]["qty"] == 2
+    assert components[0]["line_amount"] == "0.00"
+    assert components[0]["parent_item_id"] == paid_lines[0]["id"]
+    assert body["grand_total"] == "200.00"  # the freebie moves nothing
+
+
+def test_editing_the_discount_alone_recomputes_the_total(client, db_session, monkeypatch):
+    """Changing only one half of the discount keeps the other half, and the totals are
+    recomputed off the order's existing lines without resending them."""
+    _fast_alert_wait(monkeypatch)
+    make_admin(db_session, email="editdisc@example.com", password="password123")
+    headers = auth_header(client, "editdisc@example.com", "password123")
+    product = _make_order_product(client, headers, name="DiscWidget", price="100.00")
+
+    order = client.post(
+        "/orders/",
+        json=_order_payload(product["id"], discount_type="percent", discount_value=10),
+        headers=headers,
+    ).json()
+    assert order["grand_total"] == "180.00"
+
+    body = client.put(
+        f"/orders/{order['id']}", json={"discount_value": 25}, headers=headers
+    ).json()
+    assert body["discount_type"] == "percent"  # not reset by sending only the value
+    assert body["discount_amount"] == "50.00"
+    assert body["grand_total"] == "150.00"
+
+    # A percent value that only becomes invalid once combined with the stored type.
+    resp = client.put(f"/orders/{order['id']}", json={"discount_value": 150}, headers=headers)
+    assert resp.status_code == 400
+
+
+def test_editing_an_order_requires_product_management_for_a_discount(client, db_session, monkeypatch):
+    """Same gate as placing one: price_listing can edit an order, but not hand out money."""
+    from app.core.security import hash_password
+    from app.models import User
+
+    _fast_alert_wait(monkeypatch)
+    db_session.add(User(
+        user_name="Pricing Only Editor",
+        email="editpricing@example.com",
+        hashed_password=hash_password("password123"),
+        is_active=True,
+        is_verified=True,
+        price_listing=True,
+    ))
+    db_session.commit()
+    pricing_headers = auth_header(client, "editpricing@example.com", "password123")
+    make_admin(db_session, email="editadmin2@example.com", password="password123")
+    admin_headers = auth_header(client, "editadmin2@example.com", "password123")
+    product = _make_order_product(client, admin_headers, name="EditPermWidget", price="100.00")
+
+    order = client.post("/orders/", json=_order_payload(product["id"]), headers=admin_headers).json()
+
+    assert client.put(
+        f"/orders/{order['id']}",
+        json={"discount_type": "cash", "discount_value": 10},
+        headers=pricing_headers,
+    ).status_code == 403
+    # Everything else about the order is still theirs to fix.
+    assert client.put(
+        f"/orders/{order['id']}", json={"clinic_name": "Fixed Typo Clinic"}, headers=pricing_headers,
+    ).status_code == 200
+
+
+def test_any_order_can_be_marked_paid(client, db_session, monkeypatch):
+    """Payment is no longer KHQR-only: staff take cash at the counter against a quote,
+    and marking it paid is what turns the printed document into a receipt. order_type
+    stays "quote" - how the row came to exist doesn't change when it's settled."""
+    _fast_alert_wait(monkeypatch)
+    make_admin(db_session, email="cashpaid@example.com", password="password123")
+    headers = auth_header(client, "cashpaid@example.com", "password123")
+    product = _make_order_product(client, headers, name="CashWidget", price="100.00")
+
+    order = client.post("/orders/", json=_order_payload(product["id"]), headers=headers).json()
+    assert order["order_type"] == "quote"
+    assert order["payment_method"] is None
+
+    resp = client.put(f"/orders/{order['id']}", json={"payment_status": "paid"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["payment_status"] == "paid"
+    assert body["paid_at"] is not None
+    assert body["order_type"] == "quote"
+
+
+def test_a_paid_order_is_frozen(client, db_session, monkeypatch):
+    """Nothing about a paid order can change, and it cannot be deleted - a receipt has
+    been issued against those exact figures."""
+    _fast_alert_wait(monkeypatch)
+    make_admin(db_session, email="frozen@example.com", password="password123")
+    headers = auth_header(client, "frozen@example.com", "password123")
+    product = _make_order_product(client, headers, name="FrozenWidget", price="100.00")
+
+    order = client.post("/orders/", json=_order_payload(product["id"]), headers=headers).json()
+    client.put(f"/orders/{order['id']}", json={"payment_status": "paid"}, headers=headers)
+
+    for payload in (
+        {"clinic_name": "Should Not Apply"},
+        {"status": "delivered"},
+        {"payment_status": "unpaid"},
+        {"discount_type": "cash", "discount_value": 5},
+        {"items": [{"product_id": product["id"], "qty": 9}]},
+    ):
+        resp = client.put(f"/orders/{order['id']}", json=payload, headers=headers)
+        assert resp.status_code == 409, f"{payload} -> {resp.status_code}"
+
+    assert client.delete(f"/orders/{order['id']}", headers=headers).status_code == 409
+
+    body = client.get(f"/orders/{order['id']}", headers=headers).json()
+    assert body["clinic_name"] == "Test Clinic"
+    assert body["status"] == "pending"
+    assert body["grand_total"] == "200.00"
+
+
+def test_staff_can_issue_a_khqr_for_an_existing_order(client, db_session, monkeypatch):
+    """The counter/phone-order case: a quote that already exists gets a QR the customer
+    can scan. Idempotent, and invalidated by an edit that moves the total."""
+    _fast_alert_wait(monkeypatch)
+    _configure_bakong(monkeypatch)
+    make_admin(db_session, email="qradmin@example.com", password="password123")
+    headers = auth_header(client, "qradmin@example.com", "password123")
+    product = _make_order_product(client, headers, name="QRWidget", price="75.00")
+
+    order = client.post("/orders/", json=_order_payload(product["id"]), headers=headers).json()
+    assert order["khqr_string"] is None
+
+    resp = client.post(f"/orders/{order['id']}/khqr", headers=headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["payment_method"] == "khqr"
+    assert body["payment_status"] == "unpaid"
+    # A quote that gets a payment QR is still the quote it started as.
+    assert body["order_type"] == "quote"
+    assert "5406150.00" in body["khqr_string"]  # amount tag: 2 x $75.00
+    assert body["order_number"] in body["khqr_string"]  # bill number
+    assert body["khqr_md5"] is not None
+
+    # Re-opening the dialog hands back the same payload, not a fresh one.
+    again = client.post(f"/orders/{order['id']}/khqr", headers=headers).json()
+    assert again["khqr_string"] == body["khqr_string"]
+
+    # An edit that moves the total drops it, so the next request builds a new one.
+    moved = client.put(
+        f"/orders/{order['id']}",
+        json={"items": [{"product_id": product["id"], "qty": 4}]},
+        headers=headers,
+    ).json()
+    assert moved["khqr_string"] is None
+    rebuilt = client.post(f"/orders/{order['id']}/khqr", headers=headers).json()
+    assert "5406300.00" in rebuilt["khqr_string"]  # 4 x $75.00
+
+    # And a paid order has nothing left to collect.
+    client.put(f"/orders/{order['id']}", json={"payment_status": "paid"}, headers=headers)
+    assert client.post(f"/orders/{order['id']}/khqr", headers=headers).status_code == 400
+
+
+def test_staff_can_poll_any_orders_payment_status(client, db_session, monkeypatch):
+    """Staff issue the QR from the admin page, so they have to be able to watch that
+    same order settle - even one a customer placed."""
+    _fast_alert_wait(monkeypatch)
+    _configure_bakong(monkeypatch)
+    make_admin(db_session, email="pollstaff@example.com", password="password123")
+    admin_headers = auth_header(client, "pollstaff@example.com", "password123")
+    product = _make_order_product(client, admin_headers, name="PollWidget")
+
+    make_customer(db_session, email="pollcust@example.com", password="customerpass1", access_permission=True)
+    cust_headers = customer_auth_header(client, "pollcust@example.com", "customerpass1")
+    order = client.post(
+        "/orders/", json=_order_payload(product["id"], payment_method="khqr"), headers=cust_headers
+    ).json()
+
+    # Staff didn't place it, but price_listing already reads the whole order.
+    resp = client.get(f"/orders/{order['id']}/payment-status", headers=admin_headers)
+    assert resp.status_code == 200
+    assert resp.json() == {"payment_status": "unpaid"}
+
+
+def test_editing_an_order_rejects_a_blank_required_field(client, db_session, monkeypatch):
+    """Explicit nulls clear the optional fields and are refused on the ones an order
+    can't exist without."""
+    _fast_alert_wait(monkeypatch)
+    make_admin(db_session, email="blankedit@example.com", password="password123")
+    headers = auth_header(client, "blankedit@example.com", "password123")
+    product = _make_order_product(client, headers, name="BlankWidget")
+
+    order = client.post(
+        "/orders/", json=_order_payload(product["id"], contact_person="Dr Gone"), headers=headers
+    ).json()
+
+    assert client.put(
+        f"/orders/{order['id']}", json={"clinic_name": None}, headers=headers
+    ).status_code == 400
+    assert client.put(
+        f"/orders/{order['id']}", json={"status": None}, headers=headers
+    ).status_code == 400
+    # contact_person is genuinely optional - null means "clear it".
+    body = client.put(
+        f"/orders/{order['id']}", json={"contact_person": None}, headers=headers
+    ).json()
+    assert body["contact_person"] is None
+
+
+def test_paid_quote_alert_is_a_receipt_not_a_new_quote():
+    """A quote whose payment staff recorded is a completed sale - the Telegram alert
+    must not still say "no payment has been made" just because order_type is "quote"."""
+    from app.schemas import OrderOut
+    from app.services.telegram import _order_alert_caption
+
+    base = {
+        "id": 1, "order_number": "000001", "quote_code": "260808010101",
+        "clinic_name": "Cash Clinic", "phone": "012", "address": "1 St",
+        "discount_type": "cash", "discount_value": "0", "discount_amount": "0",
+        "subtotal": "100.00", "grand_total": "100.00", "status": "pending",
+        "order_type": "quote", "created_at": "2026-08-08T00:00:00Z",
+        "updated_at": "2026-08-08T00:00:00Z",
+    }
+    unpaid_caption, unpaid_doc = _order_alert_caption(OrderOut(**base))
+    assert unpaid_doc == "Quotation"
+    assert "no payment has been made" in unpaid_caption
+
+    paid_caption, paid_doc = _order_alert_caption(OrderOut(**{**base, "payment_status": "paid"}))
+    assert paid_doc == "Receipt"
+    assert "PAID" in paid_caption
+    assert "no payment has been made" not in paid_caption
+    assert "via KHQR" not in paid_caption  # no method recorded - don't invent one
+
+    khqr_caption, _ = _order_alert_caption(
+        OrderOut(**{**base, "order_type": "order", "payment_method": "khqr", "payment_status": "paid"})
+    )
+    assert "PAID via KHQR" in khqr_caption

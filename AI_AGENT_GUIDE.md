@@ -43,6 +43,8 @@ confusing (not obviously wrong) results.
   quotes (server-priced snapshots, payment happens offline later);
   only a customer KHQR checkout is a real order, which starts
   `payment_status: "unpaid"` and carries a generated Bakong QR payload.
+  Either kind stays editable by staff until `payment_status` is `"paid"`,
+  after which it is frozen (`409` on any write, including delete).
   See section 6's Orders table.
 
 ---
@@ -525,9 +527,10 @@ server-side and never trusted from the request body.
 | `GET /orders/mine` | Same bar as `POST /orders/` (staff `price_listing`/`product_management`, or customer `access_permission`) | query `skip`, `limit`. The caller's OWN orders, scoped from the token (customer → `customer_id`, staff → `created_by_user_id`) - never from a query param. Exists because a customer has no `price_listing` and so can't use `GET /orders/` to see even their own history; powers the storefront's account drawer. Declared above `GET /{order_id}` so "mine" isn't parsed as an id. |
 | `GET /orders/mine/{id}` | Same, plus must own the order | The caller's own order in full (line items included) - what the account drawer's detail view shows and re-prints its PDF from. **404, not 403**, on an order the caller doesn't own, so it can't be used to probe which ids exist. |
 | `GET /orders/{id}` | `price_listing` | - |
-| `GET /orders/{id}/payment-status` | Same principal who placed the order | KHQR orders only (`400` otherwise). Returns `{"payment_status": "unpaid"\|"paid"}`; while unpaid and `BAKONG_API_TOKEN` is configured, each call checks Bakong for the transaction and the first confirmed one flips the order to paid (stamping `paid_at`, firing the paid-order Telegram alert). Meant to be polled by the paying customer's browser. |
-| `PUT /orders/{id}` | `price_listing` | JSON `{"status"?, "payment_status"?}` - the only things editable after creation. `payment_status` is only accepted on KHQR orders (`400` otherwise); setting `"paid"` stamps `paid_at` and fires the paid-order alert - the manual fallback when no Bakong API token is configured. |
-| `DELETE /orders/{id}` | `price_listing` | hard delete, cascades to `OrderItem` rows |
+| `GET /orders/{id}/payment-status` | The principal who placed the order, **or any `price_listing` staff** | KHQR orders only (`400` otherwise). Returns `{"payment_status": "unpaid"\|"paid"}`; while unpaid and `BAKONG_API_TOKEN` is configured, each call checks Bakong for the transaction and the first confirmed one flips the order to paid (stamping `paid_at`, firing the paid-order Telegram alert). Polled by the paying customer's browser, and by the admin Orders page's QR dialog. |
+| `POST /orders/{id}/khqr` | `price_listing` | No body. Issues a scannable KHQR against an **existing** order (counter/phone sale) for its current `grand_total`, setting `payment_method: "khqr"`, `payment_status: "unpaid"`; returns the whole `OrderOut`. Idempotent - returns the stored payload if one exists. `400` if already paid or KHQR isn't configured. `order_type` is deliberately **not** changed. |
+| `PUT /orders/{id}` | `price_listing` | JSON `OrderUpdate` - `status`, `payment_status`, `clinic_name`, `contact_person`, `phone`, `address`, `payment_term`, `install_term`, `discount_type`, `discount_value`, `items`. **`409` on a paid order** (see below). `items` REPLACES the line list and is re-priced server-side; a discount needs `product_management`; `payment_status: "paid"` stamps `paid_at` and fires the paid-order alert. |
+| `DELETE /orders/{id}` | `price_listing` | hard delete, cascades to `OrderItem` rows. **`409` on a paid order.** |
 | `POST /orders/{id}/quotation-pdf` | Same principal who placed the order | `multipart/form-data`, field `file` (a PDF) - see notes below |
 
 Notes an agent should know before calling this:
@@ -558,11 +561,27 @@ Notes an agent should know before calling this:
   building from sub-00 alone yields a QR naming the bank but no account.
   `scripts/decode_khqr.py` dumps any KHQR (image or payload string)
   field-by-field and is the fastest way to inspect either side.
-- **Receipts vs. quotations**: the printed document for a quote is a
-  Quotation; a KHQR order only ever gets a Receipt, and only after
-  `payment_status` is `"paid"` (the frontend generates it when the
-  payment-status poll flips; the server-side fallback PDF titles itself
-  the same way).
+- **An order is editable until it is paid, then frozen.** `PUT /orders/{id}`
+  accepts the clinic details, terms, order-level discount and the line list
+  itself (`items` REPLACES the lines and is re-priced through the same code
+  path a new order goes through - only ids and quantities are ever accepted).
+  The moment `payment_status` is `"paid"`, every `PUT` and the `DELETE`
+  return **`409`** - including a `status` change and setting `payment_status`
+  back to `"unpaid"`. A receipt has been issued against those exact figures,
+  so correcting a paid order means issuing a new document alongside it. An
+  edit that moves `grand_total` clears any `khqr_string`/`khqr_md5` on the
+  row, since the old QR would collect the wrong amount.
+- **Any order can be marked paid**, not just KHQR ones - staff take cash at
+  the counter against a quote. `payment_status` on a row with no
+  `payment_method` is normal and means exactly that. (The payment-status
+  *poll* still 400s on a non-KHQR row: there is no QR to ask about.)
+- **Receipts vs. quotations**: the printed document is a Receipt whenever
+  `payment_status == "paid"` - a confirmed KHQR payment or a quote staff
+  marked paid - and a Quotation otherwise. Derived from that one field alone
+  in all four places that print or announce it (the frontend's
+  `buildPrintTemplate`, the account drawer, the admin reprint button, and
+  `services/invoice_pdf.py`); `order_type`/`payment_method` only pick the
+  wording of the paid note ("Paid via KHQR" vs "Paid in full").
 - **`salesperson`/`quoted_by_name` are never accepted from the client** -
   `OrderCreate` doesn't even have those fields. They're derived from
   whoever's bearer token is calling: a staff `User` → their `user_name`

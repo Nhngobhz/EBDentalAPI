@@ -129,10 +129,17 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
     content_width = pdf.w - pdf.l_margin - pdf.r_margin  # 190mm at A4/10mm margins
     top = pdf.get_y()
 
-    # A paid KHQR order gets a Receipt; everything else (staff quote, customer cash
-    # quote) stays a Quotation - mirrors the client-side buildPrintTemplate() title.
-    is_receipt = order.payment_method == "khqr" and order.payment_status == "paid"
+    # Anything the system has recorded a payment for prints as a Receipt - a confirmed
+    # KHQR payment, or a quote staff marked paid after taking cash at the counter.
+    # Everything still awaiting payment stays a Quotation. Mirrors the client-side
+    # buildPrintTemplate() title, which derives it from the same single field.
+    is_receipt = order.payment_status == "paid"
     doc_title = "Receipt" if is_receipt else "Quotation"
+    paid_note = (
+        "Paid via KHQR. Thank you for your purchase."
+        if order.payment_method == "khqr"
+        else "Paid in full. Thank you for your purchase."
+    )
 
     # ---- header: brand (left) / "Quotation"/"Receipt" + No/Date (right) ----
     # Font sizes/positions mirror qpt-brand-name/qpt-title (1.6-1.7rem) and
@@ -323,9 +330,7 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
 
         totals_row = table.row()
         totals_row.cell(
-            "Paid via KHQR. Thank you for your purchase."
-            if is_receipt
-            else "Quotation valid for 30 days from the date issued.",
+            paid_note if is_receipt else "Quotation valid for 30 days from the date issued.",
             colspan=6, rowspan=4, align="L", v_align="TOP",
         )
         totals_row.cell("Sub-Total($):", colspan=1, align="L")

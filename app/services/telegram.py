@@ -200,10 +200,25 @@ async def notify_error(error_type: str, message: str, path: str | None = None) -
 
 def _order_alert_caption(order: "OrderOut") -> tuple[str, str]:
     """Returns (caption, document_word) for an order's Telegram alert. Three shapes:
-    a QUOTE (staff cart, or a customer who chose Cash - explicitly flagged so staff
-    never mistake it for a paid sale), a PAID KHQR order (sent from the payment-status
-    check / manual Mark-as-Paid, carrying the receipt), and the plain new-order shape
-    kept as a fallback for anything else."""
+    a PAID row (from the payment-status check or a staff Mark-as-Paid, carrying the
+    receipt), an unpaid QUOTE (staff cart, or a customer who chose Cash - explicitly
+    flagged so staff never mistake it for a paid sale), and the plain new-order shape
+    kept as a fallback for anything else.
+
+    Paid is checked FIRST, and on payment_status alone: a quote whose payment staff
+    recorded at the counter is a completed sale, and announcing it as "no payment has
+    been made" because order_type still says "quote" would be exactly backwards."""
+    if order.payment_status == "paid":
+        via = " via KHQR" if order.payment_method == "khqr" else ""
+        label = "QUOTE" if order.order_type == "quote" else "Order"
+        caption = (
+            f"✅ <b>{label} PAID{via}</b>\n"
+            f"No: {_esc(order.order_number)} (Code: {_esc(order.quote_code)})\n"
+            f"Clinic: {_esc(order.clinic_name)}\n"
+            f"Salesperson: {_esc(order.salesperson or '-')}\n"
+            f"Amount received: $ {order.grand_total:.2f}"
+        )
+        return caption, "Receipt"
     if order.order_type == "quote":
         payment_line = (
             "Payment: Cash (to be collected)\n" if order.payment_method == "cash" else ""
@@ -218,15 +233,6 @@ def _order_alert_caption(order: "OrderOut") -> tuple[str, str]:
             f"ℹ️ This is a quotation - no payment has been made."
         )
         return caption, "Quotation"
-    if order.payment_method == "khqr" and order.payment_status == "paid":
-        caption = (
-            f"✅ <b>Order PAID via KHQR</b>\n"
-            f"Order No: {_esc(order.order_number)} (Code: {_esc(order.quote_code)})\n"
-            f"Clinic: {_esc(order.clinic_name)}\n"
-            f"Salesperson: {_esc(order.salesperson or '-')}\n"
-            f"Amount received: $ {order.grand_total:.2f}"
-        )
-        return caption, "Receipt"
     caption = (
         f"\U0001F6CD <b>New order</b>\n"
         f"Order No: {_esc(order.order_number)} (Code: {_esc(order.quote_code)})\n"

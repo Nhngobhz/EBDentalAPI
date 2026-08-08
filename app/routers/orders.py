@@ -15,6 +15,12 @@ each of those expands into $0 COMPONENT lines under the paid one (see _component
 and OrderItem.parent_item_id). Components are priced at zero by construction, so they
 can never be used to shift a total - the "free" flag is not something a client can set.
 
+An order stays editable by staff (PUT /{id}: clinic details, terms, discount, and the
+line list itself) right up until payment is recorded, at which point the row freezes -
+no edits and no deletion, see _reject_if_paid. Edits re-price every line from scratch
+through the same _build_order_lines the original purchase used, so "trusted only from
+the server" holds for an edited order exactly as it does for a new one.
+
 Creating an order accepts either a staff (User) or Customer bearer token, mirroring how
 POST /auth/login tries both - see _get_ordering_principal. Whichever kind of account is
 calling must also meet the same "can place an order" bar the frontend enforces before
@@ -155,53 +161,17 @@ def _next_order_number(db: Session) -> str:
     return f"{(last.id + 1) if last else 1:06d}"
 
 
-def _generate_quote_code(db: Session) -> str:
-    """"C. Code" - a readable yymmddhhmmss timestamp, e.g. "260722070145", instead of
-    the old random 2-letters-6-digits code. Seconds are included specifically so two
-    orders placed in the same minute don't already collide on the column's uniqueness
-    constraint; a "-2", "-3", ... suffix is still appended on the rarer same-second
-    collision - the base timestamp stays intact and readable, only same-second
-    duplicates get the extra suffix."""
-    base = datetime.now(timezone.utc).strftime("%y%m%d%H%M%S")
-    code = base
-    suffix = 1
-    while db.query(Order).filter(Order.quote_code == code).first():
-        suffix += 1
-        code = f"{base}-{suffix}"
-    return code
+def _build_order_lines(db: Session, lines) -> tuple[list[OrderItem], Decimal, Decimal]:
+    """Turns the client's [{product_id|promotion_id|set_id, qty}] into real OrderItem
+    rows and returns (items, subtotal, discountable_subtotal).
 
-
-@router.post("/", response_model=OrderOut, status_code=status.HTTP_201_CREATED)
-def create_order(
-    payload: OrderCreate,
-    background_tasks: BackgroundTasks,
-    principal: tuple[Customer | None, User | None] = Depends(_get_ordering_principal),
-    db: Session = Depends(get_db),
-):
-    customer, user = principal
-
-    # Salesperson/quoted_by_name are always derived here, never trusted from the client
-    # (see OrderCreate - it doesn't even accept them). A customer placing their own order
-    # is recorded as "Website" for salesperson but keeps their own name for quoted_by_name.
-    if user is not None:
-        salesperson = user.user_name
-        quoted_by_name = user.user_name
-    else:
-        salesperson = "Website"
-        quoted_by_name = customer.customer_name
-
-    # Any order-level discount (percent or cash) is a real reduction handed out at staff
-    # discretion - gated to product_management specifically. A customer, or a
-    # price_listing-only staffer, can still place an order, just not apply a discount to
-    # it. Mirrors the quote drawer's UI, which only renders the discount control at all
-    # for product_management staff.
-    if payload.discount_value > 0:
-        if user is None or not user.product_management:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="A discount requires the 'product_management' permission",
-            )
-
+    Shared by create_order and update_order so an edited order is priced by exactly the
+    same rules a new one is - every price/name/discount looked up from the current
+    Product/Promotion/Set row and snapshotted, never taken from the request. Bundles
+    and free-gift products expand into the $0 component lines described in
+    _component_items; `discountable_subtotal` excludes promotion/set lines, which are
+    already a special deal price the order-level discount must not stack on top of.
+    """
     items: list[OrderItem] = []
     subtotal = Decimal("0")
     discountable_subtotal = Decimal("0")
@@ -218,7 +188,7 @@ def create_order(
         items.append(parent)
         items.extend(components)
 
-    for line in payload.items:
+    for line in lines:
         if line.product_id is not None:
             product = db.query(Product).filter(Product.id == line.product_id).first()
             if not product:
@@ -338,11 +308,102 @@ def create_order(
             # Same reasoning as a promotion: already a fixed deal price, excluded from
             # discountable_subtotal.
 
-    if payload.discount_type == "percent":
-        discount_amount = discountable_subtotal * payload.discount_value / Decimal("100")
-    else:
-        discount_amount = min(payload.discount_value, discountable_subtotal)
+    return items, subtotal, discountable_subtotal
 
+
+def _persisted_totals(order: Order) -> tuple[Decimal, Decimal]:
+    """(subtotal, discountable_subtotal) read back off an order's ALREADY-SAVED lines,
+    for an edit that changes the discount without touching the items. Applies the same
+    two rules _build_order_lines does: $0 component lines don't count (they're free by
+    construction), and promotion/set lines are outside the order-level discount's base.
+    """
+    subtotal = Decimal("0")
+    discountable_subtotal = Decimal("0")
+    for item in order.items:
+        if item.parent_item_id is not None:
+            continue
+        subtotal += item.line_amount
+        if item.promotion_id is None and item.set_id is None:
+            discountable_subtotal += item.line_amount
+    return subtotal, discountable_subtotal
+
+
+def _compute_discount(
+    discount_type: str, discount_value: Decimal, discountable_subtotal: Decimal
+) -> Decimal:
+    """The actual $ figure taken off, from the raw value staff entered. A cash discount
+    is capped at the discountable base so an order can never go negative."""
+    if discount_type == "percent":
+        return discountable_subtotal * discount_value / Decimal("100")
+    return min(discount_value, discountable_subtotal)
+
+
+def _reject_if_paid(order: Order) -> None:
+    """A paid order is frozen - no edits, no deletion, by anyone.
+
+    Once payment is recorded a receipt exists for those exact numbers (and a paid-order
+    Telegram alert carrying it has gone out), so the row has stopped being a working
+    document and become the record of a completed sale. Enforced here rather than only
+    in the admin UI, because hiding a button is not a rule.
+    """
+    if order.payment_status == "paid":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This order has been paid - it can no longer be edited or deleted.",
+        )
+
+
+def _generate_quote_code(db: Session) -> str:
+    """"C. Code" - a readable yymmddhhmmss timestamp, e.g. "260722070145", instead of
+    the old random 2-letters-6-digits code. Seconds are included specifically so two
+    orders placed in the same minute don't already collide on the column's uniqueness
+    constraint; a "-2", "-3", ... suffix is still appended on the rarer same-second
+    collision - the base timestamp stays intact and readable, only same-second
+    duplicates get the extra suffix."""
+    base = datetime.now(timezone.utc).strftime("%y%m%d%H%M%S")
+    code = base
+    suffix = 1
+    while db.query(Order).filter(Order.quote_code == code).first():
+        suffix += 1
+        code = f"{base}-{suffix}"
+    return code
+
+
+@router.post("/", response_model=OrderOut, status_code=status.HTTP_201_CREATED)
+def create_order(
+    payload: OrderCreate,
+    background_tasks: BackgroundTasks,
+    principal: tuple[Customer | None, User | None] = Depends(_get_ordering_principal),
+    db: Session = Depends(get_db),
+):
+    customer, user = principal
+
+    # Salesperson/quoted_by_name are always derived here, never trusted from the client
+    # (see OrderCreate - it doesn't even accept them). A customer placing their own order
+    # is recorded as "Website" for salesperson but keeps their own name for quoted_by_name.
+    if user is not None:
+        salesperson = user.user_name
+        quoted_by_name = user.user_name
+    else:
+        salesperson = "Website"
+        quoted_by_name = customer.customer_name
+
+    # Any order-level discount (percent or cash) is a real reduction handed out at staff
+    # discretion - gated to product_management specifically. A customer, or a
+    # price_listing-only staffer, can still place an order, just not apply a discount to
+    # it. Mirrors the quote drawer's UI, which only renders the discount control at all
+    # for product_management staff.
+    if payload.discount_value > 0:
+        if user is None or not user.product_management:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="A discount requires the 'product_management' permission",
+            )
+
+    items, subtotal, discountable_subtotal = _build_order_lines(db, payload.items)
+    discount_amount = _compute_discount(
+        payload.discount_type, payload.discount_value, discountable_subtotal
+    )
     grand_total = max(Decimal("0"), subtotal - discount_amount)
 
     # Quote vs. real order. Staff carts ARE the quotation tool, so a staff-placed row is
@@ -492,14 +553,22 @@ async def check_payment_status(
     the paid-order Telegram alert (which then waits ~20s for the browser to upload the
     real receipt PDF it's about to render). Without a Bakong token this still works -
     it just only ever reports what staff set manually via PUT /orders/{id}
-    ("Mark as Paid" on the admin Orders page). Same ownership gate as the
-    quotation-pdf upload: only the principal who placed the order may poll it."""
+    ("Mark as Paid" on the admin Orders page).
+
+    Callable by the principal who placed the order, and by back-office staff
+    (price_listing) for any order - staff can now generate a QR against an existing
+    order themselves (POST /{order_id}/khqr below) and need to watch that same order
+    settle while the customer is standing in front of them. price_listing is already
+    what it takes to read the whole order via GET /orders/{id}, so this exposes
+    nothing new."""
     customer, user = principal
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-    owns_order = (customer is not None and order.customer_id == customer.id) or (
-        user is not None and order.created_by_user_id == user.id
+    owns_order = (
+        (customer is not None and order.customer_id == customer.id)
+        or (user is not None and order.created_by_user_id == user.id)
+        or (user is not None and user.price_listing)
     )
     if not owns_order:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your order")
@@ -526,6 +595,79 @@ async def check_payment_status(
             background_tasks.add_task(deliver_order_alert, OrderOut.model_validate(order))
 
     return {"payment_status": order.payment_status}
+
+
+@router.post("/{order_id}/khqr", response_model=OrderOut)
+def generate_order_khqr(
+    order_id: int,
+    _: User = _perm,
+    db: Session = Depends(get_db),
+):
+    """Puts a scannable KHQR on an EXISTING order so staff can take payment for it -
+    the counter/phone-call case the customer-facing checkout never covered. A staff cart
+    always produces a quote with no payment attached (create_order); this is how that
+    quote later becomes something a customer can pay by scanning.
+
+    The QR is built for the order's CURRENT grand_total and keyed to its order_number,
+    exactly as a customer KHQR checkout would build it, and the row is set to
+    khqr/unpaid so the existing payment machinery takes over unchanged: the admin page
+    polls GET /{order_id}/payment-status, the first confirmed check flips it to paid,
+    stamps paid_at and fires the paid-order alert with the receipt.
+
+    Idempotent: re-opening the QR dialog returns the payload already on the order
+    rather than minting a new one, so a customer mid-scan never ends up looking at a
+    code the order no longer expects. An edit that moves grand_total clears the stored
+    QR (update_order) precisely so the next call here builds a fresh one for the new
+    amount.
+
+    order_type is deliberately left alone: a quote that gets paid at the counter is
+    still the quote it started as, and the Quotes/Orders tabs go on meaning "how this
+    row came to exist" rather than shuffling rows between tabs behind staff's backs.
+    """
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    # Not _reject_if_paid's wording - "already paid" is the useful thing to say when
+    # somebody asks for a payment QR.
+    if order.payment_status == "paid":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This order has already been paid.",
+        )
+    if not settings.khqr_configured:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="QR payment is not configured - collect payment another way.",
+        )
+
+    if order.khqr_string:
+        return order
+
+    # Same two providers, same rule as create_order: PayWay generates the payload
+    # upstream and leaves khqr_md5 NULL (checked later by tran_id = order_number),
+    # Bakong-direct builds it locally and stores the md5 its check API keys on.
+    # NOTE for PayWay: tran_id is the order_number, so regenerating after an edit
+    # re-uses an id PayWay has already seen for this order. Bakong-direct (the
+    # configured provider here) has no such constraint.
+    if settings.qr_provider == "payway":
+        try:
+            khqr_string = create_payway_khqr(order.grand_total, tran_id=order.order_number)
+        except PayWayError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="QR payment is temporarily unavailable - collect payment another way.",
+            )
+        khqr_md5 = None
+    else:
+        khqr_string, khqr_md5 = build_khqr(order.grand_total, bill_number=order.order_number)
+
+    order.khqr_string = khqr_string
+    order.khqr_md5 = khqr_md5
+    order.payment_method = "khqr"
+    order.payment_status = "unpaid"
+    db.commit()
+    db.refresh(order)
+    return order
 
 
 @router.get("/", response_model=list[OrderOut])
@@ -612,30 +754,104 @@ def update_order(
     current_user: User = _perm,
     db: Session = Depends(get_db),
 ):
+    """Staff edit of a still-unpaid order: clinic/contact details, terms, the
+    order-level discount, the line items themselves, the workflow status, and the
+    "payment received" flag - see OrderUpdate.
+
+    Editing stops the moment the order is paid (_reject_if_paid). Everything the
+    customer was given a receipt for has to keep matching what is on record, so a paid
+    row is read-only here and undeletable below; correcting one means issuing a new
+    order alongside it, not rewriting history.
+
+    Line items are re-priced from scratch, never patched: `items` replaces the whole
+    list through the same _build_order_lines the original purchase went through, so an
+    edited order carries exactly the snapshot shape (and the $0 bundle/free-gift
+    component lines) a freshly placed one does.
+    """
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    _reject_if_paid(order)
 
     fields = payload.model_dump(exclude_unset=True)
-    # payment_status only means anything on a KHQR order - the manual "Mark as Paid"
-    # fallback for setups without a Bakong API token. Flipping to paid stamps paid_at
-    # and sends the same paid-order alert the automatic Bakong check would (the
-    # customer's still-polling browser then sees "paid" and renders the receipt).
-    newly_paid = False
-    if "payment_status" in fields:
-        if order.payment_method != "khqr":
+    # payload.items rather than the dumped dicts - _build_order_lines wants the
+    # validated OrderItemCreate objects.
+    new_items = payload.items if fields.pop("items", None) is not None else None
+
+    # Every field left in `fields` maps to a NOT NULL column except these four, so an
+    # explicit null means "clear it" only for them; anywhere else it would be an attempt
+    # to blank out something the order can't be without.
+    nullable = {"contact_person", "payment_term", "install_term", "payment_status"}
+    for field, value in fields.items():
+        if value is None and field not in nullable:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="payment_status only applies to KHQR orders",
+                detail=f"{field} cannot be empty",
             )
-        newly_paid = fields["payment_status"] == "paid" and order.payment_status != "paid"
+
+    # Same gate as placing an order with a discount: handing out money off is a
+    # product_management call, not something every price_listing staffer can do.
+    if (fields.get("discount_value") or Decimal("0")) > 0 and not current_user.product_management:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="A discount requires the 'product_management' permission",
+        )
+
+    # Recording that payment landed. No longer KHQR-only: staff take cash and bank
+    # transfers against a quote too, and "Mark as Paid" is how that gets on the record
+    # (it is also the manual fallback when automatic Bakong/PayWay checking isn't
+    # configured). Flipping to paid stamps paid_at and fires the paid-order alert, whose
+    # attached document is now a Receipt - a customer's still-polling browser sees
+    # "paid" on its next tick and renders it too.
+    newly_paid = fields.get("payment_status") == "paid"
+
+    # Discount type and value are two halves of one figure: whichever half wasn't sent
+    # keeps its current value, so changing just the percentage doesn't silently reset
+    # the type (and vice versa).
+    discount_changed = "discount_type" in fields or "discount_value" in fields
+    discount_type = fields.get("discount_type", order.discount_type)
+    discount_value = fields.get("discount_value", order.discount_value)
+    if discount_type == "percent" and discount_value > 100:
+        # OrderUpdate can only catch this when both halves arrive together - here the
+        # effective pair is known, so a percent type sent against an existing cash
+        # value of e.g. 500 is caught as well.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A percent discount cannot exceed 100",
+        )
 
     for field, value in fields.items():
         setattr(order, field, value)
+
+    if new_items is not None:
+        built, subtotal, discountable_subtotal = _build_order_lines(db, new_items)
+        # delete-orphan on Order.items: assigning the new list drops the old rows (and
+        # their components, which cascade off their parent line).
+        order.items = built
+    elif discount_changed:
+        subtotal, discountable_subtotal = _persisted_totals(order)
+    else:
+        subtotal = discountable_subtotal = None
+
+    if subtotal is not None:
+        order.discount_amount = _compute_discount(
+            discount_type, discount_value, discountable_subtotal
+        )
+        order.subtotal = subtotal
+        previous_total = order.grand_total
+        order.grand_total = max(Decimal("0"), subtotal - order.discount_amount)
+        if order.grand_total != previous_total:
+            # Any KHQR already issued for this order encodes the OLD amount, so it
+            # would collect the wrong sum. Dropping it here is what makes
+            # generate_order_khqr build a fresh one on the next request instead of
+            # handing back a stale payload.
+            order.khqr_string = None
+            order.khqr_md5 = None
+
     if newly_paid:
         order.paid_at = datetime.now(timezone.utc)
-    # The only staff-editable thing about an order is its status/payment_status, so
-    # this records who marked it delivered, cancelled, or paid.
+    # Records who last touched the order - now a real edit trail, not just who marked it
+    # delivered/cancelled/paid.
     stamp_updated_by(order, current_user)
     db.commit()
     db.refresh(order)
@@ -649,6 +865,10 @@ def delete_order(order_id: int, _: User = _perm, db: Session = Depends(get_db)):
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    # A paid order is a permanent financial record - see _reject_if_paid. Cancelling one
+    # is a `status` change, which is itself blocked once paid; what's left is issuing a
+    # correcting document, never making the original disappear.
+    _reject_if_paid(order)
     db.delete(order)
     db.commit()
     return None

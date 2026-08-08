@@ -642,14 +642,52 @@ class OrderCreate(BaseModel):
 
 
 class OrderUpdate(BaseModel):
-    """The only things staff can change after the fact - everything else is an
-    immutable record of what was actually quoted/sold. payment_status exists so
-    staff can manually confirm a KHQR payment (admin Orders page "Mark as Paid")
-    when automatic Bakong checking isn't configured - the router rejects it on
-    non-KHQR rows."""
+    """What staff can still change about an order after it was placed - the quote is a
+    working document until money changes hands, so the clinic details, terms, discount
+    and the item list itself are all editable from the admin Orders page.
+
+    Two hard rules live in the router, not here:
+      * **A paid order is frozen.** Once payment_status is "paid" every field below is
+        refused (and so is DELETE) - a receipt has been issued against those numbers.
+      * **Prices are never accepted from the client.** `items` carries only
+        product/promotion/set ids + qty, exactly like OrderCreate; the router re-looks-up
+        and re-snapshots every price and recomputes subtotal/discount/grand_total.
+
+    payment_status is how staff record that payment landed - the automatic Bakong/PayWay
+    check for a KHQR order, or "Mark as Paid" for cash/bank transfer on any other row.
+    """
 
     status: Optional[str] = Field(None, max_length=30)
     payment_status: Optional[Literal["unpaid", "paid"]] = None
+
+    clinic_name: Optional[str] = Field(None, min_length=1, max_length=200)
+    contact_person: Optional[str] = Field(None, max_length=150)
+    phone: Optional[str] = Field(None, min_length=1, max_length=30)
+    address: Optional[str] = Field(None, min_length=1, max_length=255)
+    payment_term: Optional[str] = Field(None, max_length=100)
+    install_term: Optional[str] = Field(None, max_length=150)
+
+    # Order-level discount. Sending discount_type without discount_value (or vice versa)
+    # is allowed - the router fills the missing half from what's already on the order.
+    discount_type: Optional[DiscountType] = None
+    discount_value: Optional[Decimal] = Field(None, ge=0)
+
+    # Omit to leave the lines alone; send a list to REPLACE them wholesale (that is how
+    # the admin editor adds and removes products). The $0 component lines a bundle or
+    # free-gift product expands into are regenerated server-side, so they must not be
+    # sent back - only the lines actually being charged for.
+    items: Optional[list[OrderItemCreate]] = Field(None, min_length=1)
+
+    @field_validator("discount_value")
+    @classmethod
+    def _percent_within_100(cls, discount_value, info):
+        if (
+            discount_value is not None
+            and info.data.get("discount_type") == "percent"
+            and discount_value > 100
+        ):
+            raise ValueError("A percent discount cannot exceed 100")
+        return discount_value
 
 
 class OrderItemOut(BaseModel):
@@ -704,8 +742,9 @@ class OrderOut(BaseModel):
     khqr_string: Optional[str] = None
     khqr_md5: Optional[str] = None
     created_at: datetime
-    # On an order these track the staff member who last changed status/payment_status
-    # (PUT /orders/{id}) - the order's own content is never editable after creation.
+    # The staff member who last wrote to this order via PUT /orders/{id} - a status or
+    # payment change, or a real edit to its details/discount/line items (only possible
+    # while it is unpaid; see OrderUpdate).
     updated_at: datetime
     updated_by: Optional[UserMini] = None
     items: list[OrderItemOut] = []
