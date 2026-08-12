@@ -1,3 +1,4 @@
+import asyncio
 import os
 import secrets
 from contextlib import asynccontextmanager
@@ -24,6 +25,7 @@ from app.routers import (
     telegram_webhook,
     users,
 )
+from app.services.checkout_sweep import run_checkout_sweep
 from app.services.telegram import register_webhook
 
 setup_logging()
@@ -39,7 +41,16 @@ async def lifespan(app: FastAPI):
         Base.metadata.create_all(bind=engine)
     logger.info("%s started (environment=%s)", settings.APP_NAME, settings.ENVIRONMENT)
     await register_webhook()
-    yield
+
+    # A pay-by-QR purchase only becomes an order once the payment is confirmed, and the
+    # customer's browser is normally what notices. This is the server-side backstop for
+    # when it doesn't (tab closed mid-payment) - without it, a real payment could arrive
+    # and never produce an order. See services/checkout_sweep.py.
+    sweep = asyncio.create_task(run_checkout_sweep())
+    try:
+        yield
+    finally:
+        sweep.cancel()
 
 
 app = FastAPI(

@@ -8,7 +8,8 @@ banking app - no typing. The payload is a flat TLV string (2-digit tag,
 
     00 payload format "01"
     01 point-of-initiation "12" (dynamic - amount included)
-    29 merchant account info (individual): sub-tag 00 = Bakong account id
+    29 merchant account info (individual): sub-tags 00 Bakong account id,
+       01 account information, 02 acquiring bank
     52 merchant category code
     53 currency (840 = USD - every price in this system is in dollars)
     54 amount
@@ -16,8 +17,12 @@ banking app - no typing. The payload is a flat TLV string (2-digit tag,
     59 merchant name
     60 merchant city
     62 additional data: sub-tag 01 = bill number (our order_number)
-    99 sub-tag 00 = creation timestamp in ms (KHQR-specific)
+    99 KHQR-specific timestamps in ms: sub-tag 00 creation, 01 expiry
     63 CRC-16/CCITT-FALSE over everything incl. the "6304" prefix
+
+Bakong has no server-side "generate a QR" endpoint - NBC's own SDKs assemble the
+payload locally exactly as above, and the open API is only for verification. So
+BAKONG_API_TOKEN is needed by check_bakong_payment() below, never by the builders.
 
 The MD5 of the final payload is how Bakong's open API identifies the
 transaction (check_transaction_by_md5) - both the payload and its MD5 are
@@ -75,9 +80,15 @@ def _parse_tlv(payload: str) -> list[tuple[str, str]]:
 
 
 def _build_from_template(amount: Decimal, bill_number: str) -> str:
-    """Builds a dynamic KHQR by reusing the payee routing data from a real static
-    KHQR (KHQR_STATIC_TEMPLATE - the "my QR / receive money" code from the bank's
-    app), injecting the amount and bill number.
+    """Fallback builder, used only when BAKONG_ACCOUNT_ID is unset: builds a dynamic
+    KHQR by reusing the payee routing data from a real static KHQR
+    (KHQR_STATIC_TEMPLATE - the "my QR / receive money" code from the bank's app),
+    injecting the amount and bill number.
+
+    Because it copies the bank's tags verbatim it also carries whatever proprietary
+    ones the bank added, which may route the payment over the bank's own rail rather
+    than Bakong's - in which case check_bakong_payment() will never see it and staff
+    must confirm manually. Prefer _build_from_account_id.
 
     Why this exists: a bank's static QR is often NOT a plain
     `name@bank` Bakong alias. ABA's dual-currency personal QR, for instance, puts
@@ -125,12 +136,35 @@ def _build_from_template(amount: Decimal, bill_number: str) -> str:
 
 
 def _build_from_account_id(amount: Decimal, bill_number: str) -> str:
-    """The simple case: a true Bakong account alias (`name@bank`) is all the payee
-    routing a KHQR needs, so the whole payload is built from scratch."""
+    """Builds a KHQR from scratch in the spec's "individual" shape - what NBC's own
+    SDKs emit for BakongKHQR.generateIndividual(), and the only form guaranteed to
+    route over the Bakong rail (which is what makes check_bakong_payment() below
+    able to see the transaction at all).
+
+    Tag 29 carries all three payee sub-fields the spec defines:
+        00  Bakong account id      mandatory, <=32 - `name@bank`, or for a bank
+                                   account the *bank's* id (ABA: abaakhppxxx@abaa)
+        01  account information    optional, <=32 - the account/phone number that
+                                   actually receives the money. Not optional in
+                                   practice when 00 names an institution.
+        02  acquiring bank         optional, <=32 - display name, e.g. "ABA Bank"
+
+    Tag 99 carries both timestamps in ms: sub-00 creation, sub-01 expiry. The spec
+    makes the expiry mandatory on dynamic codes, so it is always written - see
+    KHQR_EXPIRY_MINUTES."""
+    now_ms = int(time.time() * 1000)
+    expires_ms = now_ms + settings.KHQR_EXPIRY_MINUTES * 60 * 1000
+
+    account = _tlv("00", settings.BAKONG_ACCOUNT_ID[:32])
+    if settings.BAKONG_ACCOUNT_INFORMATION:
+        account += _tlv("01", settings.BAKONG_ACCOUNT_INFORMATION[:32])
+    if settings.BAKONG_ACQUIRING_BANK:
+        account += _tlv("02", settings.BAKONG_ACQUIRING_BANK[:32])
+
     payload = (
         _tlv("00", "01")
         + _tlv("01", "12")
-        + _tlv("29", _tlv("00", settings.BAKONG_ACCOUNT_ID))
+        + _tlv("29", account)
         + _tlv("52", _MERCHANT_CATEGORY_CODE)
         + _tlv("53", _CURRENCY_USD)
         + _tlv("54", f"{amount:.2f}")
@@ -138,7 +172,7 @@ def _build_from_account_id(amount: Decimal, bill_number: str) -> str:
         + _tlv("59", settings.KHQR_MERCHANT_NAME[:25])
         + _tlv("60", settings.KHQR_MERCHANT_CITY[:15])
         + _tlv("62", _tlv("01", bill_number[:25]))
-        + _tlv("99", _tlv("00", str(int(time.time() * 1000))))
+        + _tlv("99", _tlv("00", str(now_ms)) + _tlv("01", str(expires_ms)))
     )
     return payload + "6304" + _crc16_ccitt(payload + "6304")
 
@@ -146,20 +180,38 @@ def _build_from_account_id(amount: Decimal, bill_number: str) -> str:
 def build_khqr(amount: Decimal, bill_number: str) -> tuple[str, str]:
     """Builds the dynamic KHQR payload for `amount` USD and returns (payload, md5).
 
-    Uses KHQR_STATIC_TEMPLATE when set (see _build_from_template - the right choice
-    for a bank's own personal/P2P QR), otherwise BAKONG_ACCOUNT_ID. Raises
-    RuntimeError if neither is configured - callers should have checked
-    settings.khqr_configured first. `scripts/decode_khqr.py` renders either result
-    back out field-by-field, which is the quickest way to eyeball one."""
-    if settings.KHQR_STATIC_TEMPLATE:
-        payload = _build_from_template(amount, bill_number)
-    elif settings.BAKONG_ACCOUNT_ID:
+    Prefers BAKONG_ACCOUNT_ID (see _build_from_account_id - a spec-shaped KHQR that
+    routes over Bakong, so payments are confirmable), and only falls back to
+    KHQR_STATIC_TEMPLATE when no account id is set. Raises RuntimeError if neither
+    is configured - callers should have checked settings.khqr_configured first.
+    `scripts/decode_khqr.py` renders either result back out field-by-field, which is
+    the quickest way to eyeball one."""
+    if settings.BAKONG_ACCOUNT_ID:
         payload = _build_from_account_id(amount, bill_number)
+    elif settings.KHQR_STATIC_TEMPLATE:
+        payload = _build_from_template(amount, bill_number)
     else:
         raise RuntimeError(
             "KHQR is not configured (set KHQR_STATIC_TEMPLATE or BAKONG_ACCOUNT_ID)"
         )
     return payload, hashlib.md5(payload.encode("utf-8")).hexdigest()
+
+
+def khqr_expired(payload: str) -> bool:
+    """True only when `payload` carries an expiry (tag 99 sub-01) that has passed.
+
+    Anything we can't read an expiry out of - a PayWay-generated QR, one built
+    before expiries were written, a malformed string - counts as NOT expired: the
+    caller uses this to decide whether to mint a replacement, and needlessly
+    replacing a QR a customer is mid-scan on is the worse failure."""
+    try:
+        fields = dict(_parse_tlv(payload))
+        expires = dict(_parse_tlv(fields.get("99", ""))).get("01")
+        if not expires:
+            return False
+        return int(expires) < int(time.time() * 1000)
+    except (ValueError, KeyError):
+        return False
 
 
 async def check_bakong_payment(md5: str) -> bool:

@@ -231,7 +231,9 @@ app/
     orders.py
 alembic/               Migrations (env.py wired to app.models / .env)
 scripts/create_admin.py   Bootstrap script for the first admin account
-scripts/seed_catalog.py   Inserts a few sample brands/products for local testing
+scripts/seed_catalog.py   Replays scripts/seed_data.py into an empty database
+scripts/seed_data.py      GENERATED catalog fixtures (do not hand-edit)
+scripts/export_seed_data.py  Dumps a live database back out as seed_data.py
 tests/                  pytest suite (run against a real Postgres db)
 schema.sql              Reference DDL dump (informational only)
 docker-compose.yml, Dockerfile, entrypoint.sh
@@ -259,12 +261,33 @@ docker compose exec api python -m scripts.create_admin
 
 ```
 
-Optionally, seed a few sample brands/products to have something to look
-at (safe to re-run - it skips anything that already exists):
+Optionally, seed the catalog - brands, categories, products (with gallery
+images and free-with-purchase items), manuals, promotions, sets, staff users
+and customers - so there is something to look at (safe to re-run: it skips
+anything that already exists, and never overwrites an existing row):
 
 ```bash
 docker compose exec api python -m scripts.seed_catalog
 ```
+
+`scripts/` is baked into the image by `COPY . .`, so run
+`docker compose build api` first if the seed files have changed since the
+image was built - otherwise the container runs the older copy.
+
+The data comes from `scripts/seed_data.py`, which is **generated** - it's a
+snapshot of a real database rather than a hand-maintained list, so the seed
+doesn't drift away from the live catalog. To refresh it after editing products
+in the admin UI, re-export (needs `DATABASE_URL` pointing at the database you
+want to capture; run it on the host, since a script added after the image was
+built isn't inside the container):
+
+```bash
+python -m scripts.export_seed_data
+```
+
+Only catalog and account tables are exported. Orders, order items and pending
+checkouts are deliberately left out - that's transactional history, not
+fixtures.
 
 Swagger UI / ReDoc / the raw OpenAPI schema (`/docs`, `/redoc`,
 `/openapi.json`) are disabled - see [`AI_AGENT_GUIDE.md`](AI_AGENT_GUIDE.md)

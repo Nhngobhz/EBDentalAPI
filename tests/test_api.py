@@ -2180,6 +2180,16 @@ def _fast_alert_wait(monkeypatch):
     monkeypatch.setattr("app.services.telegram._QUOTATION_PDF_WAIT_SECONDS", 0.01)
 
 
+def _async_return(value):
+    """Stub for an awaited collaborator (the Bakong check, a Telegram send). Written as a
+    real coroutine function rather than a lambda so it can stand in for one."""
+
+    async def _stub(*args, **kwargs):
+        return value
+
+    return _stub
+
+
 def test_staff_order_is_stored_as_quote(client, db_session, monkeypatch):
     _fast_alert_wait(monkeypatch)
     make_admin(db_session, email="quotestaff@example.com", password="password123")
@@ -2244,6 +2254,8 @@ def _configure_bakong(monkeypatch, account_id="testmerchant@devb"):
     monkeypatch.setattr(settings, "PAYWAY_API_KEY", "")
     monkeypatch.setattr(settings, "KHQR_STATIC_TEMPLATE", "")
     monkeypatch.setattr(settings, "BAKONG_ACCOUNT_ID", account_id)
+    monkeypatch.setattr(settings, "BAKONG_ACCOUNT_INFORMATION", "")
+    monkeypatch.setattr(settings, "BAKONG_ACQUIRING_BANK", "")
 
 
 def test_khqr_unavailable_when_not_configured(client, db_session, monkeypatch):
@@ -2256,14 +2268,37 @@ def test_khqr_unavailable_when_not_configured(client, db_session, monkeypatch):
     cust_headers = customer_auth_header(client, "noqrcust@example.com", "customerpass1")
 
     resp = client.post(
-        "/orders/", json=_order_payload(product["id"], payment_method="khqr"), headers=cust_headers
+        "/orders/checkout", json=_order_payload(product["id"], payment_method="khqr"),
+        headers=cust_headers,
     )
     assert resp.status_code == 400
     assert "not available" in resp.json()["detail"]
 
 
-def test_customer_khqr_order_generates_payload(client, db_session, monkeypatch):
-    import hashlib
+def test_orders_endpoint_refuses_khqr_and_creates_nothing(client, db_session, monkeypatch):
+    """POST /orders/ makes documents, not purchases. Routing a pay-by-QR order through it
+    would write exactly the unpaid order this design exists to prevent."""
+    _configure_bakong(monkeypatch)
+    make_admin(db_session, email="nokhqrpost@example.com", password="password123")
+    admin_headers = auth_header(client, "nokhqrpost@example.com", "password123")
+    product = _make_order_product(client, admin_headers, name="NoPostWidget")
+
+    make_customer(db_session, email="nokhqrcust@example.com", password="customerpass1", access_permission=True)
+    cust_headers = customer_auth_header(client, "nokhqrcust@example.com", "customerpass1")
+
+    before = len(client.get("/orders/", headers=admin_headers).json())
+    resp = client.post(
+        "/orders/", json=_order_payload(product["id"], payment_method="khqr"), headers=cust_headers
+    )
+    assert resp.status_code == 400
+    assert "checkout" in resp.json()["detail"]
+    assert len(client.get("/orders/", headers=admin_headers).json()) == before
+
+
+def test_customer_khqr_checkout_creates_no_order(client, db_session, monkeypatch):
+    """The core rule: pressing Confirm Purchase with KHQR issues a QR and NOTHING else.
+    No order, no order items, nothing in the customer's own order list."""
+    from decimal import Decimal
 
     from app.services.khqr import _crc16_ccitt
 
@@ -2275,28 +2310,37 @@ def test_customer_khqr_order_generates_payload(client, db_session, monkeypatch):
     make_customer(db_session, email="qrcust@example.com", password="customerpass1", access_permission=True)
     cust_headers = customer_auth_header(client, "qrcust@example.com", "customerpass1")
 
+    orders_before = len(client.get("/orders/", headers=admin_headers).json())
     resp = client.post(
-        "/orders/", json=_order_payload(product["id"], payment_method="khqr"), headers=cust_headers
+        "/orders/checkout", json=_order_payload(product["id"], payment_method="khqr"),
+        headers=cust_headers,
     )
     assert resp.status_code == 201, resp.text
-    body = resp.json()
-    assert body["order_type"] == "order"
-    assert body["payment_method"] == "khqr"
-    assert body["payment_status"] == "unpaid"
+    checkout = resp.json()
 
-    payload = body["khqr_string"]
+    # A checkout is NOT an order - it has no order number, no items, no payment status.
+    assert set(checkout) == {"id", "reference", "grand_total", "khqr_string", "expires_at"}
+    assert Decimal(checkout["grand_total"]) == Decimal("150.00")
+
+    payload = checkout["khqr_string"]
     assert payload.startswith("000201")  # tag 00, len 02, version "01"
     assert "testmerchant@devb" in payload
     assert "5303840" in payload  # currency tag: USD
     assert "5406150.00" in payload  # amount tag: 2 x $75.00
-    assert body["order_number"] in payload  # bill number carries the order number
-    # CRC integrity: the last 4 chars must be the CRC of everything before them.
+    assert checkout["reference"] in payload  # bill number carries the checkout reference
     assert payload[-8:-4] == "6304"
     assert payload[-4:] == _crc16_ccitt(payload[:-4])
-    assert body["khqr_md5"] == hashlib.md5(payload.encode()).hexdigest()
+
+    # Nothing was written: not for staff, and not in the customer's own history.
+    assert len(client.get("/orders/", headers=admin_headers).json()) == orders_before
+    assert client.get("/orders/mine", headers=cust_headers).json() == []
 
 
-def test_khqr_payment_status_poll_and_manual_mark_paid(client, db_session, monkeypatch):
+def test_checkout_becomes_an_order_only_once_paid(client, db_session, monkeypatch):
+    """The order is created by the payment, not by the checkout - and exactly once, no
+    matter how many times the browser polls."""
+    from decimal import Decimal
+
     _fast_alert_wait(monkeypatch)
     _configure_bakong(monkeypatch)
     make_admin(db_session, email="payadmin@example.com", password="password123")
@@ -2306,33 +2350,176 @@ def test_khqr_payment_status_poll_and_manual_mark_paid(client, db_session, monke
     make_customer(db_session, email="paycust@example.com", password="customerpass1", access_permission=True)
     cust_headers = customer_auth_header(client, "paycust@example.com", "customerpass1")
 
-    order = client.post(
-        "/orders/", json=_order_payload(product["id"], payment_method="khqr"), headers=cust_headers
+    checkout = client.post(
+        "/orders/checkout", json=_order_payload(product["id"], payment_method="khqr"),
+        headers=cust_headers,
     ).json()
 
-    # No Bakong token configured -> the poll can't auto-confirm; stays unpaid.
-    resp = client.get(f"/orders/{order['id']}/payment-status", headers=cust_headers)
+    # Unpaid: the poll reports it and still writes nothing.
+    resp = client.get(f"/orders/checkout/{checkout['id']}/payment-status", headers=cust_headers)
     assert resp.status_code == 200
-    assert resp.json() == {"payment_status": "unpaid"}
+    assert resp.json() == {"payment_status": "unpaid", "order": None}
+    assert client.get("/orders/mine", headers=cust_headers).json() == []
 
-    # Someone else's account can't poll it.
+    # Someone else's account can't poll it, and gets a 404 rather than a 403 so it can't
+    # be used to discover which checkouts exist.
     make_customer(db_session, email="otherpay@example.com", password="customerpass1", access_permission=True)
     other_headers = customer_auth_header(client, "otherpay@example.com", "customerpass1")
-    resp = client.get(f"/orders/{order['id']}/payment-status", headers=other_headers)
-    assert resp.status_code == 403
+    resp = client.get(f"/orders/checkout/{checkout['id']}/payment-status", headers=other_headers)
+    assert resp.status_code == 404
 
-    # Staff manually mark it paid (the no-Bakong-token fallback) - paid_at gets stamped.
-    resp = client.put(
-        f"/orders/{order['id']}", json={"payment_status": "paid"}, headers=admin_headers
-    )
+    # The payment lands.
+    monkeypatch.setattr("app.routers.orders.check_bakong_payment", _async_return(True))
+    resp = client.get(f"/orders/checkout/{checkout['id']}/payment-status", headers=cust_headers)
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["payment_status"] == "paid"
-    assert body["paid_at"] is not None
 
-    # The customer's poll now sees it.
-    resp = client.get(f"/orders/{order['id']}/payment-status", headers=cust_headers)
-    assert resp.json() == {"payment_status": "paid"}
+    order = body["order"]
+    assert order["order_type"] == "order"
+    assert order["payment_method"] == "khqr"
+    assert order["payment_status"] == "paid"
+    assert order["paid_at"] is not None
+    # The order carries the reference the bank knows the payment by - order_number only
+    # came into being just now, so it is not what the payment was made against.
+    assert order["payment_reference"] == checkout["reference"]
+    assert order["khqr_string"] == checkout["khqr_string"]
+    assert [i["product_name"] for i in order["items"]] == ["PayWidget"]
+    assert Decimal(order["grand_total"]) == Decimal(checkout["grand_total"])
+
+    # It exists exactly once, and polling again returns the same order rather than
+    # making a second one for the same payment.
+    assert [o["id"] for o in client.get("/orders/mine", headers=cust_headers).json()] == [order["id"]]
+    again = client.get(f"/orders/checkout/{checkout['id']}/payment-status", headers=cust_headers).json()
+    assert again["payment_status"] == "paid"
+    assert again["order"]["id"] == order["id"]
+    assert len(client.get("/orders/mine", headers=cust_headers).json()) == 1
+
+
+def test_staff_see_outstanding_checkouts_and_can_confirm_one(client, db_session, monkeypatch):
+    """The back-office safety net: when automatic confirmation can't see a payment that
+    plainly landed, staff must be able to find the attempt and turn it into an order.
+    Without this a failed auto-confirm means money received against nothing visible."""
+    from decimal import Decimal
+
+    _fast_alert_wait(monkeypatch)
+    _configure_bakong(monkeypatch)
+    make_admin(db_session, email="recadmin@example.com", password="password123")
+    admin_headers = auth_header(client, "recadmin@example.com", "password123")
+    product = _make_order_product(client, admin_headers, name="RecWidget", price="40.00")
+
+    make_customer(db_session, email="reccust@example.com", password="customerpass1", access_permission=True)
+    cust_headers = customer_auth_header(client, "reccust@example.com", "customerpass1")
+
+    checkout = client.post(
+        "/orders/checkout", json=_order_payload(product["id"], payment_method="khqr"),
+        headers=cust_headers,
+    ).json()
+
+    # Staff can see it, with enough detail to match against a bank statement.
+    listing = client.get("/orders/checkouts", headers=admin_headers).json()
+    assert [c["id"] for c in listing] == [checkout["id"]]
+    row = listing[0]
+    assert row["reference"] == checkout["reference"]
+    assert Decimal(row["grand_total"]) == Decimal("80.00")
+    assert row["is_expired"] is False
+    assert [(i["product_name"], i["qty"]) for i in row["items"]] == [("RecWidget", 2)]
+
+    # A customer must not be able to read the back-office list. 401 rather than 403:
+    # a customer token isn't a staff user at all, so it fails authentication before
+    # price_listing is ever considered.
+    assert client.get("/orders/checkouts", headers=cust_headers).status_code == 401
+
+    # Staff confirm the payment by hand - the order is written, exactly as the automatic
+    # path would have written it, and recorded against the staff member who vouched.
+    resp = client.post(f"/orders/checkout/{checkout['id']}/confirm", headers=admin_headers)
+    assert resp.status_code == 200, resp.text
+    order = resp.json()
+    assert order["payment_status"] == "paid"
+    assert order["payment_reference"] == checkout["reference"]
+    # UserMini deliberately carries no email - the name is what an admin screen needs.
+    assert order["updated_by"]["user_name"] == "Admin User"
+    assert [i["product_name"] for i in order["items"]] == ["RecWidget"]
+
+    # It leaves the outstanding list, and the customer now has exactly one order.
+    assert client.get("/orders/checkouts", headers=admin_headers).json() == []
+    assert len(client.get("/orders/mine", headers=cust_headers).json()) == 1
+
+    # Confirming again is idempotent - no second order for one payment.
+    again = client.post(f"/orders/checkout/{checkout['id']}/confirm", headers=admin_headers)
+    assert again.status_code == 200
+    assert again.json()["id"] == order["id"]
+    assert len(client.get("/orders/mine", headers=cust_headers).json()) == 1
+
+
+def test_expired_checkout_reports_expired(client, db_session, monkeypatch):
+    """Once the QR's own expiry passes unpaid the code is dead, and the browser is told
+    so instead of polling forever."""
+    from app.models import PendingCheckout
+
+    _configure_bakong(monkeypatch)
+    make_admin(db_session, email="expadmin@example.com", password="password123")
+    admin_headers = auth_header(client, "expadmin@example.com", "password123")
+    product = _make_order_product(client, admin_headers, name="ExpWidget")
+
+    make_customer(db_session, email="expcust@example.com", password="customerpass1", access_permission=True)
+    cust_headers = customer_auth_header(client, "expcust@example.com", "customerpass1")
+
+    checkout = client.post(
+        "/orders/checkout", json=_order_payload(product["id"], payment_method="khqr"),
+        headers=cust_headers,
+    ).json()
+
+    row = db_session.query(PendingCheckout).filter_by(id=checkout["id"]).first()
+    row.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    db_session.commit()
+
+    resp = client.get(f"/orders/checkout/{checkout['id']}/payment-status", headers=cust_headers)
+    assert resp.json() == {"payment_status": "expired", "order": None}
+    assert client.get("/orders/mine", headers=cust_headers).json() == []
+
+
+def test_sweep_creates_the_order_when_the_browser_never_saw_the_payment(
+    client, db_session, monkeypatch
+):
+    """The reason the sweep exists: a customer who pays and closes the tab must still end
+    up with an order, or the money is received against nothing at all."""
+    import asyncio
+
+    from app.models import PendingCheckout
+    from app.services import checkout_sweep
+
+    _fast_alert_wait(monkeypatch)
+    _configure_bakong(monkeypatch)
+    make_admin(db_session, email="sweepadmin@example.com", password="password123")
+    admin_headers = auth_header(client, "sweepadmin@example.com", "password123")
+    product = _make_order_product(client, admin_headers, name="SweepWidget")
+
+    make_customer(db_session, email="sweepcust@example.com", password="customerpass1", access_permission=True)
+    cust_headers = customer_auth_header(client, "sweepcust@example.com", "customerpass1")
+
+    checkout = client.post(
+        "/orders/checkout", json=_order_payload(product["id"], payment_method="khqr"),
+        headers=cust_headers,
+    ).json()
+    assert client.get("/orders/mine", headers=cust_headers).json() == []
+
+    # The customer pays; nobody is polling.
+    monkeypatch.setattr("app.routers.orders.check_bakong_payment", _async_return(True))
+    # _reconcile_once imports this at call time (import cycle), so the module attribute
+    # is what has to be replaced, not a name bound inside checkout_sweep.
+    monkeypatch.setattr("app.services.telegram.deliver_order_alert", _async_return(None))
+    asyncio.run(checkout_sweep._reconcile_once())
+
+    mine = client.get("/orders/mine", headers=cust_headers).json()
+    assert len(mine) == 1
+    assert mine[0]["payment_status"] == "paid"
+    assert mine[0]["payment_reference"] == checkout["reference"]
+
+    # And the pending row is linked, so a later poll or sweep can't duplicate it.
+    row = db_session.query(PendingCheckout).filter_by(id=checkout["id"]).first()
+    db_session.refresh(row)
+    assert row.order_id == mine[0]["id"]
 
 
 def test_khqr_built_from_a_bank_static_qr_template(monkeypatch):
@@ -2377,6 +2564,87 @@ def test_khqr_built_from_a_bank_static_qr_template(monkeypatch):
     import hashlib
 
     assert md5 == hashlib.md5(payload.encode()).hexdigest()
+
+
+def test_khqr_individual_carries_all_three_payee_sub_fields(monkeypatch):
+    """A bank account (as opposed to a Bakong wallet alias) is only identified by
+    tag 29 as a whole: sub-00 names the bank, sub-01 the account number. Dropping
+    sub-01 would produce a QR that routes to ABA and nobody in particular."""
+    from decimal import Decimal
+
+    from app.config import settings
+    from app.services.khqr import _parse_tlv, build_khqr
+
+    monkeypatch.setattr(settings, "KHQR_STATIC_TEMPLATE", "irrelevant-when-account-id-set")
+    monkeypatch.setattr(settings, "BAKONG_ACCOUNT_ID", "abaakhppxxx@abaa")
+    monkeypatch.setattr(settings, "BAKONG_ACCOUNT_INFORMATION", "004613623")
+    monkeypatch.setattr(settings, "BAKONG_ACQUIRING_BANK", "ABA Bank")
+
+    payload, _ = build_khqr(Decimal("12.50"), bill_number="000123")
+    fields = dict(_parse_tlv(payload))
+
+    # BAKONG_ACCOUNT_ID wins over a template that's also set.
+    assert dict(_parse_tlv(fields["29"])) == {
+        "00": "abaakhppxxx@abaa",
+        "01": "004613623",
+        "02": "ABA Bank",
+    }
+    # Nothing outside the spec's own tags - notably no proprietary tag 40, which is
+    # what the static-template path would have copied in from ABA's QR.
+    assert set(fields) == {"00", "01", "29", "52", "53", "54", "58", "59", "60", "62", "99", "63"}
+    assert fields["01"] == "12"  # dynamic
+    assert fields["54"] == "12.50"
+    assert fields["59"] == "EB DENTAL"  # our own name, not the bank's copy
+
+    # Tag 99 carries creation + expiry in ms; the spec makes expiry mandatory here.
+    stamps = dict(_parse_tlv(fields["99"]))
+    assert len(stamps["00"]) == 13 and len(stamps["01"]) == 13
+    gap_minutes = (int(stamps["01"]) - int(stamps["00"])) / 60000
+    assert gap_minutes == settings.KHQR_EXPIRY_MINUTES
+
+
+def test_khqr_expired_reads_the_payloads_own_expiry(monkeypatch):
+    """POST /orders/{id}/khqr reuses a stored QR rather than minting one, which would
+    strand an order on a code every wallet refuses once its expiry passed. Anything
+    with no readable expiry (PayWay QRs, pre-expiry rows) must read as still-valid."""
+    from decimal import Decimal
+
+    from app.config import settings
+    from app.services.khqr import build_khqr, khqr_expired
+
+    monkeypatch.setattr(settings, "KHQR_STATIC_TEMPLATE", "")
+    monkeypatch.setattr(settings, "BAKONG_ACCOUNT_ID", "john_smith@devb")
+    monkeypatch.setattr(settings, "BAKONG_ACCOUNT_INFORMATION", "")
+    monkeypatch.setattr(settings, "BAKONG_ACQUIRING_BANK", "")
+
+    fresh, _ = build_khqr(Decimal("1.00"), bill_number="000001")
+    assert not khqr_expired(fresh)
+
+    monkeypatch.setattr(settings, "KHQR_EXPIRY_MINUTES", -1)
+    stale, _ = build_khqr(Decimal("1.00"), bill_number="000002")
+    assert khqr_expired(stale)
+
+    # No tag 99 at all, and outright junk - both "not expired", never a false replace.
+    assert not khqr_expired("00020101021158021KH")
+    assert not khqr_expired("FAKEQR|1.00|000003")
+
+
+def test_khqr_omits_payee_sub_fields_that_are_not_configured(monkeypatch):
+    """A plain `name@bank` wallet alias needs no account number or bank name, and
+    empty TLVs would be malformed rather than merely redundant."""
+    from decimal import Decimal
+
+    from app.config import settings
+    from app.services.khqr import _parse_tlv, build_khqr
+
+    monkeypatch.setattr(settings, "KHQR_STATIC_TEMPLATE", "")
+    monkeypatch.setattr(settings, "BAKONG_ACCOUNT_ID", "john_smith@devb")
+    monkeypatch.setattr(settings, "BAKONG_ACCOUNT_INFORMATION", "")
+    monkeypatch.setattr(settings, "BAKONG_ACQUIRING_BANK", "")
+
+    payload, _ = build_khqr(Decimal("1.00"), bill_number="000001")
+    fields = dict(_parse_tlv(payload))
+    assert dict(_parse_tlv(fields["29"])) == {"00": "john_smith@devb"}
 
 
 def test_khqr_template_rejects_a_non_khqr_string(monkeypatch):
@@ -2506,7 +2774,7 @@ def _configure_payway(monkeypatch):
     monkeypatch.setattr(settings, "BAKONG_ACCOUNT_ID", "")
 
 
-def test_customer_khqr_order_via_payway(client, db_session, monkeypatch):
+def test_customer_khqr_checkout_via_payway(client, db_session, monkeypatch):
     _configure_payway(monkeypatch)
     # The real call would hit ABA's gateway - stub the service at its use site.
     monkeypatch.setattr(
@@ -2521,16 +2789,14 @@ def test_customer_khqr_order_via_payway(client, db_session, monkeypatch):
     cust_headers = customer_auth_header(client, "pwcust1@example.com", "customerpass1")
 
     resp = client.post(
-        "/orders/", json=_order_payload(product["id"], payment_method="khqr"), headers=cust_headers
+        "/orders/checkout", json=_order_payload(product["id"], payment_method="khqr"),
+        headers=cust_headers,
     )
     assert resp.status_code == 201, resp.text
-    body = resp.json()
-    assert body["order_type"] == "order"
-    assert body["payment_status"] == "unpaid"
-    assert body["khqr_string"] == f"FAKEQR|120.00|{body['order_number']}"
-    # PayWay orders keep khqr_md5 empty - that's how payment checks know to go by
-    # tran_id instead of Bakong md5.
-    assert body["khqr_md5"] is None
+    checkout = resp.json()
+    # PayWay is issued against the checkout reference - there is no order number yet.
+    assert checkout["khqr_string"] == f"FAKEQR|120.00|{checkout['reference']}"
+    assert client.get("/orders/mine", headers=cust_headers).json() == []
 
 
 def test_payway_failure_degrades_to_choose_cash(client, db_session, monkeypatch):
@@ -2550,13 +2816,14 @@ def test_payway_failure_degrades_to_choose_cash(client, db_session, monkeypatch)
     cust_headers = customer_auth_header(client, "pwcust2@example.com", "customerpass1")
 
     resp = client.post(
-        "/orders/", json=_order_payload(product["id"], payment_method="khqr"), headers=cust_headers
+        "/orders/checkout", json=_order_payload(product["id"], payment_method="khqr"),
+        headers=cust_headers,
     )
     assert resp.status_code == 400
     assert "choose Cash" in resp.json()["detail"]
 
 
-def test_payway_payment_status_poll_flips_to_paid(client, db_session, monkeypatch):
+def test_payway_checkout_poll_creates_the_order(client, db_session, monkeypatch):
     _fast_alert_wait(monkeypatch)
     _configure_payway(monkeypatch)
     monkeypatch.setattr(
@@ -2569,29 +2836,34 @@ def test_payway_payment_status_poll_flips_to_paid(client, db_session, monkeypatc
     make_customer(db_session, email="pwcust3@example.com", password="customerpass1", access_permission=True)
     cust_headers = customer_auth_header(client, "pwcust3@example.com", "customerpass1")
 
-    order = client.post(
-        "/orders/", json=_order_payload(product["id"], payment_method="khqr"), headers=cust_headers
+    checkout = client.post(
+        "/orders/checkout", json=_order_payload(product["id"], payment_method="khqr"),
+        headers=cust_headers,
     ).json()
 
     async def _not_paid(tran_id):
         return False
 
     async def _paid(tran_id):
-        assert tran_id == order["order_number"]  # checked by tran_id, not md5
+        # A PayWay checkout stores no md5, which is what routes it here - and it is
+        # checked by the checkout's reference, since no order number exists yet.
+        assert tran_id == checkout["reference"]
         return True
 
     monkeypatch.setattr("app.routers.orders.check_payway_payment", _not_paid)
-    resp = client.get(f"/orders/{order['id']}/payment-status", headers=cust_headers)
-    assert resp.json() == {"payment_status": "unpaid"}
+    resp = client.get(f"/orders/checkout/{checkout['id']}/payment-status", headers=cust_headers)
+    assert resp.json() == {"payment_status": "unpaid", "order": None}
 
     monkeypatch.setattr("app.routers.orders.check_payway_payment", _paid)
-    resp = client.get(f"/orders/{order['id']}/payment-status", headers=cust_headers)
-    assert resp.json() == {"payment_status": "paid"}
+    resp = client.get(f"/orders/checkout/{checkout['id']}/payment-status", headers=cust_headers)
+    body = resp.json()
+    assert body["payment_status"] == "paid"
 
-    # Paid state is persisted, not just reported.
-    resp = client.get(f"/orders/{order['id']}", headers=admin_headers)
+    # The order exists now, and is persisted paid rather than merely reported so.
+    resp = client.get(f"/orders/{body['order']['id']}", headers=admin_headers)
     assert resp.json()["payment_status"] == "paid"
     assert resp.json()["paid_at"] is not None
+    assert resp.json()["khqr_md5"] is None
 
 
 def test_payment_status_poll_rejected_on_non_khqr_rows(client, db_session, monkeypatch):
@@ -2865,9 +3137,12 @@ def test_any_order_can_be_marked_paid(client, db_session, monkeypatch):
     assert body["order_type"] == "quote"
 
 
-def test_a_paid_order_is_frozen(client, db_session, monkeypatch):
-    """Nothing about a paid order can change, and it cannot be deleted - a receipt has
-    been issued against those exact figures."""
+def test_a_paid_order_stays_editable(client, db_session, monkeypatch):
+    """Paid orders are editable and deletable (changed 2026-08-11 - _reject_if_paid is
+    now a no-op). This used to 409 on the reasoning that a receipt had been issued
+    against those exact figures; staff needing to correct a real order after taking
+    payment won out. The customer's already-printed receipt will not match afterwards -
+    updated_by is the only record that an amendment happened."""
     _fast_alert_wait(monkeypatch)
     make_admin(db_session, email="frozen@example.com", password="password123")
     headers = auth_header(client, "frozen@example.com", "password123")
@@ -2877,21 +3152,27 @@ def test_a_paid_order_is_frozen(client, db_session, monkeypatch):
     client.put(f"/orders/{order['id']}", json={"payment_status": "paid"}, headers=headers)
 
     for payload in (
-        {"clinic_name": "Should Not Apply"},
+        {"clinic_name": "Now It Applies"},
         {"status": "delivered"},
-        {"payment_status": "unpaid"},
         {"discount_type": "cash", "discount_value": 5},
         {"items": [{"product_id": product["id"], "qty": 9}]},
     ):
         resp = client.put(f"/orders/{order['id']}", json=payload, headers=headers)
-        assert resp.status_code == 409, f"{payload} -> {resp.status_code}"
-
-    assert client.delete(f"/orders/{order['id']}", headers=headers).status_code == 409
+        assert resp.status_code == 200, f"{payload} -> {resp.status_code} {resp.text}"
 
     body = client.get(f"/orders/{order['id']}", headers=headers).json()
-    assert body["clinic_name"] == "Test Clinic"
-    assert body["status"] == "pending"
-    assert body["grand_total"] == "200.00"
+    assert body["clinic_name"] == "Now It Applies"
+    assert body["status"] == "delivered"
+    assert body["grand_total"] == "895.00"  # 9 x 100 re-priced, less the $5 cash discount
+    # The edit is attributed, which is the whole audit trail a paid-order amendment has.
+    assert body["updated_by"]["user_name"] == "Admin User"
+
+    # Payment can also be reversed now, and the row deleted outright.
+    assert client.put(
+        f"/orders/{order['id']}", json={"payment_status": "unpaid"}, headers=headers
+    ).status_code == 200
+    assert client.delete(f"/orders/{order['id']}", headers=headers).status_code == 204
+    assert client.get(f"/orders/{order['id']}", headers=headers).status_code == 404
 
 
 def test_staff_can_issue_a_khqr_for_an_existing_order(client, db_session, monkeypatch):
@@ -2937,8 +3218,11 @@ def test_staff_can_issue_a_khqr_for_an_existing_order(client, db_session, monkey
 
 
 def test_staff_can_poll_any_orders_payment_status(client, db_session, monkeypatch):
-    """Staff issue the QR from the admin page, so they have to be able to watch that
-    same order settle - even one a customer placed."""
+    """Staff issue the QR from the admin page against an order that already exists, so
+    they have to be able to watch that same order settle - even one a customer placed.
+
+    This is now the ONLY way an order sits unpaid with a QR on it: a customer's own
+    pay-by-QR purchase never creates an order until the money has arrived."""
     _fast_alert_wait(monkeypatch)
     _configure_bakong(monkeypatch)
     make_admin(db_session, email="pollstaff@example.com", password="password123")
@@ -2947,14 +3231,39 @@ def test_staff_can_poll_any_orders_payment_status(client, db_session, monkeypatc
 
     make_customer(db_session, email="pollcust@example.com", password="customerpass1", access_permission=True)
     cust_headers = customer_auth_header(client, "pollcust@example.com", "customerpass1")
+    # A cash checkout IS an order (a quote) - payment happens offline, so there's a
+    # document from the start. Staff then put a QR on it to take the money now.
     order = client.post(
-        "/orders/", json=_order_payload(product["id"], payment_method="khqr"), headers=cust_headers
+        "/orders/", json=_order_payload(product["id"], payment_method="cash"), headers=cust_headers
     ).json()
+    order = client.post(f"/orders/{order['id']}/khqr", headers=admin_headers).json()
+    assert order["payment_status"] == "unpaid"
 
     # Staff didn't place it, but price_listing already reads the whole order.
     resp = client.get(f"/orders/{order['id']}/payment-status", headers=admin_headers)
     assert resp.status_code == 200
     assert resp.json() == {"payment_status": "unpaid"}
+
+
+def test_staff_can_poll_a_customers_checkout(client, db_session, monkeypatch):
+    """The counter case for the new flow: a customer is paying by QR in front of staff,
+    and staff need to see it settle. price_listing already reads any order, so this
+    exposes nothing new - but it must not 404 the way another customer does."""
+    _configure_bakong(monkeypatch)
+    make_admin(db_session, email="pollstaff2@example.com", password="password123")
+    admin_headers = auth_header(client, "pollstaff2@example.com", "password123")
+    product = _make_order_product(client, admin_headers, name="PollWidget2")
+
+    make_customer(db_session, email="pollcust2@example.com", password="customerpass1", access_permission=True)
+    cust_headers = customer_auth_header(client, "pollcust2@example.com", "customerpass1")
+    checkout = client.post(
+        "/orders/checkout", json=_order_payload(product["id"], payment_method="khqr"),
+        headers=cust_headers,
+    ).json()
+
+    resp = client.get(f"/orders/checkout/{checkout['id']}/payment-status", headers=admin_headers)
+    assert resp.status_code == 200
+    assert resp.json() == {"payment_status": "unpaid", "order": None}
 
 
 def test_editing_an_order_rejects_a_blank_required_field(client, db_session, monkeypatch):

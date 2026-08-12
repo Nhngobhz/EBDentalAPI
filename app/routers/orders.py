@@ -27,7 +27,7 @@ calling must also meet the same "can place an order" bar the frontend enforces b
 even showing the quote-cart UI: staff need price_listing or product_management,
 customers need access_permission. This is enforced here too, not just hidden in the UI.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import jwt
@@ -42,14 +42,31 @@ from app.core.files import ALLOWED_PDF_TYPES
 from app.core.security import decode_access_token
 from app.core.query import Limit, Skip
 from app.database import get_db
-from app.models import Customer, Order, OrderItem, Product, Promotion, Set, User
-from app.schemas import OrderCreate, OrderOut, OrderUpdate
-from app.services.khqr import build_khqr, check_bakong_payment
+from app.models import (
+    Customer,
+    Order,
+    OrderItem,
+    PendingCheckout,
+    Product,
+    Promotion,
+    Set,
+    User,
+)
+from app.schemas import (
+    CheckoutOut,
+    CheckoutStatusOut,
+    OrderCreate,
+    OrderOut,
+    OrderUpdate,
+    PendingCheckoutLineOut,
+    PendingCheckoutOut,
+)
+from app.services.khqr import build_khqr, check_bakong_payment, khqr_expired
 from app.services.payway import PayWayError, check_payway_payment, create_payway_khqr
 from app.services.telegram import (
     deliver_order_alert,
     resolve_pending_quotation_pdf,
-    send_khqr_pending_alert,
+    send_khqr_pending_alert_for_checkout,
 )
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
@@ -339,18 +356,21 @@ def _compute_discount(
 
 
 def _reject_if_paid(order: Order) -> None:
-    """A paid order is frozen - no edits, no deletion, by anyone.
+    """No-op since 2026-08-11: staff can edit and delete an order after it is paid.
 
-    Once payment is recorded a receipt exists for those exact numbers (and a paid-order
-    Telegram alert carrying it has gone out), so the row has stopped being a working
-    document and become the record of a completed sale. Enforced here rather than only
-    in the admin UI, because hiding a button is not a rule.
+    This used to hard-freeze a paid order (409 on every PUT and DELETE), on the
+    reasoning that a receipt had been issued against those exact numbers and the row had
+    stopped being a working document. That was overridden deliberately - in practice
+    staff need to correct a real order after taking payment, and being unable to do so
+    without a database session was worse than the risk it guarded against.
+
+    Kept as a named seam rather than deleting the calls, so the rule has one place to
+    come back to if it is ever wanted again (and so the call sites still document where
+    it applied). `updated_by_user_id`/`updated_at` record who changed a paid order, which
+    is now the only trail of an amendment to a completed sale - the printed receipt the
+    customer already holds will not match a later edit.
     """
-    if order.payment_status == "paid":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This order has been paid - it can no longer be edited or deleted.",
-        )
+    return None
 
 
 def _generate_quote_code(db: Session) -> str:
@@ -367,6 +387,424 @@ def _generate_quote_code(db: Session) -> str:
         suffix += 1
         code = f"{base}-{suffix}"
     return code
+
+
+# Every column of a line that gets snapshotted into a PendingCheckout. Deliberately
+# the OrderItem fields _build_order_lines fills in and nothing else: id/order_id/
+# parent_item_id are all assigned by the database when the order is finally written.
+_SNAPSHOT_LINE_FIELDS = (
+    "product_id",
+    "promotion_id",
+    "set_id",
+    "product_name",
+    "product_code",
+    "uom",
+    "unit_price",
+    "list_price",
+    "discount_type",
+    "discount",
+    "qty",
+    "line_amount",
+)
+
+
+def _snapshot_lines(items: list[OrderItem]) -> list[dict]:
+    """Freezes freshly-built (still session-less) OrderItem objects into plain JSON.
+
+    Components are nested under their parent rather than flattened, because that is the
+    shape _restore_lines has to hand back to SQLAlchemy for parent_item_id to be filled
+    in. Decimals become strings - JSON has only floats, and money must not round-trip
+    through one."""
+    # _build_order_lines returns a FLAT list containing both paid lines and the $0
+    # component lines, with each component also reachable through its parent. Identity,
+    # not a .parent lookup, is what tells them apart here: these objects have no
+    # database identity yet, so this can't lean on anything SQLAlchemy fills in later.
+    components = {id(c) for item in items for c in item.components}
+    snapshot = []
+    for item in items:
+        if id(item) in components:
+            continue
+        row = {f: getattr(item, f) for f in _SNAPSHOT_LINE_FIELDS}
+        row = {k: (str(v) if isinstance(v, Decimal) else v) for k, v in row.items()}
+        row["components"] = [
+            {
+                k: (str(v) if isinstance(v, Decimal) else v)
+                for k, v in ((f, getattr(c, f)) for f in _SNAPSHOT_LINE_FIELDS)
+            }
+            for c in item.components
+        ]
+        snapshot.append(row)
+    return snapshot
+
+
+def _restore_lines(snapshot: list[dict]) -> list[OrderItem]:
+    """The inverse of _snapshot_lines: JSON back into OrderItem rows ready to attach to
+    an Order, in the same parent-then-components order add_line produced, so the printed
+    document reads the same as it would have at checkout time."""
+
+    def build(row: dict) -> OrderItem:
+        return OrderItem(
+            **{
+                f: (Decimal(row[f]) if f in _DECIMAL_LINE_FIELDS else row[f])
+                for f in _SNAPSHOT_LINE_FIELDS
+            }
+        )
+
+    items: list[OrderItem] = []
+    for row in snapshot:
+        parent = build(row)
+        components = [build(c) for c in row["components"]]
+        parent.components = components
+        items.append(parent)
+        items.extend(components)
+    return items
+
+
+_DECIMAL_LINE_FIELDS = {"unit_price", "list_price", "discount", "line_amount"}
+
+
+def _next_checkout_reference(db: Session) -> str:
+    """The handle a KHQR payment is identified by at the bank - the QR's bill number and
+    PayWay's tran_id. Same readable yymmddhhmmss shape as quote_code (and the same
+    same-second suffix), because at checkout time there is no order and therefore no
+    order_number to use: that only gets assigned once the payment lands."""
+    base = datetime.now(timezone.utc).strftime("%y%m%d%H%M%S")
+    reference = base
+    suffix = 1
+    while db.query(PendingCheckout).filter(PendingCheckout.reference == reference).first():
+        suffix += 1
+        reference = f"{base}-{suffix}"
+    return reference
+
+
+def _price_order(db: Session, payload: OrderCreate, user: User | None):
+    """Shared pricing for both a quote and a KHQR checkout: builds the lines, applies the
+    order-level discount and returns (items, subtotal, discount_amount, grand_total).
+
+    Kept in one place so a checkout is priced by exactly the rules an order is - the QR
+    commits a customer to a number, and that number has to be the one the eventual order
+    is written with."""
+    # Any order-level discount (percent or cash) is a real reduction handed out at staff
+    # discretion - gated to product_management specifically. A customer, or a
+    # price_listing-only staffer, can still place an order, just not apply a discount to
+    # it. Mirrors the quote drawer's UI, which only renders the discount control at all
+    # for product_management staff.
+    if payload.discount_value > 0:
+        if user is None or not user.product_management:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="A discount requires the 'product_management' permission",
+            )
+
+    items, subtotal, discountable_subtotal = _build_order_lines(db, payload.items)
+    discount_amount = _compute_discount(
+        payload.discount_type, payload.discount_value, discountable_subtotal
+    )
+    grand_total = max(Decimal("0"), subtotal - discount_amount)
+    return items, subtotal, discount_amount, grand_total
+
+
+def _materialize_checkout(
+    db: Session, pending: PendingCheckout, confirmed_by: User | None = None
+) -> Order:
+    """Writes the real, paid Order this checkout was holding - the ONLY place a customer
+    KHQR order comes into existence.
+
+    Everything comes off the snapshot rather than being re-derived: the customer paid a
+    specific total for specific lines at specific prices, so re-pricing here could write
+    an order that disagrees with the money actually taken. order_number and quote_code
+    are assigned now, since this is the moment the order starts existing.
+
+    Callers MUST have locked `pending` (SELECT ... FOR UPDATE) and confirmed order_id is
+    still NULL - the browser poll and the reconciliation sweep can both be told "paid"
+    at the same moment, and two orders for one payment is the worst outcome here.
+
+    `confirmed_by` is set only when a staff member asserted the payment by hand
+    (confirm_checkout_manually), so the order records who vouched for it. An
+    automatically confirmed order has no staff involvement and leaves it NULL."""
+    snap = pending.snapshot
+    order = Order(
+        order_number=_next_order_number(db),
+        quote_code=_generate_quote_code(db),
+        customer_id=pending.customer_id,
+        clinic_name=snap["clinic_name"],
+        contact_person=snap["contact_person"],
+        phone=snap["phone"],
+        address=snap["address"],
+        payment_term=snap["payment_term"],
+        salesperson=snap["salesperson"],
+        quoted_by_name=snap["quoted_by_name"],
+        install_term=snap["install_term"],
+        discount_type=snap["discount_type"],
+        discount_value=Decimal(snap["discount_value"]),
+        discount_amount=Decimal(snap["discount_amount"]),
+        subtotal=Decimal(snap["subtotal"]),
+        grand_total=pending.grand_total,
+        order_type="order",
+        payment_method="khqr",
+        payment_status="paid",
+        paid_at=datetime.now(timezone.utc),
+        khqr_string=pending.khqr_string,
+        khqr_md5=pending.khqr_md5,
+        payment_reference=pending.reference,
+        items=_restore_lines(snap["lines"]),
+    )
+    stamp_updated_by(order, confirmed_by)
+    db.add(order)
+    db.flush()
+    pending.order_id = order.id
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+async def _checkout_is_paid(pending: PendingCheckout) -> bool:
+    """Asks whichever provider issued this checkout's QR whether it has been paid.
+
+    Branches on the checkout's own artifact, not current settings: a stored khqr_md5
+    means Bakong-direct, its absence means PayWay (checked by tran_id = reference), so a
+    checkout stays checkable even if the configured provider changes under it."""
+    if pending.khqr_md5:
+        return await check_bakong_payment(pending.khqr_md5)
+    return await check_payway_payment(pending.reference)
+
+
+@router.post("/checkout", response_model=CheckoutOut, status_code=status.HTTP_201_CREATED)
+def create_checkout(
+    payload: OrderCreate,
+    background_tasks: BackgroundTasks,
+    principal: tuple[Customer | None, User | None] = Depends(_get_ordering_principal),
+    db: Session = Depends(get_db),
+):
+    """Starts a pay-by-QR purchase. **No order and no order items are created here** -
+    a customer never holds an order they have not paid for. The cart is priced, a KHQR
+    is issued for that exact total, and both are parked in a PendingCheckout; the order
+    is written only when the payment is confirmed, by the poll below or by the
+    reconciliation sweep.
+
+    Customers only. A staff cart is the quotation tool - it produces a quote through
+    POST /orders/, which is a document, not a purchase.
+    """
+    customer, user = principal
+    if user is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Staff carts produce quotes, not payments - use POST /orders/.",
+        )
+    if not settings.khqr_configured:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="QR payment is not available right now - please choose Cash instead.",
+        )
+
+    items, subtotal, discount_amount, grand_total = _price_order(db, payload, user)
+    reference = _next_checkout_reference(db)
+
+    # Two providers produce the same thing (a KHQR payload string the modal renders):
+    # ABA PayWay generates it upstream and leaves khqr_md5 NULL (payment is later checked
+    # by tran_id = reference), Bakong-direct builds it locally and stores the md5
+    # Bakong's check API keys on.
+    khqr_md5 = None
+    if settings.qr_provider == "payway":
+        try:
+            khqr_string = create_payway_khqr(grand_total, tran_id=reference)
+        except PayWayError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="QR payment is temporarily unavailable - please choose Cash instead.",
+            )
+    else:
+        khqr_string, khqr_md5 = build_khqr(grand_total, bill_number=reference)
+
+    pending = PendingCheckout(
+        reference=reference,
+        customer_id=customer.id,
+        grand_total=grand_total,
+        khqr_string=khqr_string,
+        khqr_md5=khqr_md5,
+        expires_at=datetime.now(timezone.utc)
+        + timedelta(minutes=settings.KHQR_EXPIRY_MINUTES),
+        snapshot={
+            "clinic_name": payload.clinic_name,
+            "contact_person": payload.contact_person,
+            "phone": payload.phone,
+            "address": payload.address,
+            "payment_term": payload.payment_term,
+            "install_term": payload.install_term,
+            # Derived here exactly as create_order derives them, never client-supplied:
+            # a customer placing their own order is "Website" as salesperson but keeps
+            # their own name as the user who placed it.
+            "salesperson": "Website",
+            "quoted_by_name": customer.customer_name,
+            "discount_type": payload.discount_type,
+            "discount_value": str(payload.discount_value),
+            "discount_amount": str(discount_amount),
+            "subtotal": str(subtotal),
+            "lines": _snapshot_lines(items),
+        },
+    )
+    db.add(pending)
+    db.commit()
+    db.refresh(pending)
+
+    # Text-only heads-up that someone is at the QR - no PDF and no Delivered/Cancelled
+    # buttons, because there is nothing to deliver and no order yet. The real
+    # PDF-carrying alert goes out from the confirmation path.
+    background_tasks.add_task(
+        send_khqr_pending_alert_for_checkout, pending.reference, grand_total, customer.customer_name
+    )
+    return pending
+
+
+@router.get("/checkout/{checkout_id}/payment-status", response_model=CheckoutStatusOut)
+async def check_checkout_payment(
+    checkout_id: int,
+    background_tasks: BackgroundTasks,
+    principal: tuple[Customer | None, User | None] = Depends(_get_ordering_principal),
+    db: Session = Depends(get_db),
+):
+    """Polled by the browser while the KHQR modal is on screen. Each poll asks the
+    provider whether the payment landed; the FIRST confirmed one writes the order (as
+    paid) and fires the paid-order Telegram alert, and every poll after that returns
+    that same order rather than making another.
+
+    Returns "expired" once the QR's own expiry has passed with no payment - the code is
+    dead at that point, and telling the browser so is better than polling forever.
+
+    Callable by the customer whose checkout it is, and by back-office staff
+    (price_listing) who may be watching the customer pay at the counter.
+    """
+    customer, user = principal
+    pending = (
+        db.query(PendingCheckout).filter(PendingCheckout.id == checkout_id).first()
+    )
+    owns_checkout = pending is not None and (
+        (customer is not None and pending.customer_id == customer.id)
+        or (user is not None and user.price_listing)
+    )
+    if not owns_checkout:
+        # 404 rather than 403, same as GET /orders/mine/{id}: this must not reveal which
+        # checkout ids exist.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Checkout not found")
+
+    if pending.order_id is not None:
+        return CheckoutStatusOut(payment_status="paid", order=pending.order)
+
+    if not await _checkout_is_paid(pending):
+        expires_at = pending.expires_at
+        # Postgres hands back an aware datetime; be defensive so a naive one (SQLite in
+        # some setups) can't raise on the comparison and break the poll.
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at < datetime.now(timezone.utc):
+            return CheckoutStatusOut(payment_status="expired")
+        return CheckoutStatusOut(payment_status="unpaid")
+
+    # Confirmed paid. Re-read under a row lock: the reconciliation sweep may be doing
+    # exactly this at the same moment, and one payment must produce one order.
+    locked = (
+        db.query(PendingCheckout)
+        .filter(PendingCheckout.id == checkout_id)
+        .with_for_update()
+        .first()
+    )
+    if locked.order_id is not None:
+        db.commit()
+        return CheckoutStatusOut(payment_status="paid", order=locked.order)
+
+    order = _materialize_checkout(db, locked)
+    order_out = OrderOut.model_validate(order)
+    background_tasks.add_task(deliver_order_alert, order_out)
+    return CheckoutStatusOut(payment_status="paid", order=order_out)
+
+
+def _pending_checkout_out(pending: PendingCheckout) -> PendingCheckoutOut:
+    """Shapes a PendingCheckout for the back office. Reads the lines out of the JSON
+    snapshot, skipping the $0 component lines a bundle expands into - staff are
+    identifying a purchase here, not pricing it."""
+    expires_at = pending.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return PendingCheckoutOut(
+        id=pending.id,
+        reference=pending.reference,
+        customer_name=pending.customer.customer_name if pending.customer else None,
+        clinic_name=pending.snapshot["clinic_name"],
+        phone=pending.snapshot["phone"],
+        grand_total=pending.grand_total,
+        created_at=pending.created_at,
+        expires_at=expires_at,
+        is_expired=expires_at < datetime.now(timezone.utc),
+        items=[
+            PendingCheckoutLineOut(product_name=line["product_name"], qty=line["qty"])
+            for line in pending.snapshot["lines"]
+        ],
+    )
+
+
+@router.get("/checkouts", response_model=list[PendingCheckoutOut])
+def list_pending_checkouts(
+    _: User = _perm,
+    db: Session = Depends(get_db),
+):
+    """Every checkout that has been issued a QR and has not become an order - the back
+    office's view of money that may be in flight.
+
+    This exists because a customer's pay-by-QR purchase writes no order until the
+    payment is confirmed. When confirmation works (browser poll or the sweep) a row
+    appears here only briefly. When it DOESN'T - a provider that can't be reached, a
+    token that expired, a QR the bank settles on its own rail - this list is the only
+    place the attempt is visible at all, and POST /checkout/{id}/confirm below is how
+    staff turn a payment they can see on their bank statement into a real order.
+
+    MUST stay declared above GET /{order_id}, which would otherwise try to parse
+    "checkouts" as an order id and 422.
+    """
+    rows = (
+        db.query(PendingCheckout)
+        .options(joinedload(PendingCheckout.customer))
+        .filter(PendingCheckout.order_id.is_(None))
+        .order_by(PendingCheckout.id.desc())
+        .all()
+    )
+    return [_pending_checkout_out(row) for row in rows]
+
+
+@router.post("/checkout/{checkout_id}/confirm", response_model=OrderOut)
+def confirm_checkout_manually(
+    checkout_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: User = _perm,
+    db: Session = Depends(get_db),
+):
+    """Staff assert that this checkout's payment did arrive, and the order is written.
+
+    The manual counterpart to the automatic confirmation - same
+    `_materialize_checkout`, same row lock, same paid-order Telegram alert - for when
+    the provider check can't see a payment that plainly landed in the bank account.
+    Deliberately the same trust model as "Mark as Paid" on an existing order: staff
+    looking at their statement are the authority, and it is recorded against them.
+
+    Idempotent: a checkout that has already become an order (because the poll or the
+    sweep got there first) returns that order rather than making a second one.
+    """
+    locked = (
+        db.query(PendingCheckout)
+        .filter(PendingCheckout.id == checkout_id)
+        .with_for_update()
+        .first()
+    )
+    if locked is None:
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Checkout not found")
+    if locked.order_id is not None:
+        order = locked.order
+        db.commit()
+        return order
+
+    order = _materialize_checkout(db, locked, confirmed_by=current_user)
+    background_tasks.add_task(deliver_order_alert, OrderOut.model_validate(order))
+    return order
 
 
 @router.post("/", response_model=OrderOut, status_code=status.HTTP_201_CREATED)
@@ -388,35 +826,16 @@ def create_order(
         salesperson = "Website"
         quoted_by_name = customer.customer_name
 
-    # Any order-level discount (percent or cash) is a real reduction handed out at staff
-    # discretion - gated to product_management specifically. A customer, or a
-    # price_listing-only staffer, can still place an order, just not apply a discount to
-    # it. Mirrors the quote drawer's UI, which only renders the discount control at all
-    # for product_management staff.
-    if payload.discount_value > 0:
-        if user is None or not user.product_management:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="A discount requires the 'product_management' permission",
-            )
+    items, subtotal, discount_amount, grand_total = _price_order(db, payload, user)
 
-    items, subtotal, discountable_subtotal = _build_order_lines(db, payload.items)
-    discount_amount = _compute_discount(
-        payload.discount_type, payload.discount_value, discountable_subtotal
-    )
-    grand_total = max(Decimal("0"), subtotal - discount_amount)
-
-    # Quote vs. real order. Staff carts ARE the quotation tool, so a staff-placed row is
-    # always a quote (payment_method doesn't apply). A customer must pick how they'll
-    # pay: Cash means payment happens offline later, so what they get is also a quote;
-    # KHQR is a real order that starts "unpaid" and carries a generated Bakong QR
-    # payload the customer pays against (receipt only exists once it flips to "paid").
+    # Everything this endpoint produces is a QUOTE - a document, not a purchase. Staff
+    # carts ARE the quotation tool, and a customer choosing Cash is paying offline later,
+    # so neither has a payment attached. A pay-by-QR purchase goes to POST /orders/checkout
+    # instead, which deliberately creates NO order until the money actually arrives.
     order_number = _next_order_number(db)
-    khqr_string = khqr_md5 = None
+    order_type = "quote"
     if user is not None:
-        order_type = "quote"
         payment_method = None
-        payment_status = None
     else:
         payment_method = payload.payment_method
         if payment_method is None:
@@ -425,32 +844,10 @@ def create_order(
                 detail="Please choose a payment method (Cash or KHQR).",
             )
         if payment_method == "khqr":
-            if not settings.khqr_configured:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="QR payment is not available right now - please choose Cash instead.",
-                )
-            order_type = "order"
-            payment_status = "unpaid"
-            # Two providers produce the same thing (a KHQR payload string the modal
-            # renders): ABA PayWay generates it upstream and keeps khqr_md5 NULL
-            # (payment is later checked by tran_id = order_number), Bakong-direct
-            # builds it locally and stores the md5 Bakong's check API keys on. The
-            # md5's presence is also how check_payment_status below knows which
-            # provider a historical order belongs to.
-            if settings.qr_provider == "payway":
-                try:
-                    khqr_string = create_payway_khqr(grand_total, tran_id=order_number)
-                except PayWayError:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="QR payment is temporarily unavailable - please choose Cash instead.",
-                    )
-            else:
-                khqr_string, khqr_md5 = build_khqr(grand_total, bill_number=order_number)
-        else:
-            order_type = "quote"
-            payment_status = None
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Pay-by-QR purchases go through POST /orders/checkout.",
+            )
 
     order = Order(
         order_number=order_number,
@@ -472,9 +869,9 @@ def create_order(
         grand_total=grand_total,
         order_type=order_type,
         payment_method=payment_method,
-        payment_status=payment_status,
-        khqr_string=khqr_string,
-        khqr_md5=khqr_md5,
+        # A quote has no payment concept: staff quotes never did, and a cash quote is
+        # settled offline. Staff record payment later with "Mark as Paid" if it happens.
+        payment_status=None,
         items=items,
     )
     db.add(order)
@@ -486,17 +883,12 @@ def create_order(
     # DetachedInstanceError. OrderOut.model_validate() reads everything needed (incl.
     # items) right now, while the session is still live.
     #
-    # Quotes (staff or customer-cash) alert immediately: deliver_order_alert() briefly
-    # waits for the browser to upload its real rendered PDF (see
-    # POST /{order_id}/quotation-pdf below) before falling back to a server-rendered
-    # one. A KHQR order instead gets a text-only "awaiting payment" alert now - its
-    # PDF-carrying alert (the receipt) only goes out once payment is confirmed, from
-    # check_payment_status/update_order below.
+    # deliver_order_alert() briefly waits for the browser to upload its real rendered PDF
+    # (see POST /{order_id}/quotation-pdf below) before falling back to a server-rendered
+    # one. Every row created here is a quote, so it alerts immediately - the pay-by-QR
+    # path alerts from create_checkout/check_checkout_payment instead.
     order_out = OrderOut.model_validate(order)
-    if payment_method == "khqr":
-        background_tasks.add_task(send_khqr_pending_alert, order_out)
-    else:
-        background_tasks.add_task(deliver_order_alert, order_out)
+    background_tasks.add_task(deliver_order_alert, order_out)
     return order
 
 
@@ -614,11 +1006,14 @@ def generate_order_khqr(
     polls GET /{order_id}/payment-status, the first confirmed check flips it to paid,
     stamps paid_at and fires the paid-order alert with the receipt.
 
-    Idempotent: re-opening the QR dialog returns the payload already on the order
-    rather than minting a new one, so a customer mid-scan never ends up looking at a
-    code the order no longer expects. An edit that moves grand_total clears the stored
-    QR (update_order) precisely so the next call here builds a fresh one for the new
-    amount.
+    Idempotent while the stored QR is still payable: re-opening the QR dialog returns
+    the payload already on the order rather than minting a new one, so a customer
+    mid-scan never ends up looking at a code the order no longer expects. Once that
+    payload's own expiry has passed (KHQR_EXPIRY_MINUTES, embedded in the QR) nobody
+    can be mid-scan on it any more and a fresh one is built - otherwise an order left
+    overnight would be stuck holding a code every wallet refuses. An edit that moves
+    grand_total clears the stored QR (update_order) precisely so the next call here
+    builds a fresh one for the new amount.
 
     order_type is deliberately left alone: a quote that gets paid at the counter is
     still the quote it started as, and the Quotes/Orders tabs go on meaning "how this
@@ -640,7 +1035,7 @@ def generate_order_khqr(
             detail="QR payment is not configured - collect payment another way.",
         )
 
-    if order.khqr_string:
+    if order.khqr_string and not khqr_expired(order.khqr_string):
         return order
 
     # Same two providers, same rule as create_order: PayWay generates the payload
@@ -754,14 +1149,14 @@ def update_order(
     current_user: User = _perm,
     db: Session = Depends(get_db),
 ):
-    """Staff edit of a still-unpaid order: clinic/contact details, terms, the
-    order-level discount, the line items themselves, the workflow status, and the
-    "payment received" flag - see OrderUpdate.
+    """Staff edit of an order: clinic/contact details, terms, the order-level discount,
+    the line items themselves, the workflow status, and the "payment received" flag -
+    see OrderUpdate.
 
-    Editing stops the moment the order is paid (_reject_if_paid). Everything the
-    customer was given a receipt for has to keep matching what is on record, so a paid
-    row is read-only here and undeletable below; correcting one means issuing a new
-    order alongside it, not rewriting history.
+    **A paid order is editable too, since 2026-08-11** (see _reject_if_paid, now a
+    no-op). Note what that means: the customer already holds a receipt printed from the
+    pre-edit figures, and nothing reissues it, so an edit that moves the money makes the
+    two disagree. `updated_by`/`updated_at` are the only record that it happened.
 
     Line items are re-priced from scratch, never patched: `items` replaces the whole
     list through the same _build_order_lines the original purchase went through, so an
@@ -865,9 +1260,9 @@ def delete_order(order_id: int, _: User = _perm, db: Session = Depends(get_db)):
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-    # A paid order is a permanent financial record - see _reject_if_paid. Cancelling one
-    # is a `status` change, which is itself blocked once paid; what's left is issuing a
-    # correcting document, never making the original disappear.
+    # Paid orders are deletable too since 2026-08-11 (_reject_if_paid is a no-op). This
+    # destroys the record of a completed sale, including its line items - there is no
+    # soft-delete and no archive to recover it from.
     _reject_if_paid(order)
     db.delete(order)
     db.commit()

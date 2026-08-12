@@ -741,6 +741,9 @@ class OrderOut(BaseModel):
     paid_at: Optional[datetime] = None
     khqr_string: Optional[str] = None
     khqr_md5: Optional[str] = None
+    # Which pending checkout this order was materialized from, for a customer KHQR sale
+    # - the reference the bank knows the payment by (see PendingCheckout.reference).
+    payment_reference: Optional[str] = None
     created_at: datetime
     # The staff member who last wrote to this order via PUT /orders/{id} - a status or
     # payment change, or a real edit to its details/discount/line items (only possible
@@ -750,3 +753,63 @@ class OrderOut(BaseModel):
     items: list[OrderItemOut] = []
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class CheckoutOut(BaseModel):
+    """A KHQR checkout awaiting payment. Deliberately NOT an OrderOut: no order exists
+    yet, and none will until the money arrives (see PendingCheckout). Carries only what
+    the payment modal needs - the QR to render, the amount to show, and the id to poll.
+    """
+
+    id: int
+    reference: str
+    grand_total: Decimal
+    khqr_string: str
+    expires_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class PendingCheckoutLineOut(BaseModel):
+    """Just enough of a snapshotted line for staff to recognise what a customer is
+    paying for. The full pricing only becomes visible once it is a real order."""
+
+    product_name: str
+    qty: int
+
+
+class PendingCheckoutOut(BaseModel):
+    """An outstanding checkout as the back office sees it - what a customer started
+    paying for and has not (as far as we know) paid.
+
+    Staff need this precisely because there is no order behind it: if automatic
+    confirmation fails, this row is the only trace that money may have moved, and
+    `reference` is what the payment appears as on the bank statement.
+    """
+
+    id: int
+    reference: str
+    customer_name: Optional[str] = None
+    clinic_name: str
+    phone: str
+    grand_total: Decimal
+    created_at: datetime
+    expires_at: datetime
+    # The QR's own expiry has passed, so the customer can no longer pay against it.
+    # Not the same as "nothing was paid" - a payment made just before it lapsed may
+    # still be settling, which is why these stay listed rather than disappearing.
+    is_expired: bool
+    items: list[PendingCheckoutLineOut] = []
+
+
+class CheckoutStatusOut(BaseModel):
+    """What the payment poll returns.
+
+    `payment_status` is "unpaid" while waiting, "paid" once confirmed, or "expired" when
+    the QR's own expiry passed with no payment. `order` is filled in on exactly the
+    transition to "paid" and on every poll after it - that is the moment the order comes
+    into existence, and it is what the browser renders the receipt from.
+    """
+
+    payment_status: Literal["unpaid", "paid", "expired"]
+    order: Optional[OrderOut] = None

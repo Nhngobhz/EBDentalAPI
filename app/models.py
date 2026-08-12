@@ -14,6 +14,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    JSON,
     Numeric,
     String,
     Text,
@@ -543,6 +544,12 @@ class Order(AuditedMixin, Base):
     khqr_string = Column(String(512), nullable=True)
     khqr_md5 = Column(String(32), nullable=True)
 
+    # For an order that came from a customer KHQR checkout: the PendingCheckout
+    # reference the QR was issued under (its bill number at the bank). order_number is
+    # only assigned when the order is written, i.e. after payment, so this is the only
+    # thing that ties a bank statement line back to the sale. NULL on every other row.
+    payment_reference = Column(String(30), nullable=True, index=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     customer = relationship("Customer")
@@ -563,6 +570,58 @@ class Order(AuditedMixin, Base):
         cascade="all, delete-orphan",
         order_by="[func.coalesce(OrderItem.parent_item_id, OrderItem.id), OrderItem.id]",
     )
+
+
+class PendingCheckout(Base):
+    """A customer's KHQR checkout that has been priced and issued a QR but not paid yet.
+
+    An Order is only ever written once money has actually arrived, so between "customer
+    pressed Confirm Purchase" and "Bakong says it's paid" there is no order and no
+    order_items - just this row. On confirmation it is materialized into a real paid
+    Order (routers/orders.py::_materialize_checkout) and `order_id` is filled in;
+    nothing unpaid is ever visible to a customer as an order.
+
+    `snapshot` holds the fully-priced lines, not the cart the browser sent: the QR
+    commits the customer to an exact amount, so the order that eventually gets written
+    must be the one that was priced when the QR was issued, even if a product's price
+    changed in between. See _snapshot_lines/_restore_lines.
+    """
+
+    __tablename__ = "pending_checkouts"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Stands in for order_number until there is an order: it's the bill number embedded
+    # in the KHQR (tag 62 sub-01) and the PayWay tran_id, so it's the handle the payment
+    # is identified by at the bank. Copied onto the order as payment_reference when the
+    # order is finally written, which is what ties a bank statement line to a sale.
+    reference = Column(String(30), unique=True, nullable=False, index=True)
+
+    # Only customers ever reach this path - a staff cart produces a quote, never a
+    # payable order. CASCADE because an abandoned checkout has no meaning without them.
+    customer_id = Column(Integer, ForeignKey("customers.id", ondelete="CASCADE"), nullable=False)
+
+    # The whole order-to-be: clinic details, discount, and the priced lines. JSON rather
+    # than real rows precisely because rows are what we're refusing to create.
+    snapshot = Column(JSON, nullable=False)
+    grand_total = Column(Numeric(10, 2), nullable=False)
+
+    khqr_string = Column(String(512), nullable=False)
+    khqr_md5 = Column(String(32), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    # Matches the expiry embedded in the QR itself. Past this, the QR is refused by the
+    # payer's app, so an unmaterialized row is just litter - the reconciliation sweep
+    # prunes it after a grace period (services/checkout_sweep.py).
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+
+    # NULL until payment is confirmed. Set (once) to the order that was written from
+    # this snapshot, which is also what makes confirmation idempotent under a racing
+    # browser poll and background sweep.
+    order_id = Column(Integer, ForeignKey("orders.id", ondelete="SET NULL"), nullable=True)
+
+    customer = relationship("Customer")
+    order = relationship("Order")
 
 
 class OrderItem(Base):

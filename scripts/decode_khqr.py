@@ -1,10 +1,11 @@
 """
 Decode a KHQR code and print the fields that matter for configuring payments.
 
-Its main job: pull the **Bakong account ID** out of a static KHQR (the one your
-bank's app shows on its "my QR / receive money" screen) so it can go into
-`.env` as `BAKONG_ACCOUNT_ID`. That ID is never printed on the QR card itself -
-it's encoded inside the QR payload, in EMV tag 29 (individual) or 30 (merchant).
+Its main job: pull the **payee routing fields** out of a static KHQR (the one your
+bank's app shows on its "my QR / receive money" screen) so they can go into `.env`
+as BAKONG_ACCOUNT_ID / BAKONG_ACCOUNT_INFORMATION / BAKONG_ACQUIRING_BANK. None of
+them are printed on the QR card itself - they're encoded inside the payload, in EMV
+tag 29 (individual) or 30 (merchant), sub-fields 00/01/02.
 
 Usage - either from a saved photo/screenshot of the QR:
 
@@ -22,7 +23,11 @@ Payload mode is pure stdlib and always works.
 See app/services/khqr.py for the writing side / the tag meanings.
 """
 import sys
+from datetime import datetime
 from pathlib import Path
+
+# Tag 99 sub-fields, both epoch milliseconds.
+_TIMESTAMPS = {"00": "created", "01": "expires"}
 
 # Human-readable names for the top-level EMV tags a KHQR actually uses.
 _TAG_NAMES = {
@@ -100,17 +105,36 @@ def main() -> None:
     print(f"\nPayload ({len(payload)} chars):\n{payload}\n")
 
     fields = parse_tlv(payload)
-    account_id = None
+    # Tag 29/30 sub-fields 00/01/02 map one-to-one onto the .env settings that
+    # app/services/khqr.py builds a spec-shaped KHQR from.
+    _SUB_SETTING = {
+        "00": "BAKONG_ACCOUNT_ID",
+        "01": "BAKONG_ACCOUNT_INFORMATION",
+        "02": "BAKONG_ACQUIRING_BANK",
+    }
+    payee: dict[str, str] = {}
     for tag, value in fields:
         label = _TAG_NAMES.get(tag, "")
         print(f"  {tag}  {label:<45} {value}")
-        # 29/30 nest their own TLVs; sub-tag 00 is the Bakong account ID.
+        # 29/30 nest their own TLVs - that's where the payee routing lives.
         if tag in ("29", "30"):
             for sub_tag, sub_value in parse_tlv(value):
-                marker = "  <-- BAKONG_ACCOUNT_ID" if sub_tag == "00" else ""
+                setting = _SUB_SETTING.get(sub_tag, "")
+                marker = f"  <-- {setting}" if setting else ""
                 print(f"        {sub_tag}  {'sub-field':<41} {sub_value}{marker}")
-                if sub_tag == "00" and account_id is None:
-                    account_id = sub_value
+                if setting and setting not in payee:
+                    payee[setting] = sub_value
+        elif tag == "99":
+            # sub-00 creation, sub-01 expiry, both epoch ms.
+            for sub_tag, sub_value in parse_tlv(value):
+                when = _TIMESTAMPS.get(sub_tag, "sub-field")
+                readable = ""
+                if sub_value.isdigit():
+                    stamp = datetime.fromtimestamp(int(sub_value) / 1000)
+                    readable = f"  ({stamp:%Y-%m-%d %H:%M:%S})"
+                print(f"        {sub_tag}  {when:<41} {sub_value}{readable}")
+        elif tag.isdigit() and 26 <= int(tag) <= 51:
+            print(f"        {'':<45} (proprietary, not part of the KHQR spec)")
 
     # CRC covers everything up to and including the "6304" tag+length prefix.
     if len(payload) >= 4:
@@ -118,10 +142,11 @@ def main() -> None:
         actual = payload[-4:]
         print(f"\n  CRC: {actual} ({'valid' if expected == actual else f'INVALID, expected {expected}'})")
 
-    if account_id:
+    if payee:
         print("\n" + "=" * 60)
-        print("Put this in store-api/.env:\n")
-        print(f"    BAKONG_ACCOUNT_ID={account_id}")
+        print("Put these in store-api/.env:\n")
+        for setting in _SUB_SETTING.values():
+            print(f"    {setting}={payee.get(setting, '')}")
         print("=" * 60)
     else:
         print("\nNo account ID found (no tag 29/30 sub-field 00) - is this a KHQR?")

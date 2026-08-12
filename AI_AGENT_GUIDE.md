@@ -537,30 +537,59 @@ Notes an agent should know before calling this:
 - **`order_type` is derived, never sent**: a staff caller always creates a
   `"quote"` (their cart IS the quotation tool - `payment_method` is ignored
   for them and stored as `null`); a customer must send `payment_method` -
-  `"cash"` also creates a `"quote"` (payment is collected offline later),
-  `"khqr"` creates a real `"order"` with `payment_status: "unpaid"` and a
-  server-generated `khqr_string` (a KHQR/EMV payload the frontend renders
-  as a QR code). Two interchangeable providers produce it (see
-  `settings.qr_provider`): **ABA PayWay** (`PAYWAY_MERCHANT_ID`/`PAYWAY_API_KEY`,
-  wins when both are configured - generates the QR upstream, keeps
-  `khqr_md5` NULL, and payment is checked by `tran_id` = `order_number`)
-  or **Bakong-direct** (payload built locally by `services/khqr.py`,
-  `khqr_md5` stored for Bakong's check_transaction_by_md5). `KHQR_PROVIDER`
-  pins one explicitly; "auto" (default) prefers PayWay. The stored
-  `khqr_md5`'s presence is how a historical order's provider is
-  recognized. If neither is configured, a `"khqr"` request gets a `400`
-  telling the customer to choose Cash.
-- **Bakong-direct has two configuration shapes**, because a bank's own
-  personal QR often isn't a plain `name@bank` alias: `KHQR_STATIC_TEMPLATE`
-  (paste the full payload of the bank app's static "receive money" QR -
-  every tag in the EMV merchant-account range 26-51 is copied through
-  verbatim, so bank-proprietary routing survives) or `BAKONG_ACCOUNT_ID` (a
-  real alias). ABA's dual-currency personal QR is exactly the first case:
-  tag 29 sub-00 holds the *institution* id `abaakhppxxx@abaa`, the account
-  number is in sub-01, and a proprietary tag 40 carries the P2P token -
-  building from sub-00 alone yields a QR naming the bank but no account.
-  `scripts/decode_khqr.py` dumps any KHQR (image or payload string)
-  field-by-field and is the fastest way to inspect either side.
+  `"cash"` also creates a `"quote"` (payment is collected offline later).
+  **`"khqr"` creates nothing at all** - see the next bullet.
+- **A customer never holds an unpaid order (changed 2026-08-11).**
+  `POST /orders/` is the document endpoint and now **refuses**
+  `payment_method: "khqr"` with a `400`. A pay-by-QR purchase goes to
+  **`POST /orders/checkout`**, which prices the cart, issues the QR and
+  writes a **`PendingCheckout`** - no `orders` row, no `order_items` rows,
+  nothing in `GET /orders/mine`. The order is created, already `"paid"`, by
+  whichever of these first sees the payment confirmed:
+  **`GET /orders/checkout/{id}/payment-status`** (the browser poll, which
+  returns the new order so it can render the receipt) or the background
+  **reconciliation sweep** (`services/checkout_sweep.py`, every 60s, started
+  from `main.py`'s lifespan). The sweep is not optional: the browser poll is
+  the only client-side trigger, so without it a customer who pays and closes
+  the tab would leave money received against no order. Both take a
+  `SELECT ... FOR UPDATE` on the pending row and check `order_id IS NULL`
+  before writing - one payment, one order. `_materialize_checkout` writes the
+  order from the stored snapshot and never re-prices it: the customer paid a
+  specific total for specific lines, and a product's price may have moved
+  since. `orders.payment_reference` records which checkout it came from,
+  because `order_number` is only assigned at payment time and is therefore
+  *not* what the bank knows the transaction by.
+- Two interchangeable providers produce the QR (see `settings.qr_provider`):
+  **ABA PayWay** (`PAYWAY_MERCHANT_ID`/`PAYWAY_API_KEY`, wins when both are
+  configured - generates the QR upstream, keeps `khqr_md5` NULL, and payment
+  is checked by `tran_id` = the checkout's `reference`) or **Bakong-direct**
+  (payload built locally by `services/khqr.py`, `khqr_md5` stored for Bakong's
+  check_transaction_by_md5). `KHQR_PROVIDER` pins one explicitly; "auto"
+  (default) prefers PayWay. The stored `khqr_md5`'s presence is how a
+  checkout's (or a historical order's) provider is recognized. If neither is
+  configured, a checkout request gets a `400` telling the customer to choose
+  Cash.
+- **Bakong-direct has two configuration shapes, and `BAKONG_ACCOUNT_ID` wins
+  (changed 2026-08-11).** The payee lives in tag 29's three sub-fields, which
+  map onto `BAKONG_ACCOUNT_ID` / `BAKONG_ACCOUNT_INFORMATION` /
+  `BAKONG_ACQUIRING_BANK` - for a *bank account* (not a Bakong wallet alias)
+  sub-00 holds the institution id and sub-01 the account number, so ABA is
+  `abaakhppxxx@abaa` + `004613623`; building from sub-00 alone yields a QR
+  naming the bank but no account. `KHQR_STATIC_TEMPLATE` (paste the bank app's
+  whole static "receive money" payload; every tag in the EMV merchant-account
+  range 26-51 is copied verbatim) is now only the fallback for when no account
+  id is set: it also copies bank-proprietary tags - ABA's `abaP2P` tag 40 -
+  which can route payment over the bank's own rail, where Bakong's
+  check_transaction_by_md5 will never see it. `scripts/decode_khqr.py` dumps
+  any KHQR (image or payload string) field-by-field and prints the three
+  settings ready to paste; it's the fastest way to inspect either side.
+- **Bakong has no QR-generation API.** NBC's SDKs assemble the EMV payload
+  locally, which is exactly what `services/khqr.py` does; the open API at
+  `api-bakong.nbc.gov.kh` only *verifies*. So `BAKONG_API_TOKEN` is needed by
+  `check_bakong_payment()` alone - QR generation works without it, payment just
+  has to be confirmed by hand. Dynamic QRs must carry an expiry (tag 99 sub-01,
+  `KHQR_EXPIRY_MINUTES`); an expired one is refused by the payer's app and staff
+  re-issue with `POST /orders/{id}/khqr`.
 - **An order is editable until it is paid, then frozen.** `PUT /orders/{id}`
   accepts the clinic details, terms, order-level discount and the line list
   itself (`items` REPLACES the lines and is re-priced through the same code

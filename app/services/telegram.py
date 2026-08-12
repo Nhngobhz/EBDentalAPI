@@ -41,6 +41,8 @@ from app.config import settings
 from app.core.logging_conf import get_logger
 
 if TYPE_CHECKING:
+    from decimal import Decimal
+
     from app.schemas import OrderOut
 
 logger = get_logger("telegram")
@@ -243,18 +245,23 @@ def _order_alert_caption(order: "OrderOut") -> tuple[str, str]:
     return caption, "Quotation"
 
 
-async def send_khqr_pending_alert(order: "OrderOut") -> None:
-    """Text-only heads-up the moment a customer places a KHQR order - no PDF and no
-    Delivered/Cancelled buttons yet, because nothing should be delivered (and no
-    receipt exists) until the payment actually lands. The full PDF-carrying alert
-    with buttons goes out via deliver_order_alert() once the order flips to paid
-    (automatic Bakong check or staff Mark-as-Paid)."""
+async def send_khqr_pending_alert_for_checkout(
+    reference: str, grand_total: "Decimal", customer_name: str
+) -> None:
+    """Text-only heads-up that a customer is at the QR - no PDF, no Delivered/Cancelled
+    buttons, and deliberately no order number, because at this point **there is no
+    order**: a customer KHQR purchase writes nothing until the payment is confirmed (see
+    routers/orders.py::create_checkout). `reference` is the QR's bill number, which is
+    what the payment will show up as at the bank if staff need to reconcile it by hand.
+
+    The full PDF-carrying alert with buttons goes out via deliver_order_alert() at the
+    moment the order is actually created, i.e. once the money has arrived."""
     text = (
-        f"\U0001F551 <b>New order - awaiting KHQR payment</b>\n"
-        f"Order No: {_esc(order.order_number)} (Code: {_esc(order.quote_code)})\n"
-        f"Clinic: {_esc(order.clinic_name)}\n"
-        f"Amount due: $ {order.grand_total:.2f}\n"
-        f"A paid confirmation with the receipt will follow once the transfer arrives."
+        f"\U0001F551 <b>Customer is paying by KHQR</b>\n"
+        f"Ref: {_esc(reference)}\n"
+        f"Customer: {_esc(customer_name)}\n"
+        f"Amount due: $ {grand_total:.2f}\n"
+        f"No order exists yet - one is created, with its receipt, once the payment lands."
     )
     await send_telegram_message(text, topic_id=settings.TELEGRAM_ORDER_TOPIC_ID)
 

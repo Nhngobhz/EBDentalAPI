@@ -127,18 +127,35 @@ class Settings(BaseSettings):
             return f"{parts.scheme}://{parts.netloc}"
         return self.PAYWAY_API_BASE.strip().rstrip("/")
 
-    # Bakong-direct comes in two flavours, both handled by services/khqr.py:
-    #  - KHQR_STATIC_TEMPLATE: paste the full payload of your bank app's own static
-    #    "receive money" QR (decode it with scripts/decode_khqr.py). Its payee
-    #    routing data is copied into every generated QR. Use this for a bank's
-    #    personal/P2P QR, where the account is NOT a plain name@bank alias - ABA's
-    #    dual-currency QR is exactly that case.
-    #  - BAKONG_ACCOUNT_ID: a true Bakong alias (`name@bank`), when you have one.
-    # KHQR_STATIC_TEMPLATE wins if both are set.
-    KHQR_STATIC_TEMPLATE: str = ""
+    # Bakong-direct comes in two flavours, both handled by services/khqr.py.
+    # BAKONG_ACCOUNT_ID is the preferred one and wins if both are set:
+    #
+    #  - BAKONG_ACCOUNT_ID (+ the two fields below): builds a QR to the KHQR spec's
+    #    "individual" shape, tag 29 sub-fields 00/01/02. All three values are
+    #    printed by `python scripts/decode_khqr.py <your static QR>`. For a bank
+    #    account (rather than a Bakong wallet) the account id is the *bank's*
+    #    Bakong id and the account number goes in BAKONG_ACCOUNT_INFORMATION -
+    #    e.g. ABA issues abaakhppxxx@abaa + your account number.
+    #  - KHQR_STATIC_TEMPLATE: legacy fallback. Paste the full payload of your bank
+    #    app's static "receive money" QR and its payee routing is copied into every
+    #    generated QR verbatim - including any proprietary tags the bank added
+    #    (ABA's dual-currency QR carries an `abaP2P` tag 40 that is not part of the
+    #    KHQR spec). Kept as a rollback path; prefer BAKONG_ACCOUNT_ID.
     BAKONG_ACCOUNT_ID: str = ""
+    # Optional per the KHQR spec, but what actually identifies the destination when
+    # BAKONG_ACCOUNT_ID is a bank rather than a personal wallet alias: the bank
+    # account number (or phone number) that receives the money.
+    BAKONG_ACCOUNT_INFORMATION: str = ""
+    # Human-readable acquiring bank name, e.g. "ABA Bank". Shown by some wallets.
+    BAKONG_ACQUIRING_BANK: str = ""
+    KHQR_STATIC_TEMPLATE: str = ""
     KHQR_MERCHANT_NAME: str = "EB DENTAL"
     KHQR_MERCHANT_CITY: str = "Phnom Penh"
+    # How long a generated dynamic QR stays payable. The KHQR spec makes the
+    # expiration timestamp mandatory on dynamic codes; an expired QR is refused by
+    # the payer's app, and staff can always issue a fresh one against the same
+    # order (POST /orders/{id}/khqr).
+    KHQR_EXPIRY_MINUTES: int = 60
     BAKONG_API_TOKEN: str = ""
     BAKONG_API_BASE: str = "https://api-bakong.nbc.gov.kh"
 

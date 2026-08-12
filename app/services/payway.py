@@ -18,9 +18,11 @@ of the request's field values (empty string for anything not sent), keyed with t
 merchant API key. Getting the concatenation order wrong yields PayWay status code 5
 ("invalid hash") - the orders below match the official docs, don't reorder them.
 
-`tran_id` is always our Order.order_number (unique, 6 digits, well under PayWay's
-20-char cap) - so checking a payment later needs nothing stored beyond the order
-row itself.
+`tran_id` is the PendingCheckout.reference the QR was issued under (a yymmddhhmmss
+code, well under PayWay's 20-char cap) - NOT an order number, because a customer's
+pay-by-QR purchase has no order until the payment is confirmed. It is copied onto the
+order as `payment_reference` when the order is finally written, which is what ties a
+PayWay transaction to the sale it produced.
 """
 import base64
 import hashlib
