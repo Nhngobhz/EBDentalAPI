@@ -4,14 +4,20 @@ Reusable FastAPI dependencies: who is calling, and are they allowed to.
 RBAC model used throughout the API:
   - `role_title` is a free-text label (e.g. "Sales Manager"). It is never
     checked for authorization - it's just for display.
-  - The four boolean columns on User (user_management, price_listing,
-    product_management, customer_management) are the actual source of
+  - The boolean columns on User (user_management, price_listing,
+    product_management, customer_management, admin) are the actual source of
     truth. `require_permission("product_management")` (etc.) is used as a
     dependency on every mutating endpoint that needs it.
-  - A user with ALL FOUR permissions set to True is a de-facto super
-    admin. There is no separate `is_superuser` flag (not in the requested
+  - A user with all four of the original permissions set to True is a de-facto
+    super admin. There is no separate `is_superuser` flag (not in the requested
     schema) - the bootstrap admin created by scripts/create_admin.py
-    simply gets all four set to True.
+    simply gets them all set to True.
+  - `admin` was added later and gates site-wide configuration only (the Settings
+    screen, app/routers/settings.py). It is NOT implied by the other four and is
+    not a superset of them: an `admin` holder can change the store's phone number
+    and the printed quote wording without gaining the ability to edit products or
+    create staff accounts. Migration a3d81f6c94e2 grants it to accounts that
+    already held all four, so existing owners keep working.
 """
 import jwt
 from fastapi import Depends, HTTPException, status
@@ -33,6 +39,7 @@ PERMISSION_NAMES = (
     "price_listing",
     "product_management",
     "customer_management",
+    "admin",
 )
 
 

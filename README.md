@@ -70,8 +70,10 @@ CRUD → file upload → error handling), not just written from memory - see
    6 resources):
    - `user_management` → manage User accounts (create/edit/permissions/deactivate)
    - `customer_management` → manage Customers
-   - `product_management` → manage Brands, Categories, Products (non-price fields), Manuals
-   - `price_listing` → change `price`/`discount` on Products, and full CRUD on Promotions
+   - `product_management` → manage Brands, Categories, Products (non-price fields),
+     Manuals, and full CRUD on Promotions and Sets (they are catalogue authoring:
+     what the store advertises and which products come in the bundle)
+   - `price_listing` → change `price`/`discount` on Products, and manage Orders
    - Editing a product's price specifically requires **both**
      `product_management` AND `price_listing` via the general update
      endpoint, OR just `price_listing` via the dedicated
@@ -151,6 +153,16 @@ CRUD → file upload → error handling), not just written from memory - see
     is set per line), and a `Set` line is excluded from the order-level
     discount base for the same reason a `Promotion` line is - it already
     carries its own deal price.
+
+    **`Set.brand_id` (added 2026-08-13)** files a set under a `Brand`, so the
+    storefront's Promotions page can be browsed by brand the way the catalog
+    is (`GET /sets/?brand_id=`). Unlike `Product.brand_id` it is **nullable**:
+    every existing set predates the column, and a mixed-brand bundle
+    legitimately belongs to no single brand - those show only under "All".
+    `PUT /sets/{id}` with `brand_id: null` clears it; omitting the field
+    leaves it alone. `Brand` deliberately has no `sets` relationship, so the
+    FK's `ON DELETE RESTRICT` is what stops a brand still used by a set from
+    being deleted (surfaced as a 400 by `DELETE /brands/{id}`).
 
 14. **Bundle contents & free items (added 2026-07-31):** a `Promotion` and a
     `Set` are now **collections of products** (`PromotionItem`/`SetItem`
@@ -376,15 +388,15 @@ auth flows), see [`AI_AGENT_GUIDE.md`](AI_AGENT_GUIDE.md). Summary:
 | `GET/PUT /customers/me` | Any logged-in customer | Self profile. Same email re-verification behavior as `/users/me` |
 | `POST /customers/me/change-password` | Any logged-in customer | Requires `current_password` + `new_password` (only works for self-registered customers, i.e. ones with a password) |
 | `GET/POST/PUT/DELETE /customers/...` | `customer_management` | Staff-side customer management, incl. toggling `access_permission` |
-| `GET /brands`, `/categories`, `/products`, `/manuals`, `/promotions`, `/sets` | **Public** | Catalog browsing. `products`/`promotions`/`sets` `price` is masked as `"XXXX"` (and `discount`/`old_price` omitted) unless the caller is staff or a customer with `access_permission=True`. `GET /products` also accepts a `category_id` filter |
+| `GET /brands`, `/categories`, `/products`, `/manuals`, `/promotions`, `/sets` | **Public** | Catalog browsing. `products`/`promotions`/`sets` `price` is masked as `"XXXX"` (and `discount`/`old_price` omitted) unless the caller is staff or a customer with `access_permission=True`. `GET /products` also accepts a `category_id` filter; `GET /products` and `GET /sets` both accept `brand_id` |
 | `POST /brands/`, `POST /categories/` | `product_management` | `multipart/form-data`: `brand_name`/`category_name` plus an optional `file` to set the image in the same request |
 | `POST /manuals/` | `product_management` | `multipart/form-data`: `product_id`, optional `description`, plus an optional `file` to set the PDF in the same request |
 | `PUT/DELETE /brands/...`, `PUT/DELETE /categories/...`, `PUT/DELETE /manuals/...` | `product_management` | Deleting a `Category` that still has `Product`s assigned is rejected (400), same as `Brand` |
 | `POST/DELETE /products/...` | `product_management` (+`price_listing` if price included) | Optional `category_id` is set here |
-| `GET/POST/PUT/DELETE /sets/...`, `POST /sets/{id}/image` | `price_listing` for writes | Same shape as `/promotions/...` - see point 13 above |
+| `GET/POST/PUT/DELETE /sets/...`, `POST /sets/{id}/image` | `product_management` for writes | Same shape as `/promotions/...`, plus an optional `brand_id` - see point 13 above |
 | `items` on `/promotions/`+`/sets/`, `free_items` on `/products/` | Same permission as editing that resource | What the bundle contains / what a product comes with free. Write `[{product_id, qty}]`; omit to leave alone, send `[]` to clear - see point 14 above |
 | `PATCH /products/{id}/price` | `price_listing` | |
-| `POST/PUT/DELETE /promotions/...` | `price_listing` | |
+| `POST/PUT/DELETE /promotions/...` | `product_management` | A price_listing-only staffer reads and sells promotions but can't author them |
 | `POST .../{id}/image`, `.../{id}/pdf` | Same permission as editing that resource | File uploads (still available for setting/replacing an image after creation) |
 | `POST /products/{id}/gallery`, `DELETE /products/{id}/gallery/{image_id}` | `product_management` | The product page's extra photos - multipart, repeated `files` field, appends rather than replaces. See point 15 above |
 

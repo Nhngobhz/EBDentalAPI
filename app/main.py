@@ -22,6 +22,7 @@ from app.routers import (
     products,
     promotions,
     sets,
+    settings as settings_router,
     telegram_webhook,
     users,
 )
@@ -113,6 +114,8 @@ app.include_router(manuals.router)
 app.include_router(promotions.router)
 app.include_router(sets.router)
 app.include_router(orders.router)
+# Imported as `settings_router` because `settings` in this module is the config object.
+app.include_router(settings_router.router)
 app.include_router(telegram_webhook.router)
 
 

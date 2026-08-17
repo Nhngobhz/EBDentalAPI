@@ -8,7 +8,7 @@ Naming convention used throughout:
 """
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import Annotated, Literal, Optional, Union
+from typing import Annotated, Any, Literal, Optional, Union
 
 from pydantic import (
     AfterValidator,
@@ -87,6 +87,9 @@ class UserCreateByAdmin(UserBase):
     price_listing: bool = False
     product_management: bool = False
     customer_management: bool = False
+    # Site-wide configuration (the Settings screen). See app/core/deps.py - not
+    # implied by the four above.
+    admin: bool = False
 
 
 class UserUpdateSelf(BaseModel):
@@ -123,6 +126,7 @@ class UserUpdateByAdmin(BaseModel):
     price_listing: Optional[bool] = None
     product_management: Optional[bool] = None
     customer_management: Optional[bool] = None
+    admin: Optional[bool] = None
 
 
 class UserOut(UserBase):
@@ -136,6 +140,7 @@ class UserOut(UserBase):
     price_listing: bool
     product_management: bool
     customer_management: bool
+    admin: bool
     updated_at: datetime
     updated_by: Optional["UserMini"] = None
 
@@ -556,6 +561,8 @@ class SetBase(BaseModel):
 class SetCreate(SetBase):
     price: Decimal = Field(..., gt=0)
     old_price: Optional[Decimal] = Field(None, gt=0)
+    # Optional, unlike ProductCreate.brand_id - see Set.brand_id.
+    brand_id: Optional[int] = None
     items: list[BundleItemIn] = []
 
 
@@ -564,6 +571,9 @@ class SetUpdate(BaseModel):
     description: Optional[str] = None
     price: Optional[Decimal] = Field(None, gt=0)
     old_price: Optional[Decimal] = Field(None, gt=0)
+    # Sending null clears the set's brand (back to "All" on the Promotions
+    # page); omitting the field leaves it alone, as everywhere else here.
+    brand_id: Optional[int] = None
     # Omitted -> contents left alone; sent (even as []) -> replaced wholesale.
     items: Optional[list[BundleItemIn]] = None
 
@@ -577,6 +587,9 @@ class SetOut(SetBase):
     old_price: Optional[Union[Decimal, str]] = None
     set_image: Optional[str] = None
     detail_image: Optional[str] = None
+    # Same nested shape ProductOut uses, so a set card can render the brand
+    # name/logo without a second lookup. None for an unbranded set.
+    brand: Optional[BrandMini] = None
     # Member products - same shape/reasoning as PromotionOut.items.
     items: list[BundleItemOut] = []
     created_at: datetime
@@ -813,3 +826,24 @@ class CheckoutStatusOut(BaseModel):
 
     payment_status: Literal["unpaid", "paid", "expired"]
     order: Optional[OrderOut] = None
+
+
+# ---------------------------------------------------------------------------
+# Site-wide settings (see app/core/settings_spec.py)
+# ---------------------------------------------------------------------------
+class SettingsUpdate(BaseModel):
+    """A partial dict of {key: value}. Types are deliberately loose here - `Any` rather
+    than a field per setting - because the real validation is `settings_spec.coerce()`,
+    which is also what the admin form is generated from. Declaring the shape twice is
+    exactly the drift this design exists to avoid."""
+
+    values: dict[str, Any] = Field(default_factory=dict)
+
+
+class SettingsReset(BaseModel):
+    """Put settings back on their defaults: a whole `group`, an explicit list of `keys`,
+    or both. At least one must be non-empty (enforced in the router, so the error names
+    what to send instead of a Pydantic shape complaint)."""
+
+    group: Optional[str] = None
+    keys: Optional[list[str]] = None

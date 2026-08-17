@@ -135,6 +135,7 @@ async def create_user(
         price_listing=payload.price_listing,
         product_management=payload.product_management,
         customer_management=payload.customer_management,
+        admin=payload.admin,
         is_active=True,
         is_verified=False,
     )
@@ -174,6 +175,25 @@ def update_user(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="You cannot revoke your own user_management permission",
         )
+
+    # Same reasoning for `admin`, and it bites harder: the Settings screen is the only
+    # way to grant `admin`, so the last holder revoking it from themselves leaves the
+    # permission ungrantable through the UI at all - it would take a hand-written UPDATE
+    # against the database to recover.
+    if user.id == current_user.id and data.get("admin") is False:
+        remaining_admins = (
+            db.query(User)
+            .filter(User.admin.is_(True), User.is_active.is_(True), User.id != user.id)
+            .count()
+        )
+        if remaining_admins == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "You are the only account with the 'admin' permission - grant it to "
+                    "someone else before removing your own"
+                ),
+            )
 
     for field, value in data.items():
         setattr(user, field, value)

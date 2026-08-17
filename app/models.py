@@ -120,11 +120,18 @@ class User(AuditedMixin, Base):
 
     # --- Permissions (the actual RBAC source of truth) ---------------------
     # role_title is a free-text label (e.g. "Sales Manager"). What a user
-    # can actually DO is controlled by these four explicit flags.
+    # can actually DO is controlled by these explicit flags.
     user_management = Column(Boolean, default=False, nullable=False)
     price_listing = Column(Boolean, default=False, nullable=False)
     product_management = Column(Boolean, default=False, nullable=False)
     customer_management = Column(Boolean, default=False, nullable=False)
+    # Site-wide configuration (the Settings screen / AppSetting below). Deliberately
+    # separate from user_management: being allowed to create staff accounts is not the
+    # same as being allowed to switch the storefront into maintenance mode or rewrite
+    # what every printed quote says. Migration a3d81f6c94e2 backfills it to true for
+    # accounts that already held all four flags above - what app/core/deps.py's module
+    # docstring calls a "de-facto super admin" - so existing owners aren't locked out.
+    admin = Column(Boolean, default=False, nullable=False, server_default="false")
 
     # --- Added: required to support password auth / email confirmation -----
     hashed_password = Column(String(255), nullable=False)
@@ -436,7 +443,23 @@ class Set(AuditedMixin, Base):
     # set card - e.g. a shot of what's inside the bundle. Purely decorative:
     # a set without one just renders the card without it.
     detail_image = Column(String(500), nullable=True)
+
+    # Which brand the set belongs to, so the Promotions page can be browsed by
+    # brand the way the catalog is. Nullable, unlike Product.brand_id: every
+    # existing set predates this column, and a mixed-brand bundle legitimately
+    # belongs to no single brand (those sit under "All").
+    brand_id = Column(
+        Integer, ForeignKey("brands.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # No back_populates onto Brand: Brand.sets is deliberately not defined, so
+    # SQLAlchemy has no relationship to "helpfully" NULL out when a brand is
+    # deleted and the DB's ON DELETE RESTRICT is what answers - the same
+    # in-use-brand protection Product gets from brand_id being NOT NULL. See
+    # the passive_deletes comment on Category.products for the failure mode.
+    brand = relationship("Brand")
 
     items = relationship(
         "SetItem",
@@ -686,3 +709,40 @@ class OrderItem(Base):
         backref=backref("parent", remote_side=[id]),
         order_by="OrderItem.id",
     )
+
+
+class AppSetting(Base):
+    """One overridden site-wide setting, as a key/value row.
+
+    Deliberately a key/value table rather than a wide one-row `settings` table with a
+    column per setting: adding a setting is then a code change in
+    app/core/settings_spec.py and nothing else, with no migration and no risk of the
+    schema and the admin form drifting apart.
+
+    Only *overrides* live here. Every setting's default is declared in the spec, and a
+    key with no row simply reads as its default - which means a fresh database needs no
+    seeding, and "reset to default" is a DELETE rather than a write of a value someone
+    has to remember. `value` is JSON so a bool stays a bool and a number stays a number;
+    reading a row for a key the spec no longer defines just ignores it.
+
+    Secrets are NOT stored here. API keys and tokens (PayWay, Bakong, Telegram, SMTP,
+    R2) stay in the environment where the deployment already keeps them - the Settings
+    screen only reports whether each is configured. Two sources of truth for a
+    credential is how you get a "why is it still using the old key" afternoon.
+    """
+
+    __tablename__ = "app_settings"
+
+    key = Column(String(100), primary_key=True)
+    value = Column(JSON, nullable=True)
+
+    # Same pair as AuditedMixin, spelled out rather than mixed in: this table has no
+    # `id`, and "who last changed the store's phone number" is worth keeping even
+    # though nothing else about the row is.
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+    updated_by_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    updated_by = relationship("User", foreign_keys=[updated_by_user_id])

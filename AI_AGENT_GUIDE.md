@@ -42,7 +42,7 @@ confusing (not obviously wrong) results.
   (`order_type`): staff-placed rows and customer "cash" checkouts are
   quotes (server-priced snapshots, payment happens offline later);
   only a customer KHQR checkout is a real order, which starts
-  `payment_status: "unpaid"` and carries a generated Bakong QR payload.
+  `payment_status: "unpaid"` and carries a generated KHQR payload.
   Either kind stays editable by staff until `payment_status` is `"paid"`,
   after which it is frozen (`409` on any write, including delete).
   See section 6's Orders table.
@@ -194,21 +194,32 @@ from Google rather than a guessable secret. The limit lives in-process
 Staff (`User`) authorization is **not** role-based despite the
 `role_title` field existing - `role_title` (e.g. "Sales Manager") is a
 free-text display label only and is never checked by any endpoint. Actual
-authorization comes from four independent boolean flags on the `User`
+authorization comes from five independent boolean flags on the `User`
 row, checked directly:
 
 | Permission | Grants |
 |---|---|
 | `user_management` | Create/edit/deactivate staff (`User`) accounts, view the staff list |
 | `customer_management` | Full CRUD on `Customer` records, including toggling `access_permission` |
-| `product_management` | CRUD on `Brand`, `Category`, `Product` (non-price fields), `Manual` |
-| `price_listing` | Set `price`/`discount` on `Product`, full CRUD on `Promotion` and `Set` |
+| `product_management` | CRUD on `Brand`, `Category`, `Product` (non-price fields), `Manual`, and full CRUD on `Promotion` and `Set` |
+| `price_listing` | Set `price`/`discount` on `Product`, and manage `Order`s (list/read/place/edit/delete, mark paid, issue a KHQR) |
+| `admin` | Read and write site-wide settings (`/settings`, section 6) - store contact details, printed-quote wording, maintenance mode |
 
 Notes an agent should know before assuming a 403 is a bug:
 
 - These flags are **independent**, not a hierarchy - `user_management`
-  does not imply the other three. A user with all four `true` is a
-  de-facto super-admin; there is no separate `is_superuser` flag.
+  does not imply the other three. A user with all four of the original
+  flags `true` is a de-facto super-admin; there is no separate
+  `is_superuser` flag.
+- `admin` was added after the other four and is **not** implied by them
+  for new accounts - it has to be granted explicitly. Migration
+  `a3d81f6c94e2` backfilled it onto accounts that already held all four,
+  so pre-existing super-admins have it, but `POST /users/` defaults it to
+  `false` like every other flag.
+- A staff member cannot revoke their **own** `admin` when they are the
+  last active holder of it (`400`). Settings is the only place the flag
+  can be granted from, so the last holder dropping it would make the
+  permission ungrantable without a manual database write.
 - Changing an **existing** product's `price`/`discount` via the general
   `PUT /products/{id}` requires **both** `product_management` AND
   `price_listing`. A caller with only `price_listing` must instead use
@@ -458,9 +469,9 @@ overwrite. Not price-masked - a photo isn't a price.
 |---|---|---|
 | `GET /promotions/` | Public | query `skip`, `limit`, `active_only` (bool - filters to `start_date <= now <= end_date`); price masking applies, see section 4 |
 | `GET /promotions/{id}` | Public | price masking applies, see section 4 |
-| `POST /promotions/` | `price_listing` | JSON `PromotionCreate` (`promotion_name`, `description?`, `price` >0, `old_price?` >0, `start_date`, `end_date` - must be after `start_date` or `422`, `items?` - see "Bundle contents" below) |
-| `PUT /promotions/{id}` | `price_listing` | JSON `PromotionUpdate`, all optional; if you change only one of `start_date`/`end_date`, the other's current value is still validated against it |
-| `DELETE /promotions/{id}` | `price_listing` | - |
+| `POST /promotions/` | `product_management` | JSON `PromotionCreate` (`promotion_name`, `description?`, `price` >0, `old_price?` >0, `start_date`, `end_date` - must be after `start_date` or `422`, `items?` - see "Bundle contents" below) |
+| `PUT /promotions/{id}` | `product_management` | JSON `PromotionUpdate`, all optional; if you change only one of `start_date`/`end_date`, the other's current value is still validated against it |
+| `DELETE /promotions/{id}` | `product_management` | - |
 
 **Note**: `Promotion.price`/`old_price` are masked the same way as
 `Product` prices - unauthenticated/unentitled callers get `price` as the
@@ -471,15 +482,21 @@ A `Set` is a bundle deal shown on the storefront's Promotions page,
 alongside `Promotion`. Same shape as `Promotion` minus `start_date`/
 `end_date` - a set is never time-boxed, it's always on sale.
 
+Unlike `Promotion`, a set can be filed under a `Brand` (`brand_id`, added
+2026-08-13), which is what the Promotions page's brand strip filters on. It
+is **optional** - a mixed-brand bundle has no single brand and `SetOut.brand`
+comes back `null` for it. A brand still assigned to a set can't be deleted
+(400 from `DELETE /brands/{id}`), same as one still assigned to a product.
+
 | Method & path | Auth | Body / notes |
 |---|---|---|
-| `GET /sets/` | Public | query `skip`, `limit`; price masking applies, see section 4 |
+| `GET /sets/` | Public | query `skip`, `limit`, `brand_id`; price masking applies, see section 4 |
 | `GET /sets/{id}` | Public | price masking applies, see section 4 |
-| `POST /sets/` | `price_listing` | JSON `SetCreate` (`set_name`, `description?`, `price` >0, `old_price?` >0, `items?` - see "Bundle contents" below) |
-| `PUT /sets/{id}` | `price_listing` | JSON `SetUpdate`, all optional |
-| `POST /sets/{id}/image` | `price_listing` | multipart `file` |
-| `POST /sets/{id}/detail-image` | `price_listing` | multipart `file` (the optional second image under the name/description) |
-| `DELETE /sets/{id}` | `price_listing` | - |
+| `POST /sets/` | `product_management` | JSON `SetCreate` (`set_name`, `description?`, `price` >0, `old_price?` >0, `brand_id?`, `items?` - see "Bundle contents" below) |
+| `PUT /sets/{id}` | `product_management` | JSON `SetUpdate`, all optional; `brand_id: null` clears the brand, omitting it leaves it alone |
+| `POST /sets/{id}/image` | `product_management` | multipart `file` |
+| `POST /sets/{id}/detail-image` | `product_management` | multipart `file` (the optional second image under the name/description) |
+| `DELETE /sets/{id}` | `product_management` | - |
 
 ### Bundle contents - `Promotion.items` / `Set.items` / `Product.free_items`
 
@@ -527,7 +544,7 @@ server-side and never trusted from the request body.
 | `GET /orders/mine` | Same bar as `POST /orders/` (staff `price_listing`/`product_management`, or customer `access_permission`) | query `skip`, `limit`. The caller's OWN orders, scoped from the token (customer → `customer_id`, staff → `created_by_user_id`) - never from a query param. Exists because a customer has no `price_listing` and so can't use `GET /orders/` to see even their own history; powers the storefront's account drawer. Declared above `GET /{order_id}` so "mine" isn't parsed as an id. |
 | `GET /orders/mine/{id}` | Same, plus must own the order | The caller's own order in full (line items included) - what the account drawer's detail view shows and re-prints its PDF from. **404, not 403**, on an order the caller doesn't own, so it can't be used to probe which ids exist. |
 | `GET /orders/{id}` | `price_listing` | - |
-| `GET /orders/{id}/payment-status` | The principal who placed the order, **or any `price_listing` staff** | KHQR orders only (`400` otherwise). Returns `{"payment_status": "unpaid"\|"paid"}`; while unpaid and `BAKONG_API_TOKEN` is configured, each call checks Bakong for the transaction and the first confirmed one flips the order to paid (stamping `paid_at`, firing the paid-order Telegram alert). Polled by the paying customer's browser, and by the admin Orders page's QR dialog. |
+| `GET /orders/{id}/payment-status` | The principal who placed the order, **or any `price_listing` staff** | KHQR orders only (`400` otherwise). Returns `{"payment_status": "unpaid"\|"paid"}`; while unpaid, each call asks the order's own provider about the transaction (PayWay by `tran_id`, or Bakong by `khqr_md5` when `BAKONG_API_TOKEN` is configured) and the first confirmed one flips the order to paid (stamping `paid_at`, firing the paid-order Telegram alert). Polled by the paying customer's browser, and by the admin Orders page's QR dialog. |
 | `POST /orders/{id}/khqr` | `price_listing` | No body. Issues a scannable KHQR against an **existing** order (counter/phone sale) for its current `grand_total`, setting `payment_method: "khqr"`, `payment_status: "unpaid"`; returns the whole `OrderOut`. Idempotent - returns the stored payload if one exists. `400` if already paid or KHQR isn't configured. `order_type` is deliberately **not** changed. |
 | `PUT /orders/{id}` | `price_listing` | JSON `OrderUpdate` - `status`, `payment_status`, `clinic_name`, `contact_person`, `phone`, `address`, `payment_term`, `install_term`, `discount_type`, `discount_value`, `items`. **`409` on a paid order** (see below). `items` REPLACES the line list and is re-priced server-side; a discount needs `product_management`; `payment_status: "paid"` stamps `paid_at` and fires the paid-order alert. |
 | `DELETE /orders/{id}` | `price_listing` | hard delete, cascades to `OrderItem` rows. **`409` on a paid order.** |
@@ -665,6 +682,39 @@ Notes an agent should know before calling this:
   (`services/invoice_pdf.py`) - so this endpoint is best-effort: a slow/missing call
   never fails the purchase itself, it just means the Telegram alert uses the
   fallback PDF instead of the real one.
+
+### Site settings - `/settings`
+
+Admin-editable, site-wide configuration. The catalogue of what exists - key, type,
+default, group, label - is declared in `app/core/settings_spec.py`, which is the single
+source of truth: the API validates against it and the Flask admin form is generated from
+it. Adding a setting is a change to that file only, with **no migration**.
+
+| Method & path | Auth | Notes |
+|---|---|---|
+| `GET /settings/public` | **Public** | Only the keys the spec marks `public`. The storefront footer, contact page and printed-quote letterhead read from this, and an anonymous visitor has no token |
+| `GET /settings/` | `admin` | `{values, defaults, groups, status}` - `groups` is the form spec, `status` is the read-only integrations panel |
+| `PUT /settings/` | `admin` | Body `{"values": {key: value}}`, partial. Coerced to the declared type (`"45"` → `45`, `"on"` → `true`) |
+| `POST /settings/reset` | `admin` | Body `{"group": "store"}` and/or `{"keys": [...]}`. Deletes the overrides so those keys read as their defaults again |
+
+Things worth knowing:
+
+- **Only overrides are stored.** `app_settings` is a key/value table that starts empty;
+  a key with no row reads as its spec default. So "reset" is a `DELETE`, and saving a
+  value that *equals* the default also deletes the row rather than storing a copy.
+- **A rejected value saves nothing.** Every value in the payload is coerced before
+  anything is written, so one bad field fails the whole request with `400` - no
+  half-saved form. The message names the field by its human label
+  (`"Quote validity (days) must be at least 1"`), not by key.
+- **No secrets live here.** PayWay / Bakong / Telegram / SMTP / R2 / Google credentials
+  stay in the environment (`app/config.py`). `GET /settings/` reports whether each is
+  configured, under `status`, and never returns a value.
+- **Values are cached** for 30s process-wide (`app/services/app_settings.py`), and
+  invalidated immediately on write. The Flask app caches `GET /settings/public` for 60s
+  on its side and clears that on save too.
+- Changing anything in the `document` group affects **both** printed-document engines -
+  `services/invoice_pdf.py` here and `buildPrintTemplate()` in the website's `main.js`.
+  They must stay in step.
 
 ### Misc
 | Method & path | Auth | Notes |

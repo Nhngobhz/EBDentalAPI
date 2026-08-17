@@ -17,6 +17,7 @@ from app.core import ratelimit
 from app.database import Base, SessionLocal, engine
 from app.main import app
 from app.core.security import hash_password
+from app.services import app_settings
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -35,6 +36,10 @@ def _clean_tables():
     # one test's deliberate bad-password attempts would count against the next
     # test's legitimate logins from the same TestClient address.
     ratelimit.reset()
+    # Same reasoning for the settings cache (app/services/app_settings.py): it memoizes
+    # the merged settings dict process-wide for 30s, so a test that changes a setting
+    # would otherwise leak that value into the next test even after this truncate.
+    app_settings.invalidate()
     db = SessionLocal()
     try:
         for table in reversed(Base.metadata.sorted_tables):
@@ -72,6 +77,10 @@ def make_admin(db_session, email="admin@example.com", password="adminpass123"):
         price_listing=True,
         product_management=True,
         customer_management=True,
+        # Mirrors migration a3d81f6c94e2, which grants `admin` to every account that
+        # already held all four flags above. A test "admin" should be the same thing a
+        # real deployment's admin is.
+        admin=True,
     )
     db_session.add(admin)
     db_session.commit()

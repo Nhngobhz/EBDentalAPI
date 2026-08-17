@@ -34,6 +34,7 @@ from fpdf.enums import CellBordersLayout, TableBordersLayout
 from fpdf.fonts import FontFace
 
 from app.schemas import OrderOut
+from app.services import app_settings
 
 _FONTS_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
 # Mirrors the website print template's font stack exactly: 'Inter' is the default
@@ -116,6 +117,13 @@ class _QuotePDF(FPDF):
 
 
 def build_invoice_pdf(order: OrderOut) -> bytes:
+    # The letterhead and the validity/paid wording are admin-editable (the Settings
+    # screen's "Quote & Invoice" group). This runs outside a request - it's called from
+    # the Telegram service - so get_all() opens its own short-lived session; see
+    # app/services/app_settings.py. The same keys drive buildPrintTemplate() in the
+    # website's main.js, and the two must stay in step.
+    site = app_settings.get_all()
+
     pdf = _QuotePDF(unit="mm", format="A4")
     pdf.set_margins(10, 10, 10)
     pdf.set_auto_page_break(auto=True, margin=10)
@@ -136,9 +144,12 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
     is_receipt = order.payment_status == "paid"
     doc_title = "Receipt" if is_receipt else "Quotation"
     paid_note = (
-        "Paid via KHQR. Thank you for your purchase."
+        site["receipt_note_khqr"]
         if order.payment_method == "khqr"
-        else "Paid in full. Thank you for your purchase."
+        else site["receipt_note_cash"]
+    )
+    validity_note = (
+        f"Quotation valid for {site['quote_validity_days']} days from the date issued."
     )
 
     # ---- header: brand (left) / "Quotation"/"Receipt" + No/Date (right) ----
@@ -146,13 +157,21 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
     # qpt-brand-meta/qpt-meta-right (0.72-0.75rem) at ~96dpi/16px-root.
     pdf.set_xy(pdf.l_margin, top)
     _use_latin_font(pdf, 20, bold=True)
-    pdf.cell(content_width / 2, 9, "EB DENTAL")
+    pdf.cell(content_width / 2, 9, site["document_brand_name"])
     pdf.set_xy(pdf.l_margin + content_width / 2, top)
     pdf.cell(content_width / 2, 9, doc_title, align="R")
 
     pdf.set_xy(pdf.l_margin, top + 9)
     _use_latin_font(pdf, 8.5)
-    pdf.multi_cell(content_width / 2, 4.2, "Phnom Penh, Cambodia\nTel: 012 81 89 58 / 011 81 89 58")
+    # Two lines when a phone number is set, one when it isn't - an empty "Tel:" prefix
+    # would otherwise print on its own.
+    tel_line = site["document_tel_line"]
+    pdf.multi_cell(
+        content_width / 2,
+        4.2,
+        f"{site['document_address_line']}\nTel: {tel_line}" if tel_line
+        else site["document_address_line"],
+    )
 
     created = order.created_at or datetime.now(timezone.utc)
     pdf.set_xy(pdf.l_margin + content_width / 2, top + 9)
@@ -330,7 +349,7 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
 
         totals_row = table.row()
         totals_row.cell(
-            paid_note if is_receipt else "Quotation valid for 30 days from the date issued.",
+            paid_note if is_receipt else validity_note,
             colspan=6, rowspan=4, align="L", v_align="TOP",
         )
         totals_row.cell("Sub-Total($):", colspan=1, align="L")

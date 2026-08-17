@@ -14,7 +14,12 @@ from app.schemas import PromotionCreate, PromotionOut, PromotionUpdate
 
 router = APIRouter(prefix="/promotions", tags=["Promotions"])
 
-_perm = Depends(require_permission("price_listing"))
+# Editing a promotion is a catalogue change, not a pricing one: it decides what the
+# store advertises and which products come in the bundle, so it gates on
+# product_management exactly as products/brands/categories do. A price_listing-only
+# staffer can still read every promotion (the GETs below are public) and sell it -
+# they just can't author it.
+_perm = Depends(require_permission("product_management"))
 
 _MASKED_PRICE = "XXXX"
 
@@ -74,8 +79,8 @@ def create_promotion(payload: PromotionCreate, current_user: User = _perm, db: S
     db.commit()
     db.refresh(promotion)
     # Serialized (not returned raw) so old_price is the contents-derived figure
-    # here too, exactly as a later GET would report it. can_view_price=True:
-    # every write endpoint below is already price_listing-gated staff.
+    # here too, exactly as a later GET would report it. can_view_price=True: every
+    # write endpoint below is staff, and staff always see real prices.
     return _serialize_promotion(promotion, True)
 
 

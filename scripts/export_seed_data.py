@@ -267,6 +267,9 @@ def export_sets(db) -> list[dict]:
                 "description": s.description,
                 "price": _num(s.price),
                 "old_price": _num(s.old_price),
+                # By name, like a product's brand - ids differ between databases.
+                # None for a set filed under no brand.
+                "brand": s.brand.brand_name if s.brand else None,
                 "set_image": s.set_image,
                 "detail_image": s.detail_image,
                 "items": [

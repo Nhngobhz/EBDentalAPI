@@ -1184,6 +1184,19 @@ def update_order(
                 detail=f"{field} cannot be empty",
             )
 
+    # A completed sale's workflow status is final. The rest of a paid order stays
+    # editable (see _reject_if_paid) because staff genuinely need to correct a real
+    # order after taking payment - but the status is the one field that describes how
+    # the sale ended, and moving a settled order back to "pending" or on to
+    # "cancelled" only ever misrepresents it against the receipt the customer holds.
+    # Re-sending the value it already has is allowed, so a full-object edit that
+    # simply carries the current status through doesn't trip this.
+    if order.payment_status == "paid" and "status" in fields and fields["status"] != order.status:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This order is complete - its status can no longer be changed",
+        )
+
     # Same gate as placing an order with a discount: handing out money off is a
     # product_management call, not something every price_listing staffer can do.
     if (fields.get("discount_value") or Decimal("0")) > 0 and not current_user.product_management:

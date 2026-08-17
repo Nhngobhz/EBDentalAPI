@@ -249,7 +249,9 @@ def seed_promotions(db, product_by_name: dict[str, Product]) -> None:
         db.flush()
 
 
-def seed_sets(db, product_by_name: dict[str, Product]) -> None:
+def seed_sets(
+    db, product_by_name: dict[str, Product], brand_by_name: dict[str, Brand]
+) -> None:
     for item in seed_data.SETS:
         name = item["set_name"]
         existing = db.query(Set).filter(Set.set_name == name).first()
@@ -257,11 +259,19 @@ def seed_sets(db, product_by_name: dict[str, Product]) -> None:
             print(f"Set '{name}' already exists (id={existing.id}), skipping.")
             continue
 
+        # Optional, unlike a product's brand - a set may legitimately have none,
+        # so an absent/unknown brand leaves the set unbranded rather than
+        # skipping it the way seed_products does.
+        brand = brand_by_name.get(item.get("brand")) if item.get("brand") else None
+        if item.get("brand") and brand is None:
+            print(f"Brand '{item['brand']}' not found, leaving set '{name}' unbranded.")
+
         bundle = Set(
             set_name=name,
             description=item.get("description"),
             price=item["price"],
             old_price=item.get("old_price"),
+            brand_id=brand.id if brand else None,
             set_image=item.get("set_image"),
             detail_image=item.get("detail_image"),
         )
@@ -347,7 +357,7 @@ def main() -> None:
         seed_product_free_items(db, product_by_name)
         seed_manuals(db, product_by_name)
         seed_promotions(db, product_by_name)
-        seed_sets(db, product_by_name)
+        seed_sets(db, product_by_name, brand_by_name)
         seed_users(db)
         seed_customers(db)
         db.commit()

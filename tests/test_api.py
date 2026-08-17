@@ -403,6 +403,66 @@ def test_price_listing_permission_required_for_price_changes(client, db_session)
     assert resp.json()["price"] == "5.00"
 
 
+def test_promotions_and_sets_are_authored_by_product_management(client, db_session):
+    """Promotions and Sets used to be price_listing writes. They decide what the store
+    advertises and which products are in the bundle, which is catalogue authoring - so
+    they moved to product_management, and a sales/pricing staffer can now only read
+    them."""
+    from app.models import User
+    from app.core.security import hash_password
+
+    db_session.add(User(
+        user_name="Pricing Only",
+        email="promopricing@example.com",
+        hashed_password=hash_password("password123"),
+        is_active=True,
+        is_verified=True,
+        price_listing=True,
+    ))
+    db_session.add(User(
+        user_name="Catalog Only",
+        email="promocatalog@example.com",
+        hashed_password=hash_password("password123"),
+        is_active=True,
+        is_verified=True,
+        product_management=True,
+    ))
+    db_session.commit()
+
+    pricing_headers = auth_header(client, "promopricing@example.com", "password123")
+    catalog_headers = auth_header(client, "promocatalog@example.com", "password123")
+
+    promo = {
+        "promotion_name": "Perm Promo",
+        "price": "50.00",
+        "start_date": "2026-01-01T00:00:00",
+        "end_date": "2026-12-31T23:59:59",
+    }
+    assert client.post("/promotions/", json=promo, headers=pricing_headers).status_code == 403
+    assert client.post("/sets/", json={"set_name": "Perm Set", "price": "50.00"},
+                       headers=pricing_headers).status_code == 403
+
+    created_promo = client.post("/promotions/", json=promo, headers=catalog_headers)
+    assert created_promo.status_code == 201, created_promo.text
+    created_set = client.post("/sets/", json={"set_name": "Perm Set", "price": "50.00"},
+                              headers=catalog_headers)
+    assert created_set.status_code == 201, created_set.text
+
+    # Editing and deleting follow the same rule.
+    promo_id = created_promo.json()["id"]
+    set_id = created_set.json()["id"]
+    assert client.put(f"/promotions/{promo_id}", json={"price": "40.00"},
+                      headers=pricing_headers).status_code == 403
+    assert client.put(f"/sets/{set_id}", json={"price": "40.00"},
+                      headers=pricing_headers).status_code == 403
+    assert client.delete(f"/promotions/{promo_id}", headers=pricing_headers).status_code == 403
+    assert client.delete(f"/sets/{set_id}", headers=pricing_headers).status_code == 403
+
+    # But a pricing staffer still *reads* both - they sell them.
+    assert client.get("/promotions/", headers=pricing_headers).status_code == 200
+    assert client.get(f"/sets/{set_id}", headers=pricing_headers).status_code == 200
+
+
 # ---------------------------------------------------------------------------
 # list_price (the stored pre-discount price - see migration f2a9c4e18b73)
 # ---------------------------------------------------------------------------
@@ -1039,6 +1099,76 @@ def test_promotion_date_validation_and_active_filter(client, db_session):
     assert active_only.status_code == 200
     assert len(active_only.json()) == 1
     assert active_only.json()[0]["promotion_name"] == "Summer Sale"
+
+
+# ---------------------------------------------------------------------------
+# Sets - brand assignment and the storefront's brand filter
+# ---------------------------------------------------------------------------
+def test_set_brand_is_optional_and_filterable(client, db_session):
+    make_admin(db_session, email="setbrand@example.com", password="password123")
+    headers = auth_header(client, "setbrand@example.com", "password123")
+
+    brand_id = client.post(
+        "/brands/", data={"brand_name": "SetBrandCo"}, headers=headers
+    ).json()["id"]
+
+    branded = client.post(
+        "/sets/",
+        json={"set_name": "Branded Set", "price": "50.00", "brand_id": brand_id},
+        headers=headers,
+    )
+    assert branded.status_code == 201, branded.text
+    assert branded.json()["brand"]["brand_name"] == "SetBrandCo"
+
+    # A set without a brand is still valid - it just sits under "All".
+    plain = client.post("/sets/", json={"set_name": "Plain Set", "price": "20.00"}, headers=headers)
+    assert plain.status_code == 201, plain.text
+    assert plain.json()["brand"] is None
+
+    # Public listing, unauthenticated: the filter is what the Promotions page's
+    # brand strip uses.
+    all_sets = client.get("/sets/")
+    assert all_sets.status_code == 200
+    assert len(all_sets.json()) == 2
+
+    filtered = client.get(f"/sets/?brand_id={brand_id}")
+    assert filtered.status_code == 200
+    assert [s["set_name"] for s in filtered.json()] == ["Branded Set"]
+
+    # Empty string (a browser-built `?brand_id=`) means "no filter", not a 422.
+    assert len(client.get("/sets/?brand_id=").json()) == 2
+
+
+def test_set_brand_can_be_changed_and_cleared(client, db_session):
+    make_admin(db_session, email="setbrand2@example.com", password="password123")
+    headers = auth_header(client, "setbrand2@example.com", "password123")
+
+    brand_id = client.post(
+        "/brands/", data={"brand_name": "SwitchBrandCo"}, headers=headers
+    ).json()["id"]
+    set_id = client.post(
+        "/sets/", json={"set_name": "Switchable", "price": "30.00"}, headers=headers
+    ).json()["id"]
+
+    assigned = client.put(f"/sets/{set_id}", json={"brand_id": brand_id}, headers=headers)
+    assert assigned.status_code == 200, assigned.text
+    assert assigned.json()["brand"]["id"] == brand_id
+
+    # Explicit null clears it; omitting the field would have left it alone.
+    cleared = client.put(f"/sets/{set_id}", json={"brand_id": None}, headers=headers)
+    assert cleared.status_code == 200
+    assert cleared.json()["brand"] is None
+
+
+def test_set_rejects_unknown_brand(client, db_session):
+    make_admin(db_session, email="setbrand3@example.com", password="password123")
+    headers = auth_header(client, "setbrand3@example.com", "password123")
+
+    resp = client.post(
+        "/sets/", json={"set_name": "Ghost Brand Set", "price": "10.00", "brand_id": 999999}, headers=headers
+    )
+    assert resp.status_code == 400
+    assert "brand_id" in resp.json()["detail"]
 
 
 # ---------------------------------------------------------------------------
@@ -3142,7 +3272,9 @@ def test_a_paid_order_stays_editable(client, db_session, monkeypatch):
     now a no-op). This used to 409 on the reasoning that a receipt had been issued
     against those exact figures; staff needing to correct a real order after taking
     payment won out. The customer's already-printed receipt will not match afterwards -
-    updated_by is the only record that an amendment happened."""
+    updated_by is the only record that an amendment happened.
+
+    `status` is the one exception - see the test below."""
     _fast_alert_wait(monkeypatch)
     make_admin(db_session, email="frozen@example.com", password="password123")
     headers = auth_header(client, "frozen@example.com", "password123")
@@ -3153,7 +3285,6 @@ def test_a_paid_order_stays_editable(client, db_session, monkeypatch):
 
     for payload in (
         {"clinic_name": "Now It Applies"},
-        {"status": "delivered"},
         {"discount_type": "cash", "discount_value": 5},
         {"items": [{"product_id": product["id"], "qty": 9}]},
     ):
@@ -3162,7 +3293,6 @@ def test_a_paid_order_stays_editable(client, db_session, monkeypatch):
 
     body = client.get(f"/orders/{order['id']}", headers=headers).json()
     assert body["clinic_name"] == "Now It Applies"
-    assert body["status"] == "delivered"
     assert body["grand_total"] == "895.00"  # 9 x 100 re-priced, less the $5 cash discount
     # The edit is attributed, which is the whole audit trail a paid-order amendment has.
     assert body["updated_by"]["user_name"] == "Admin User"
@@ -3173,6 +3303,47 @@ def test_a_paid_order_stays_editable(client, db_session, monkeypatch):
     ).status_code == 200
     assert client.delete(f"/orders/{order['id']}", headers=headers).status_code == 204
     assert client.get(f"/orders/{order['id']}", headers=headers).status_code == 404
+
+
+def test_a_paid_orders_status_is_final(client, db_session, monkeypatch):
+    """The one thing a completed sale won't accept. Everything else about a paid order
+    can still be corrected (see the test above), but its workflow status describes how
+    the sale ended, and moving a settled order back to "pending" or on to "cancelled"
+    contradicts the receipt the customer is holding."""
+    _fast_alert_wait(monkeypatch)
+    make_admin(db_session, email="finalstatus@example.com", password="password123")
+    headers = auth_header(client, "finalstatus@example.com", "password123")
+    product = _make_order_product(client, headers, name="FinalWidget", price="100.00")
+
+    order = client.post("/orders/", json=_order_payload(product["id"]), headers=headers).json()
+    # Free to move while there is no payment on record.
+    assert client.put(
+        f"/orders/{order['id']}", json={"status": "delivered"}, headers=headers
+    ).status_code == 200
+
+    client.put(f"/orders/{order['id']}", json={"payment_status": "paid"}, headers=headers)
+
+    for new_status in ("pending", "cancelled", "confirmed"):
+        resp = client.put(f"/orders/{order['id']}", json={"status": new_status}, headers=headers)
+        assert resp.status_code == 409, f"{new_status} -> {resp.status_code} {resp.text}"
+
+    # Re-sending the status it already has is not a change, so a full-object edit that
+    # carries the current status through still saves.
+    resp = client.put(
+        f"/orders/{order['id']}",
+        json={"status": "delivered", "clinic_name": "Still Editable"},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = client.get(f"/orders/{order['id']}", headers=headers).json()
+    assert body["status"] == "delivered"
+    assert body["clinic_name"] == "Still Editable"
+
+    # Reversing the payment unlocks it again - the sale is no longer complete.
+    client.put(f"/orders/{order['id']}", json={"payment_status": "unpaid"}, headers=headers)
+    assert client.put(
+        f"/orders/{order['id']}", json={"status": "cancelled"}, headers=headers
+    ).status_code == 200
 
 
 def test_staff_can_issue_a_khqr_for_an_existing_order(client, db_session, monkeypatch):
@@ -3319,3 +3490,245 @@ def test_paid_quote_alert_is_a_receipt_not_a_new_quote():
         OrderOut(**{**base, "order_type": "order", "payment_method": "khqr", "payment_status": "paid"})
     )
     assert "PAID via KHQR" in khqr_caption
+
+
+# ---------------------------------------------------------------------------
+# Site-wide settings + the `admin` permission
+# ---------------------------------------------------------------------------
+def _staff_without_admin(db_session, email):
+    """A staff member holding every OTHER permission. The point of these tests is that
+    `admin` is not implied by the rest - so the negative case has to be someone who
+    would otherwise be able to do anything."""
+    from app.core.security import hash_password
+    from app.models import User
+
+    user = User(
+        user_name="Busy Staffer",
+        email=email,
+        hashed_password=hash_password("password123"),
+        role_title="Manager",
+        is_active=True,
+        is_verified=True,
+        user_management=True,
+        price_listing=True,
+        product_management=True,
+        customer_management=True,
+        admin=False,
+    )
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+    return user
+
+
+def test_public_settings_need_no_auth(client):
+    resp = client.get("/settings/public")
+    assert resp.status_code == 200
+    values = resp.json()
+    # The storefront footer renders from these before anyone has signed in.
+    assert values["store_name"]
+    assert "quote_validity_days" in values
+
+
+def test_public_settings_expose_only_public_keys(client):
+    from app.core.settings_spec import PUBLIC_KEYS
+
+    resp = client.get("/settings/public")
+    assert set(resp.json()) == set(PUBLIC_KEYS)
+
+
+def test_reading_settings_requires_the_admin_permission(client, db_session):
+    _staff_without_admin(db_session, "notadmin@example.com")
+    headers = auth_header(client, "notadmin@example.com", "password123")
+
+    resp = client.get("/settings/", headers=headers)
+    assert resp.status_code == 403
+    assert "admin" in resp.json()["detail"]
+
+    # ...and so does writing, not just reading.
+    resp = client.put("/settings/", json={"values": {"store_name": "Nope"}}, headers=headers)
+    assert resp.status_code == 403
+
+
+def test_admin_can_read_and_save_settings(client, db_session):
+    make_admin(db_session, email="settingsadmin@example.com", password="password123")
+    headers = auth_header(client, "settingsadmin@example.com", "password123")
+
+    resp = client.get("/settings/", headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert {"values", "defaults", "groups", "status"} <= set(body)
+    # The admin form is rendered from `groups`, so it has to describe every setting.
+    described = {s["key"] for g in body["groups"] for s in g["settings"]}
+    assert described == set(body["defaults"])
+
+    resp = client.put(
+        "/settings/",
+        json={"values": {"contact_phone": "010 111 222", "quote_validity_days": "45"}},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    values = resp.json()["values"]
+    assert values["contact_phone"] == "010 111 222"
+    # Coerced to its declared type, not left as the string the form submitted.
+    assert values["quote_validity_days"] == 45
+
+    # Visible to an anonymous visitor immediately - no restart, no cache wait.
+    assert client.get("/settings/public").json()["contact_phone"] == "010 111 222"
+
+
+def test_settings_reject_out_of_range_and_unknown_keys(client, db_session):
+    make_admin(db_session, email="rangeadmin@example.com", password="password123")
+    headers = auth_header(client, "rangeadmin@example.com", "password123")
+
+    resp = client.put("/settings/", json={"values": {"quote_validity_days": 0}}, headers=headers)
+    assert resp.status_code == 400
+    # The message names the field the way the admin sees it, not by key.
+    assert "Quote validity (days)" in resp.json()["detail"]
+
+    resp = client.put("/settings/", json={"values": {"not_a_setting": "x"}}, headers=headers)
+    assert resp.status_code == 400
+
+    # A url-typed setting lands in an href on a public page, so anything that isn't
+    # http(s)/tel/mailto is refused rather than rendered.
+    resp = client.put(
+        "/settings/", json={"values": {"call_now_url": "javascript:alert(1)"}}, headers=headers
+    )
+    assert resp.status_code == 400
+
+
+def test_a_rejected_value_saves_nothing_at_all(client, db_session):
+    """One bad field must not let the good ones through - a half-saved form is the
+    worst outcome, because the admin can't tell which half took."""
+    make_admin(db_session, email="atomicadmin@example.com", password="password123")
+    headers = auth_header(client, "atomicadmin@example.com", "password123")
+
+    resp = client.put(
+        "/settings/",
+        json={"values": {"contact_phone": "011 999 888", "quote_validity_days": 9999}},
+        headers=headers,
+    )
+    assert resp.status_code == 400
+    assert client.get("/settings/public").json()["contact_phone"] != "011 999 888"
+
+
+def test_saving_the_default_value_stores_no_override(client, db_session):
+    from app.core.settings_spec import DEFAULTS
+    from app.models import AppSetting
+
+    make_admin(db_session, email="defaultadmin@example.com", password="password123")
+    headers = auth_header(client, "defaultadmin@example.com", "password123")
+
+    client.put("/settings/", json={"values": {"store_name": "Temporary Name"}}, headers=headers)
+    assert db_session.query(AppSetting).filter_by(key="store_name").count() == 1
+
+    # Typing the default back in is the same thing as resetting - so it leaves no row,
+    # and the setting keeps tracking the default if that ever changes.
+    client.put(
+        "/settings/", json={"values": {"store_name": DEFAULTS["store_name"]}}, headers=headers
+    )
+    assert db_session.query(AppSetting).filter_by(key="store_name").count() == 0
+
+
+def test_settings_reset_restores_a_whole_group(client, db_session):
+    from app.core.settings_spec import DEFAULTS
+
+    make_admin(db_session, email="resetadmin@example.com", password="password123")
+    headers = auth_header(client, "resetadmin@example.com", "password123")
+
+    client.put(
+        "/settings/",
+        json={"values": {"contact_phone": "012 000 000", "store_name": "Changed"}},
+        headers=headers,
+    )
+    resp = client.post("/settings/reset", json={"group": "store"}, headers=headers)
+    assert resp.status_code == 200
+    values = resp.json()["values"]
+    assert values["contact_phone"] == DEFAULTS["contact_phone"]
+    assert values["store_name"] == DEFAULTS["store_name"]
+
+    assert client.post("/settings/reset", json={"group": "nope"}, headers=headers).status_code == 400
+    assert client.post("/settings/reset", json={}, headers=headers).status_code == 400
+
+
+def test_settings_record_who_changed_them(client, db_session):
+    from app.models import AppSetting
+
+    admin = make_admin(db_session, email="auditadmin@example.com", password="password123")
+    headers = auth_header(client, "auditadmin@example.com", "password123")
+
+    client.put("/settings/", json={"values": {"business_hours": "Daily"}}, headers=headers)
+    row = db_session.query(AppSetting).filter_by(key="business_hours").one()
+    assert row.updated_by_user_id == admin.id
+
+
+def test_admin_permission_round_trips_through_the_users_api(client, db_session):
+    """The POST /users/ trap: `admin` has to be in the explicit field list create_user
+    builds the User from, not just in the schema, or it validates and is then dropped."""
+    make_admin(db_session, email="grantadmin@example.com", password="password123")
+    headers = auth_header(client, "grantadmin@example.com", "password123")
+
+    created = client.post(
+        "/users/",
+        json={
+            "user_name": "New Settings Person",
+            "email": "newsettings@example.com",
+            "password": "password123",
+            "admin": True,
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201
+    assert created.json()["admin"] is True
+
+    user_id = created.json()["id"]
+    updated = client.put(f"/users/{user_id}", json={"admin": False}, headers=headers)
+    assert updated.status_code == 200
+    assert updated.json()["admin"] is False
+
+
+def test_the_last_admin_cannot_revoke_their_own_admin_permission(client, db_session):
+    """Settings is the only place `admin` can be granted from, so the last holder
+    dropping it would make the permission ungrantable without a manual DB write."""
+    only_admin = make_admin(db_session, email="lonelyadmin@example.com", password="password123")
+    headers = auth_header(client, "lonelyadmin@example.com", "password123")
+
+    resp = client.put(f"/users/{only_admin.id}", json={"admin": False}, headers=headers)
+    assert resp.status_code == 400
+    assert "only account" in resp.json()["detail"]
+
+    # With a second admin in place it's allowed - the guard is about the last one.
+    make_admin(db_session, email="secondadmin@example.com", password="password123")
+    resp = client.put(f"/users/{only_admin.id}", json={"admin": False}, headers=headers)
+    assert resp.status_code == 200
+
+
+def test_invoice_pdf_uses_the_configured_letterhead(client, db_session):
+    """The printed PDF reads its letterhead from settings. Mirrored by
+    buildPrintTemplate() in the website's main.js - see the eb-quote-parity skill."""
+    from app.schemas import OrderOut
+    from app.services import app_settings
+    from app.services.invoice_pdf import build_invoice_pdf
+
+    make_admin(db_session, email="pdfadmin@example.com", password="password123")
+    headers = auth_header(client, "pdfadmin@example.com", "password123")
+    client.put(
+        "/settings/",
+        json={"values": {"document_brand_name": "TOTALLY OTHER CLINIC", "quote_validity_days": 7}},
+        headers=headers,
+    )
+
+    order = OrderOut(**{
+        "id": 1, "order_number": "EB-1", "quote_code": "260817120000",
+        "items": [], "clinic_name": "C", "phone": "012", "address": "1 St",
+        "discount_type": "cash", "discount_value": "0", "discount_amount": "0",
+        "subtotal": "0.00", "grand_total": "0.00", "status": "pending",
+        "order_type": "quote", "created_at": "2026-08-17T00:00:00Z",
+        "updated_at": "2026-08-17T00:00:00Z",
+    })
+    pdf_bytes = build_invoice_pdf(order)
+    assert pdf_bytes[:4] == b"%PDF"
+    # Belt and braces: the values really did reach the builder, not just the API.
+    values = app_settings.get_all()
+    assert values["document_brand_name"] == "TOTALLY OTHER CLINIC"
+    assert values["quote_validity_days"] == 7

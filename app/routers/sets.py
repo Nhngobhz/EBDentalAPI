@@ -1,20 +1,29 @@
 ﻿from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.core.bundles import build_bundle_rows, bundle_old_price, replace_bundle_rows
 from app.core.audit import stamp_updated_by
 from app.core.deps import get_price_visibility, require_permission
 from app.core.files import save_named_image
-from app.core.query import Limit, Skip
+from app.core.query import Limit, OptionalInt, Skip
 from app.database import get_db
-from app.models import Set, SetItem, User
+from app.models import Brand, Set, SetItem, User
 from app.schemas import SetCreate, SetOut, SetUpdate
 
 router = APIRouter(prefix="/sets", tags=["Sets"])
 
-_perm = Depends(require_permission("price_listing"))
+# Same reasoning as promotions: a set is catalogue authoring, so product_management
+# owns it. price_listing alone reads and sells sets but doesn't create or change them.
+_perm = Depends(require_permission("product_management"))
 
 _MASKED_PRICE = "XXXX"
+
+
+def _check_brand(db: Session, brand_id: int | None) -> None:
+    """400 rather than a raw IntegrityError 500 on an unknown brand_id - same
+    guard create_product runs. None is valid here: a set need not have a brand."""
+    if brand_id is not None and not db.query(Brand).filter(Brand.id == brand_id).first():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="brand_id does not exist")
 
 
 def _serialize_set(set_: Set, can_view_price: bool) -> dict:
@@ -35,13 +44,20 @@ def _serialize_set(set_: Set, can_view_price: bool) -> dict:
 def list_sets(
     skip: Skip = 0,
     limit: Limit = 50,
+    brand_id: OptionalInt = None,
     can_view_price: bool = Depends(get_price_visibility),
     db: Session = Depends(get_db),
 ):
     """Public: sets power the storefront's Promotions page and should be
     visible to anyone. Price/old_price are masked unless the caller is
-    staff or a customer with access_permission=True."""
-    sets = db.query(Set).order_by(Set.created_at.desc()).offset(skip).limit(limit).all()
+    staff or a customer with access_permission=True.
+
+    `brand_id` narrows the list to one brand, the same way GET /products does
+    for the catalog (see Set.brand_id)."""
+    query = db.query(Set).options(joinedload(Set.brand))
+    if brand_id is not None:
+        query = query.filter(Set.brand_id == brand_id)
+    sets = query.order_by(Set.created_at.desc()).offset(skip).limit(limit).all()
     return [_serialize_set(s, can_view_price) for s in sets]
 
 
@@ -59,6 +75,7 @@ def get_set(
 
 @router.post("/", response_model=SetOut, status_code=status.HTTP_201_CREATED)
 def create_set(payload: SetCreate, current_user: User = _perm, db: Session = Depends(get_db)):
+    _check_brand(db, payload.brand_id)
     data = payload.model_dump(exclude={"items"})
     set_ = Set(**data, items=build_bundle_rows(db, payload.items, SetItem))
     stamp_updated_by(set_, current_user)
@@ -66,8 +83,8 @@ def create_set(payload: SetCreate, current_user: User = _perm, db: Session = Dep
     db.commit()
     db.refresh(set_)
     # Serialized (not returned raw) so old_price is the contents-derived figure
-    # here too, exactly as a later GET would report it. can_view_price=True:
-    # every write endpoint below is already price_listing-gated staff.
+    # here too, exactly as a later GET would report it. can_view_price=True: every
+    # write endpoint below is staff, and staff always see real prices.
     return _serialize_set(set_, True)
 
 
@@ -83,6 +100,8 @@ def update_set(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Set not found")
 
     data = payload.model_dump(exclude_unset=True)
+    if "brand_id" in data:
+        _check_brand(db, data["brand_id"])
     # Contents are replaced wholesale when sent and left alone when omitted -
     # see replace_bundle_rows for why this can't just be an assignment.
     if "items" in data:

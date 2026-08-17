@@ -550,10 +550,10 @@ PROMOTIONS = [
 
 
 SETS = [
-    {"set_name": "Laptop Combo", "description": "ewrqwerwqerwqerqwd", "price": 2200, "old_price": None, "set_image": "https://pub-9e796b584d4340c79e93e11491a5f323.r2.dev/sets/Laptop Combo image.JPEG", "detail_image": "https://pub-9e796b584d4340c79e93e11491a5f323.r2.dev/sets/Laptop Combo detail image.JPEG",
+    {"set_name": "Laptop Combo", "description": "ewrqwerwqerwqerqwd", "price": 2200, "old_price": None, "brand": None, "set_image": "https://pub-9e796b584d4340c79e93e11491a5f323.r2.dev/sets/Laptop Combo image.JPEG", "detail_image": "https://pub-9e796b584d4340c79e93e11491a5f323.r2.dev/sets/Laptop Combo detail image.JPEG",
         "items": [],
     },
-    {"set_name": "Sensor 1.5 combo", "description": None, "price": 1890, "old_price": 1870, "set_image": "https://pub-9e796b584d4340c79e93e11491a5f323.r2.dev/sets/Sensor 1.5 combo image.JPEG", "detail_image": None,
+    {"set_name": "Sensor 1.5 combo", "description": None, "price": 1890, "old_price": 1870, "brand": None, "set_image": "https://pub-9e796b584d4340c79e93e11491a5f323.r2.dev/sets/Sensor 1.5 combo image.JPEG", "detail_image": None,
         "items": [
             {"product": "i-Sensor H 1.5", "qty": 1},
             {"product": "AI-Ray", "qty": 1},
