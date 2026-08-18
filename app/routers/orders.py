@@ -37,7 +37,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.config import settings
 from app.core.bundles import bundle_old_price
 from app.core.audit import stamp_updated_by
-from app.core.deps import oauth2_scheme, principal_id_from_token, require_permission
+from app.core.deps import oauth2_scheme, principal_id_from_token, require_any_permission
 from app.core.files import ALLOWED_PDF_TYPES
 from app.core.security import decode_access_token
 from app.core.query import Limit, Skip
@@ -61,7 +61,7 @@ from app.schemas import (
     PendingCheckoutLineOut,
     PendingCheckoutOut,
 )
-from app.services.khqr import build_khqr, check_bakong_payment, khqr_expired
+from app.services.khqr import build_khqr, check_bakong_payment, expiry_minutes, khqr_expired
 from app.services.payway import PayWayError, check_payway_payment, create_payway_khqr
 from app.services.telegram import (
     deliver_order_alert,
@@ -71,11 +71,13 @@ from app.services.telegram import (
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
-# Viewing/managing orders and placing one both gate on price_listing - orders are a
-# money concept like Promotions, which already uses this same flag. No 5th permission
-# flag is introduced (README calls "four explicit permission flags" a deliberate design
-# point).
-_perm = Depends(require_permission("price_listing"))
+# Viewing/managing orders and placing one gate on price_listing - orders are a money
+# concept like Promotions, which already uses this same flag - OR on `admin`, added
+# 2026-08-17. `admin` isn't a job description like the other four; it's "runs this
+# store", and an owner who holds only that flag still has to be able to see the day's
+# sales and record a payment against one. It is not a blanket superuser: the discount
+# gate inside update_order/create_order still asks for product_management specifically.
+_perm = Depends(require_any_permission("price_listing", "admin"))
 
 
 def _get_ordering_principal(
@@ -622,8 +624,9 @@ def create_checkout(
         grand_total=grand_total,
         khqr_string=khqr_string,
         khqr_md5=khqr_md5,
-        expires_at=datetime.now(timezone.utc)
-        + timedelta(minutes=settings.KHQR_EXPIRY_MINUTES),
+        # Must match the expiry written into the QR payload itself (tag 99 sub-01),
+        # so both come from the same helper rather than reading the setting twice.
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=expiry_minutes()),
         snapshot={
             "clinic_name": payload.clinic_name,
             "contact_person": payload.contact_person,
@@ -1195,6 +1198,25 @@ def update_order(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="This order is complete - its status can no longer be changed",
+        )
+
+    # ...and the mirror image of that rule: money can't be recorded against a
+    # cancelled sale. Without this, "Mark as Paid" on a cancelled row produced a
+    # cancelled-AND-paid order - a row the totals strip excludes as cancelled while the
+    # customer's own order list showed it as paid, and which prints as a real Invoice.
+    # Staff who cancelled by mistake put the status back first, which is one extra
+    # click and leaves the correction visible in updated_by/updated_at.
+    # The effective status is what counts: a single PUT that reopens the order AND
+    # records the payment is a legitimate way through.
+    #
+    # Deliberately only this staff-driven path. A confirmed KHQR payment
+    # (check_payment_status below) still flips a cancelled order to paid, because there
+    # the bank is reporting money that actually arrived - refusing to write it down
+    # wouldn't un-take it, and staff need to see it to issue the refund.
+    if fields.get("payment_status") == "paid" and fields.get("status", order.status) == "cancelled":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This order is cancelled - reopen it before recording a payment",
         )
 
     # Same gate as placing an order with a discount: handing out money off is a

@@ -175,3 +175,30 @@ def require_permission(permission: str):
         return current_user
 
     return _checker
+
+
+def require_any_permission(*permissions: str):
+    """Like require_permission, but ANY one of them is enough.
+
+    Exists because `admin` is a flag about the store itself rather than a job, so it
+    isn't implied by - and doesn't imply - the four workaday permissions. The orders
+    area needs both doors open: sales staff hold `price_listing`, while the owner may
+    only hold `admin` and still has to be able to look at the day's sales and record a
+    payment. Spelling that as two OR'd checks keeps `admin` from quietly becoming a
+    superuser everywhere - each endpoint still names the doors it opens.
+    """
+    unknown = [p for p in permissions if p not in PERMISSION_NAMES]
+    if unknown:
+        raise ValueError(f"Unknown permission: {unknown[0]}")
+
+    def _checker(current_user: User = Depends(get_verified_user)) -> User:
+        if not any(getattr(current_user, p, False) for p in permissions):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This action requires the "
+                + " or ".join(f"'{p}'" for p in permissions)
+                + " permission",
+            )
+        return current_user
+
+    return _checker

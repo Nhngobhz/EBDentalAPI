@@ -847,3 +847,41 @@ class SettingsReset(BaseModel):
 
     group: Optional[str] = None
     keys: Optional[list[str]] = None
+
+
+# ---------------------------------------------------------------------------
+# Department QR codes (contact page)
+# ---------------------------------------------------------------------------
+# The badge colours the storefront actually has CSS for - see .qr-badge in the Flask
+# app's static/css/products.css. "" is the default cyan. A Literal rather than a DB
+# enum so a fifth colour is a code change here plus one CSS rule, with no migration.
+QrBadgeVariant = Literal["", "machinery", "materials", "implants"]
+
+
+class QrCodeUpdate(BaseModel):
+    """Partial update. Every field is optional and applied with `exclude_unset`, so
+    omitting a key leaves it alone while sending `null` clears it - which is how the
+    admin form erases a subtitle or a badge."""
+
+    title: Optional[str] = Field(None, min_length=1, max_length=150)
+    subtitle: Optional[str] = Field(None, max_length=200)
+    badge_label: Optional[str] = Field(None, max_length=60)
+    badge_variant: Optional[QrBadgeVariant] = None
+    badge_icon: Optional[str] = Field(None, max_length=60)
+    sort_order: Optional[int] = None
+
+
+class QrCodeOut(BaseModel):
+    id: int
+    title: str
+    subtitle: Optional[str] = None
+    qr_image: Optional[str] = None
+    badge_label: Optional[str] = None
+    badge_variant: Optional[str] = None
+    badge_icon: Optional[str] = None
+    sort_order: int
+    created_at: datetime
+    updated_at: datetime
+    updated_by: Optional[UserMini] = None
+
+    model_config = ConfigDict(from_attributes=True)

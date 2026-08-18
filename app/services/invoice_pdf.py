@@ -108,6 +108,39 @@ def _money(value) -> str:
     return f"$ {Decimal(value):.2f}"
 
 
+CANCELLED_NOTE = "This order was cancelled. It is not an invoice and is not payable."
+
+
+def document_title(order) -> str:
+    """What the printed document calls itself. Three outcomes, checked in this order:
+
+    1. **A cancelled order is never an invoice**, whatever its payment state - it prints
+       as "Cancelled Order". A cancelled sale that had been paid is money owed back, and
+       a page headed "Invoice" is a claim that a sale stands; handing one to a customer
+       (or filing it) misstates the position. Storefront downloads for a cancelled order
+       are removed entirely - this title is the backstop for the paths that still build
+       one, chiefly the Telegram alert fired when a payment confirms against an order
+       staff had already cancelled.
+    2. Anything the system has recorded a payment for is an **Invoice** - a confirmed
+       KHQR payment, or a quote staff marked paid after taking cash at the counter. Keyed
+       on payment_status, NOT on order_type: a paid quote IS the sale.
+    3. Everything else is a **Quotation**.
+
+    (2) was called "Receipt" until 2026-08-17, renamed on the owner's instruction - a paid
+    quote becomes that sale's invoice in how this business talks about it, and the word
+    the customer is handed should match. Only the printed word changed: `receipt_note_khqr`
+    / `receipt_note_cash` keep their setting keys, since renaming a key would strand
+    whatever wording the admin had saved under the old one.
+
+    Public (no underscore) because it is the one place this rule is written down on the
+    server: telegram.py names the attached file from it too. The client-side mirror is
+    `docTitle` in QuoteCart.buildPrintTemplate() - change one, change both.
+    """
+    if getattr(order, "status", None) == "cancelled":
+        return "Cancelled Order"
+    return "Invoice" if getattr(order, "payment_status", None) == "paid" else "Quotation"
+
+
 class _QuotePDF(FPDF):
     def header(self):
         pass
@@ -137,22 +170,24 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
     content_width = pdf.w - pdf.l_margin - pdf.r_margin  # 190mm at A4/10mm margins
     top = pdf.get_y()
 
-    # Anything the system has recorded a payment for prints as a Receipt - a confirmed
-    # KHQR payment, or a quote staff marked paid after taking cash at the counter.
-    # Everything still awaiting payment stays a Quotation. Mirrors the client-side
-    # buildPrintTemplate() title, which derives it from the same single field.
-    is_receipt = order.payment_status == "paid"
-    doc_title = "Receipt" if is_receipt else "Quotation"
+    doc_title = document_title(order)
+    is_cancelled = order.status == "cancelled"
+    # A cancelled row prints neither the paid note ("Thank you for your purchase") nor a
+    # validity line - both would be untrue - so it gets its own literal instead. Not a
+    # setting: it states a fact about the row rather than wording the shop chooses, and
+    # a settings page full of knobs nobody turns is its own problem (settings_spec.py).
+    is_paid_document = order.payment_status == "paid" and not is_cancelled
     paid_note = (
         site["receipt_note_khqr"]
         if order.payment_method == "khqr"
         else site["receipt_note_cash"]
     )
     validity_note = (
-        f"Quotation valid for {site['quote_validity_days']} days from the date issued."
+        CANCELLED_NOTE if is_cancelled
+        else f"Quotation valid for {site['quote_validity_days']} days from the date issued."
     )
 
-    # ---- header: brand (left) / "Quotation"/"Receipt" + No/Date (right) ----
+    # ---- header: brand (left) / the document title + No/Date (right) ----
     # Font sizes/positions mirror qpt-brand-name/qpt-title (1.6-1.7rem) and
     # qpt-brand-meta/qpt-meta-right (0.72-0.75rem) at ~96dpi/16px-root.
     pdf.set_xy(pdf.l_margin, top)
@@ -235,10 +270,13 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
         ("Address", order.address),
     ], khmer_fields=("Clinic", "Address"))
     right_bottom = info_rows(pdf.l_margin + col_width, [
-        ("Payment Term", order.payment_term or "COD"),
+        # A staff-written term wins; the standing ones are the fallback. Same two
+        # settings the Flask app substitutes onto a customer's order in
+        # blueprints/quote.py, so the printed document and the recorded order agree.
+        ("Payment Term", order.payment_term or site["default_payment_term"]),
         ("Salesperson", order.salesperson),
         ("User", order.quoted_by_name),
-        ("Installation Term", order.install_term or "Free within Phnom Penh"),
+        ("Installation Term", order.install_term or site["default_install_term"]),
         ("Contact Person", order.contact_person),
     ])
     pdf.set_y(max(left_bottom, right_bottom) + 4)
@@ -349,7 +387,7 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
 
         totals_row = table.row()
         totals_row.cell(
-            paid_note if is_receipt else validity_note,
+            paid_note if is_paid_document else validity_note,
             colspan=6, rowspan=4, align="L", v_align="TOP",
         )
         totals_row.cell("Sub-Total($):", colspan=1, align="L")

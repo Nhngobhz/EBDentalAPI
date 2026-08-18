@@ -25,6 +25,8 @@ built in the customer's browser.
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.config import settings as env
+
 
 @dataclass(frozen=True)
 class Setting:
@@ -99,6 +101,47 @@ _STORE = (
 )
 
 # ---------------------------------------------------------------------------
+# Group: About page
+#
+# Consumer: templates/main/about.html.
+#
+# These exist because the About page was repeating facts the Store group already
+# owned - it hardcoded "since 1985" next to an editable tagline saying the same
+# thing, and "Orussey Market" next to an editable address. The prose itself is a
+# setting rather than the individual facts spliced into a fixed sentence: the shop
+# should be able to rewrite its own story, not just change the year inside ours.
+# ---------------------------------------------------------------------------
+_ABOUT = (
+    Setting("about_intro", "about", "Hero paragraph", "textarea",
+            "EB Dental Supply equips clinics, laboratories and dental professionals "
+            "across the country with instruments, equipment and consumables from the "
+            "world's leading manufacturers.",
+            "The lead paragraph under the About page's headline.", rows=3),
+    Setting("stat_years", "about", "Stat 1 — Years of Excellence", "text", "40+",
+            "The three big numbers across the About page. Leave one empty to hide it."),
+    Setting("stat_brands", "about", "Stat 2 — Trusted Brands", "text", "100+"),
+    Setting("stat_clinicians", "about", "Stat 3 — Happy Clinicians", "text", "5000+"),
+    Setting("about_story_heading", "about", "Our Story heading", "text",
+            "A name dental professionals have trusted since 1985"),
+    Setting("about_story", "about", "Our Story", "textarea",
+            "For over 40 years, EB Dental Supply has been a trusted partner for dental "
+            "professionals across Cambodia and the region. We provide high-quality "
+            "instruments, equipment, and consumables from the world's leading brands, "
+            "ensuring that practitioners have access to the best tools for patient care.\n"
+            "From our home at Orussey Market in Phnom Penh, we support everything from a "
+            "single hand instrument to a full clinic fit-out — backed by a team that knows "
+            "the products it sells and stands behind them long after delivery.",
+            "One paragraph per line.", rows=7),
+)
+
+# The "qr" group (the four contact-page QR captions) used to live here. It moved to a
+# real table - see app/models.py::QrCode and app/routers/qr_codes.py - because a
+# key/value spec can only describe a fixed number of cards, and the whole point of the
+# new screen is that staff can add a fifth department and swap the pictures themselves.
+# Migration d3b7f1c5a92e copies any values saved here into that table; the old override
+# rows are left in app_settings, harmlessly ignored (see services/app_settings.py).
+
+# ---------------------------------------------------------------------------
 # Group 2: Printed quote / invoice / receipt
 #
 # Consumers: QuoteCart.buildPrintTemplate() in EB Web Project/static/js/main.js
@@ -118,11 +161,52 @@ _DOCUMENT = (
             "Printed as \"Tel: <value>\" under the letterhead name."),
     Setting("quote_validity_days", "document", "Quote validity (days)", "number", 30,
             "How long a quotation says it stays valid for.", minimum=1, maximum=365),
-    Setting("receipt_note_khqr", "document", "Receipt note — paid by KHQR", "text",
+    # Keys still say "receipt" because the printed document was called one until
+    # 2026-08-17; only the word on the page (and these labels) changed, and renaming a
+    # settings key would strand whatever the admin had typed under the old one.
+    Setting("receipt_note_khqr", "document", "Invoice note — paid by KHQR", "text",
             "Paid via KHQR. Thank you for your purchase.",
             "Replaces the validity line once an order is paid."),
-    Setting("receipt_note_cash", "document", "Receipt note — paid in cash", "text",
+    Setting("receipt_note_cash", "document", "Invoice note — paid in cash", "text",
             "Paid in full. Thank you for your purchase."),
+    # These two were the same two string literals in two repos: constants in the Flask
+    # app's blueprints/quote.py and, separately, the `or ...` fallbacks in
+    # services/invoice_pdf.py here. They print on every quote, so a change to one and
+    # not the other is exactly the drift this group exists to prevent.
+    Setting("default_payment_term", "document", "Default payment term", "text", "COD",
+            "Applied to every customer order and shown in their cart. Staff still type "
+            "their own per quote - they are negotiating them."),
+    Setting("default_install_term", "document", "Default installation term", "text",
+            "Free within Phnom Penh"),
+)
+
+# ---------------------------------------------------------------------------
+# Group: KHQR payments
+#
+# Consumers: app/services/khqr.py (tags 59/60 and the tag-99 expiry it writes into
+# every generated QR) and app/routers/orders.py (the PendingCheckout deadline, which
+# has to match the deadline inside the QR).
+#
+# NOT credentials, which is why these three can live here while BAKONG_ACCOUNT_ID,
+# BAKONG_API_TOKEN and the PayWay keys stay in the environment. Each default is the
+# env-resolved value from app/config.py rather than a literal, so a deployment that
+# already sets KHQR_MERCHANT_NAME in .env keeps it and an override here layers on top.
+#
+# public=False: nothing in a browser needs these, and the merchant name reaches the
+# payer through the QR payload itself.
+# ---------------------------------------------------------------------------
+_PAYMENT = (
+    Setting("khqr_merchant_name", "payment", "Merchant name", "text",
+            env.KHQR_MERCHANT_NAME,
+            "Shown by the payer's banking app. Truncated to 25 characters by the "
+            "KHQR spec.", public=False),
+    Setting("khqr_merchant_city", "payment", "Merchant city", "text",
+            env.KHQR_MERCHANT_CITY, "Truncated to 15 characters by the KHQR spec.",
+            public=False),
+    Setting("khqr_expiry_minutes", "payment", "QR valid for (minutes)", "number",
+            env.KHQR_EXPIRY_MINUTES,
+            "How long a generated QR stays payable. Staff can always issue a fresh one "
+            "against the same order.", public=False, minimum=1, maximum=1440),
 )
 
 # ---------------------------------------------------------------------------
@@ -145,9 +229,16 @@ GROUPS: tuple[Group, ...] = (
     Group("store", "Store & Contact", "fa-store",
           "Name, contact details and links shown in the footer and on the contact page.",
           _STORE),
+    Group("about", "About Page", "fa-circle-info",
+          "The story, headline numbers and lead paragraph on the About page.",
+          _ABOUT),
     Group("document", "Quote & Invoice", "fa-file-invoice",
           "The letterhead and wording on printed quotations, invoices and receipts.",
           _DOCUMENT),
+    Group("payment", "KHQR Payments", "fa-money-bill-transfer",
+          "What the payer's banking app shows, and how long a generated QR stays "
+          "payable. Bank credentials stay in the server's environment.",
+          _PAYMENT),
     Group("maintenance", "Maintenance", "fa-screwdriver-wrench",
           "Temporarily close the storefront without stopping the server.",
           _MAINTENANCE),

@@ -29,8 +29,11 @@ transaction (check_transaction_by_md5) - both the payload and its MD5 are
 persisted on the Order so payment can be confirmed later (see
 routers/orders.py::check_payment_status).
 
-All merchant details come from settings (BAKONG_ACCOUNT_ID etc.) - if they're
-not configured, KHQR checkout is refused at order creation, never half-built.
+Account routing comes from the environment (BAKONG_ACCOUNT_ID etc.) - if it isn't
+configured, KHQR checkout is refused at order creation, never half-built. The three
+*presentation* values - merchant name, city and how long the QR stays payable - are
+admin-editable site settings instead, since they are not credentials; see the helpers
+just below.
 """
 import hashlib
 import time
@@ -38,8 +41,30 @@ from decimal import Decimal
 
 from app.config import settings
 from app.core.logging_conf import get_logger
+from app.services import app_settings
 
 logger = get_logger("khqr")
+
+
+# These read through app_settings rather than app.config so an admin can change them
+# from the Settings screen without a redeploy. There is no `or settings.KHQR_...`
+# fallback here on purpose: the spec's *default* for each of these keys already is the
+# corresponding config value (see settings_spec._PAYMENT), so app_settings returns the
+# .env value whenever no override exists, and a second fallback would be unreachable
+# code that also implied env could still override an admin's choice.
+#
+# Functions rather than module-level constants because the value must be re-read per
+# QR - a constant would freeze whatever was set when this module was first imported.
+def merchant_name() -> str:
+    return app_settings.get("khqr_merchant_name")
+
+
+def merchant_city() -> str:
+    return app_settings.get("khqr_merchant_city")
+
+
+def expiry_minutes() -> int:
+    return int(app_settings.get("khqr_expiry_minutes"))
 
 # ISO 4217 numeric code embedded in tag 53. Every price in this system is USD.
 _CURRENCY_USD = "840"
@@ -127,8 +152,8 @@ def _build_from_template(amount: Decimal, bill_number: str) -> str:
         + _tlv("53", _CURRENCY_USD)
         + _tlv("54", f"{amount:.2f}")
         + _tlv("58", fields.get("58") or "KH")
-        + _tlv("59", (fields.get("59") or settings.KHQR_MERCHANT_NAME)[:25])
-        + _tlv("60", (fields.get("60") or settings.KHQR_MERCHANT_CITY)[:15])
+        + _tlv("59", (fields.get("59") or merchant_name())[:25])
+        + _tlv("60", (fields.get("60") or merchant_city())[:15])
         + _tlv("62", _tlv("01", bill_number[:25]))
         + _tlv("99", _tlv("00", str(int(time.time() * 1000))))
     )
@@ -151,9 +176,9 @@ def _build_from_account_id(amount: Decimal, bill_number: str) -> str:
 
     Tag 99 carries both timestamps in ms: sub-00 creation, sub-01 expiry. The spec
     makes the expiry mandatory on dynamic codes, so it is always written - see
-    KHQR_EXPIRY_MINUTES."""
+    expiry_minutes()."""
     now_ms = int(time.time() * 1000)
-    expires_ms = now_ms + settings.KHQR_EXPIRY_MINUTES * 60 * 1000
+    expires_ms = now_ms + expiry_minutes() * 60 * 1000
 
     account = _tlv("00", settings.BAKONG_ACCOUNT_ID[:32])
     if settings.BAKONG_ACCOUNT_INFORMATION:
@@ -169,8 +194,8 @@ def _build_from_account_id(amount: Decimal, bill_number: str) -> str:
         + _tlv("53", _CURRENCY_USD)
         + _tlv("54", f"{amount:.2f}")
         + _tlv("58", "KH")
-        + _tlv("59", settings.KHQR_MERCHANT_NAME[:25])
-        + _tlv("60", settings.KHQR_MERCHANT_CITY[:15])
+        + _tlv("59", merchant_name()[:25])
+        + _tlv("60", merchant_city()[:15])
         + _tlv("62", _tlv("01", bill_number[:25]))
         + _tlv("99", _tlv("00", str(now_ms)) + _tlv("01", str(expires_ms)))
     )

@@ -43,9 +43,11 @@ confusing (not obviously wrong) results.
   quotes (server-priced snapshots, payment happens offline later);
   only a customer KHQR checkout is a real order, which starts
   `payment_status: "unpaid"` and carries a generated KHQR payload.
-  Either kind stays editable by staff until `payment_status` is `"paid"`,
-  after which it is frozen (`409` on any write, including delete).
-  See section 6's Orders table.
+  Either kind stays editable by staff **including after** it is paid (the
+  hard freeze that used to apply was lifted on 2026-08-11) - the one
+  exception is `status`, which is final once a payment is on record.
+  A paid row's printed document is an **Invoice** rather than a
+  Quotation, whichever kind it is. See section 6's Orders table.
 
 ---
 
@@ -203,7 +205,7 @@ row, checked directly:
 | `customer_management` | Full CRUD on `Customer` records, including toggling `access_permission` |
 | `product_management` | CRUD on `Brand`, `Category`, `Product` (non-price fields), `Manual`, and full CRUD on `Promotion` and `Set` |
 | `price_listing` | Set `price`/`discount` on `Product`, and manage `Order`s (list/read/place/edit/delete, mark paid, issue a KHQR) |
-| `admin` | Read and write site-wide settings (`/settings`, section 6) - store contact details, printed-quote wording, maintenance mode |
+| `admin` | Read and write site-wide settings (`/settings`, section 6) - store contact details, printed-quote wording, maintenance mode; the department QR cards (`/qr-codes`); and, since 2026-08-17, everything `price_listing` grants on `/orders` |
 
 Notes an agent should know before assuming a 403 is a bug:
 
@@ -540,14 +542,14 @@ server-side and never trusted from the request body.
 | Method & path | Auth | Body / notes |
 |---|---|---|
 | `POST /orders/` | `Any user` with `price_listing` or `product_management`, OR `Any customer` with `access_permission` | JSON `OrderCreate` (`clinic_name`, `phone`, `address` - all **required**; `contact_person?`, `payment_term?`, `install_term?`; `payment_method`: `"cash"`\|`"khqr"` - **required for customers, ignored for staff**; `discount_type`: `"percent"`\|`"cash"`, default `"cash"`; `discount_value` ≥0, default `0`; `items`: list of `{product_id\|promotion_id\|set_id, qty}`, at least 1). See notes below. |
-| `GET /orders/` | `price_listing` | query `skip`, `limit`, `status`, `customer_id` |
+| `GET /orders/` | `price_listing` **or** `admin` | query `skip`, `limit`, `status`, `customer_id` |
 | `GET /orders/mine` | Same bar as `POST /orders/` (staff `price_listing`/`product_management`, or customer `access_permission`) | query `skip`, `limit`. The caller's OWN orders, scoped from the token (customer → `customer_id`, staff → `created_by_user_id`) - never from a query param. Exists because a customer has no `price_listing` and so can't use `GET /orders/` to see even their own history; powers the storefront's account drawer. Declared above `GET /{order_id}` so "mine" isn't parsed as an id. |
 | `GET /orders/mine/{id}` | Same, plus must own the order | The caller's own order in full (line items included) - what the account drawer's detail view shows and re-prints its PDF from. **404, not 403**, on an order the caller doesn't own, so it can't be used to probe which ids exist. |
-| `GET /orders/{id}` | `price_listing` | - |
+| `GET /orders/{id}` | `price_listing` **or** `admin` | - |
 | `GET /orders/{id}/payment-status` | The principal who placed the order, **or any `price_listing` staff** | KHQR orders only (`400` otherwise). Returns `{"payment_status": "unpaid"\|"paid"}`; while unpaid, each call asks the order's own provider about the transaction (PayWay by `tran_id`, or Bakong by `khqr_md5` when `BAKONG_API_TOKEN` is configured) and the first confirmed one flips the order to paid (stamping `paid_at`, firing the paid-order Telegram alert). Polled by the paying customer's browser, and by the admin Orders page's QR dialog. |
 | `POST /orders/{id}/khqr` | `price_listing` | No body. Issues a scannable KHQR against an **existing** order (counter/phone sale) for its current `grand_total`, setting `payment_method: "khqr"`, `payment_status: "unpaid"`; returns the whole `OrderOut`. Idempotent - returns the stored payload if one exists. `400` if already paid or KHQR isn't configured. `order_type` is deliberately **not** changed. |
-| `PUT /orders/{id}` | `price_listing` | JSON `OrderUpdate` - `status`, `payment_status`, `clinic_name`, `contact_person`, `phone`, `address`, `payment_term`, `install_term`, `discount_type`, `discount_value`, `items`. **`409` on a paid order** (see below). `items` REPLACES the line list and is re-priced server-side; a discount needs `product_management`; `payment_status: "paid"` stamps `paid_at` and fires the paid-order alert. |
-| `DELETE /orders/{id}` | `price_listing` | hard delete, cascades to `OrderItem` rows. **`409` on a paid order.** |
+| `PUT /orders/{id}` | `price_listing` **or** `admin` | JSON `OrderUpdate` - `status`, `payment_status`, `clinic_name`, `contact_person`, `phone`, `address`, `payment_term`, `install_term`, `discount_type`, `discount_value`, `items`. `items` REPLACES the line list and is re-priced server-side; a discount needs `product_management`; `payment_status: "paid"` stamps `paid_at` and fires the paid-order alert. **Two `409`s guard the paid/cancelled pair**: the `status` of a paid order can't be changed, and `payment_status: "paid"` is refused on a cancelled one (send the reopening `status` in the same request to do both at once). A confirmed KHQR payment is exempt - see `GET /{id}/payment-status`. |
+| `DELETE /orders/{id}` | `price_listing` **or** `admin` | hard delete, cascades to `OrderItem` rows. A paid order can be deleted too (since 2026-08-11) - that destroys the record of a completed sale, with no archive to recover it from. |
 | `POST /orders/{id}/quotation-pdf` | Same principal who placed the order | `multipart/form-data`, field `file` (a PDF) - see notes below |
 
 Notes an agent should know before calling this:
@@ -607,27 +609,35 @@ Notes an agent should know before calling this:
   has to be confirmed by hand. Dynamic QRs must carry an expiry (tag 99 sub-01,
   `KHQR_EXPIRY_MINUTES`); an expired one is refused by the payer's app and staff
   re-issue with `POST /orders/{id}/khqr`.
-- **An order is editable until it is paid, then frozen.** `PUT /orders/{id}`
+- **A paid order is still editable - its `status` is not.** `PUT /orders/{id}`
   accepts the clinic details, terms, order-level discount and the line list
   itself (`items` REPLACES the lines and is re-priced through the same code
-  path a new order goes through - only ids and quantities are ever accepted).
-  The moment `payment_status` is `"paid"`, every `PUT` and the `DELETE`
-  return **`409`** - including a `status` change and setting `payment_status`
-  back to `"unpaid"`. A receipt has been issued against those exact figures,
-  so correcting a paid order means issuing a new document alongside it. An
+  path a new order goes through - only ids and quantities are ever accepted),
+  and it keeps accepting them after payment: staff genuinely need to correct a
+  real order once the money is in, and the hard freeze that used to `409` every
+  write was lifted on 2026-08-11 (`_reject_if_paid`, now a no-op). Know what
+  that means - the customer holds an Invoice printed from the pre-edit figures
+  and nothing reissues it, so `updated_by`/`updated_at` are the only record
+  that an amendment happened. Two `409`s remain, and they are a pair:
+  `status` can't move once `payment_status` is `"paid"` (that field says how
+  the sale ended), and `payment_status: "paid"` is refused while `status` is
+  `"cancelled"` (reopen it in the same `PUT` if that is what you mean). An
   edit that moves `grand_total` clears any `khqr_string`/`khqr_md5` on the
   row, since the old QR would collect the wrong amount.
 - **Any order can be marked paid**, not just KHQR ones - staff take cash at
   the counter against a quote. `payment_status` on a row with no
   `payment_method` is normal and means exactly that. (The payment-status
   *poll* still 400s on a non-KHQR row: there is no QR to ask about.)
-- **Receipts vs. quotations**: the printed document is a Receipt whenever
+- **Invoices vs. quotations**: the printed document is an **Invoice** whenever
   `payment_status == "paid"` - a confirmed KHQR payment or a quote staff
   marked paid - and a Quotation otherwise. Derived from that one field alone
-  in all four places that print or announce it (the frontend's
-  `buildPrintTemplate`, the account drawer, the admin reprint button, and
-  `services/invoice_pdf.py`); `order_type`/`payment_method` only pick the
-  wording of the paid note ("Paid via KHQR" vs "Paid in full").
+  everywhere it is printed or announced: `invoice_pdf.document_title()` here
+  (which `services/telegram.py` also names the attachment from), and
+  `docTitle` in the frontend's `buildPrintTemplate` for the browser-rendered
+  copy, the account drawer, the customer orders page and the admin reprint
+  button. `order_type`/`payment_method` only pick the wording of the paid note
+  ("Paid via KHQR" vs "Paid in full"). This document was called a **Receipt**
+  until 2026-08-17; the `receipt_note_*` setting keys kept their names.
 - **`salesperson`/`quoted_by_name` are never accepted from the client** -
   `OrderCreate` doesn't even have those fields. They're derived from
   whoever's bearer token is calling: a staff `User` → their `user_name`
@@ -697,6 +707,16 @@ it. Adding a setting is a change to that file only, with **no migration**.
 | `PUT /settings/` | `admin` | Body `{"values": {key: value}}`, partial. Coerced to the declared type (`"45"` → `45`, `"on"` → `true`) |
 | `POST /settings/reset` | `admin` | Body `{"group": "store"}` and/or `{"keys": [...]}`. Deletes the overrides so those keys read as their defaults again |
 
+Five groups, and what reads each:
+
+| Group | Read by |
+|---|---|
+| `store` | The storefront footer and contact page (name, tagline, phone, address, map, Facebook links) |
+| `about` | The About page - lead paragraph, the three headline numbers, and the Our Story copy |
+| `document` | **Both** printed-document engines (see below) |
+| `payment` | `services/khqr.py` - merchant name/city in tags 59/60, and the tag-99 expiry. **Not public** |
+| `maintenance` | The Flask app's `maintenance_gate` before_request |
+
 Things worth knowing:
 
 - **Only overrides are stored.** `app_settings` is a key/value table that starts empty;
@@ -708,13 +728,46 @@ Things worth knowing:
   (`"Quote validity (days) must be at least 1"`), not by key.
 - **No secrets live here.** PayWay / Bakong / Telegram / SMTP / R2 / Google credentials
   stay in the environment (`app/config.py`). `GET /settings/` reports whether each is
-  configured, under `status`, and never returns a value.
+  configured, under `status`, and never returns a value. The `payment` group is the
+  boundary case and is worth understanding: merchant *name*, *city* and QR *expiry* are
+  presentation, not credentials, so they are editable - but marked `public=False`, so
+  they never appear in `GET /settings/public`. Their spec defaults are the env-resolved
+  `KHQR_*` config values, which is why a deployment that sets them in `.env` and never
+  opens the Settings screen behaves exactly as it did before they became settings.
+  `services/khqr.py` therefore reads them through `app_settings` with **no** `or
+  settings.KHQR_...` fallback - that branch would be unreachable.
 - **Values are cached** for 30s process-wide (`app/services/app_settings.py`), and
   invalidated immediately on write. The Flask app caches `GET /settings/public` for 60s
   on its side and clears that on save too.
 - Changing anything in the `document` group affects **both** printed-document engines -
   `services/invoice_pdf.py` here and `buildPrintTemplate()` in the website's `main.js`.
-  They must stay in step.
+  They must stay in step. `default_payment_term` / `default_install_term` are the
+  clearest case: the Flask app substitutes them onto every customer order, this repo's
+  PDF builder uses them as the `order.payment_term or ...` fallback, and the cart drawer
+  displays them - three readers, one value.
+
+### Department QR codes - `/qr-codes`
+The cards under "Scan to Connect" on the contact page - one row per department, each a
+title, an optional subtitle, an uploaded QR picture and an optional coloured badge.
+There is no fixed number of them: this replaced the settings group `qr` (migration
+`d3b7f1c5a92e`), which could only ever describe four.
+
+Nothing to do with KHQR payment codes (`/orders/{id}/khqr`), which are generated per
+order and never stored.
+
+| Method & path | Auth | Body / notes |
+|---|---|---|
+| `GET /qr-codes/` | Public | query `skip`, `limit`. Ordered by `sort_order`, then `id` |
+| `GET /qr-codes/{id}` | Public | - |
+| `POST /qr-codes/` | `admin` | multipart: `title` (required), `subtitle`, `badge_label`, `badge_variant`, `badge_icon`, `sort_order`, + optional `file` |
+| `PUT /qr-codes/{id}` | `admin` | JSON, partial; does not touch the image. `null` clears a field, an omitted key leaves it |
+| `POST /qr-codes/{id}/image` | `admin` | multipart `file`. Stored as uploaded (no JPEG re-encode - that blurs a QR's edges) |
+| `DELETE /qr-codes/{id}` | `admin` | - |
+
+`badge_variant` is one of `""` (cyan), `machinery`, `materials`, `implants` - colour
+only, matching the `.qr-badge` classes in the Flask app's CSS. Empty `badge_label`
+means no badge at all; a card with no `qr_image` still renders, as a "QR coming soon"
+placeholder.
 
 ### Misc
 | Method & path | Auth | Notes |

@@ -203,7 +203,7 @@ async def notify_error(error_type: str, message: str, path: str | None = None) -
 def _order_alert_caption(order: "OrderOut") -> tuple[str, str]:
     """Returns (caption, document_word) for an order's Telegram alert. Three shapes:
     a PAID row (from the payment-status check or a staff Mark-as-Paid, carrying the
-    receipt), an unpaid QUOTE (staff cart, or a customer who chose Cash - explicitly
+    invoice), an unpaid QUOTE (staff cart, or a customer who chose Cash - explicitly
     flagged so staff never mistake it for a paid sale), and the plain new-order shape
     kept as a fallback for anything else.
 
@@ -220,7 +220,14 @@ def _order_alert_caption(order: "OrderOut") -> tuple[str, str]:
             f"Salesperson: {_esc(order.salesperson or '-')}\n"
             f"Amount received: $ {order.grand_total:.2f}"
         )
-        return caption, "Receipt"
+        # Taken from the PDF builder rather than spelled again here: the filename staff
+        # see in Telegram has to match the title inside the document they open. That
+        # word became "Invoice" (from "Receipt") on 2026-08-17. Imported inside the
+        # function like build_invoice_pdf below - invoice_pdf pulls in fpdf2 and both
+        # bundled fonts, which nothing needs until an alert actually carries a document.
+        from app.services.invoice_pdf import document_title
+
+        return caption, document_title(order)
     if order.order_type == "quote":
         payment_line = (
             "Payment: Cash (to be collected)\n" if order.payment_method == "cash" else ""
@@ -261,7 +268,7 @@ async def send_khqr_pending_alert_for_checkout(
         f"Ref: {_esc(reference)}\n"
         f"Customer: {_esc(customer_name)}\n"
         f"Amount due: $ {grand_total:.2f}\n"
-        f"No order exists yet - one is created, with its receipt, once the payment lands."
+        f"No order exists yet - one is created, with its invoice, once the payment lands."
     )
     await send_telegram_message(text, topic_id=settings.TELEGRAM_ORDER_TOPIC_ID)
 

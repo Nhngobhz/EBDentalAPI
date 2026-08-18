@@ -56,8 +56,9 @@ def _integration_status() -> dict:
             "auto_confirm": bool(
                 env_settings.payway_configured or env_settings.BAKONG_API_TOKEN
             ),
-            "merchant_name": env_settings.KHQR_MERCHANT_NAME,
-            "expiry_minutes": env_settings.KHQR_EXPIRY_MINUTES,
+            # Merchant name/city and the QR expiry moved into the editable KHQR
+            # Payments group, so they are no longer echoed here - a read-only copy of a
+            # field the same page lets you edit is just something else to keep in step.
         },
         "telegram": {
             "configured": bool(

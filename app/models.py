@@ -746,3 +746,48 @@ class AppSetting(Base):
         Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     updated_by = relationship("User", foreign_keys=[updated_by_user_id])
+
+
+class QrCode(AuditedMixin, Base):
+    """One card in the contact page's "Department QR Codes" grid.
+
+    A table rather than more keys in app/core/settings_spec.py, which is where the
+    four captions used to live (group "qr", removed in migration d3b7f1c5a92e). A
+    key/value spec can only ever describe a FIXED number of fields, so "add a fifth
+    department" meant a code change in two repos; and the QR pictures themselves
+    weren't editable at all - they were a file drop under the Flask app's
+    static/images/qr/. Both are now ordinary admin CRUD.
+
+    Deliberately has nothing to do with the KHQR payment codes (app/services/khqr.py),
+    which are generated per order and never stored - these are static pictures of a
+    Telegram/WhatsApp/Facebook link for a department.
+    """
+
+    __tablename__ = "qr_codes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(150), nullable=False)
+    subtitle = Column(String(200), nullable=True)
+
+    # Nullable so a card can be created before its picture is ready (and so an
+    # upload failing doesn't lose the captions) - the storefront renders its "QR
+    # coming soon" placeholder until one is uploaded. Stored like every other
+    # image field: an R2 URL, or a local /static/... path. See app/core/files.py.
+    qr_image = Column(String(500), nullable=True)
+
+    # The small pill under the caption. Empty label = no pill, which is why this
+    # is nullable rather than defaulted: not every department needs one.
+    badge_label = Column(String(60), nullable=True)
+    # Colour only - "" / machinery / materials / implants, matching the .qr-badge
+    # modifier classes in the Flask app's static/css/products.css. A plain String
+    # and not a DB enum so adding a colour later needs no migration (same reasoning
+    # as discount_type and order_type); the allowed set is the Literal in schemas.py.
+    badge_variant = Column(String(30), nullable=True)
+    # Font Awesome class shown inside the pill, e.g. "fa-wrench".
+    badge_icon = Column(String(60), nullable=True)
+
+    # Display position, low to high. Not nullable (with a server_default) because
+    # every card has to sort somewhere, and NULL ordering differs between backends.
+    sort_order = Column(Integer, nullable=False, server_default="0")
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

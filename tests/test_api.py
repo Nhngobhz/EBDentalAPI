@@ -2704,6 +2704,7 @@ def test_khqr_individual_carries_all_three_payee_sub_fields(monkeypatch):
 
     from app.config import settings
     from app.services.khqr import _parse_tlv, build_khqr
+    from app.services.khqr import expiry_minutes as khqr_expiry_minutes
 
     monkeypatch.setattr(settings, "KHQR_STATIC_TEMPLATE", "irrelevant-when-account-id-set")
     monkeypatch.setattr(settings, "BAKONG_ACCOUNT_ID", "abaakhppxxx@abaa")
@@ -2730,7 +2731,8 @@ def test_khqr_individual_carries_all_three_payee_sub_fields(monkeypatch):
     stamps = dict(_parse_tlv(fields["99"]))
     assert len(stamps["00"]) == 13 and len(stamps["01"]) == 13
     gap_minutes = (int(stamps["01"]) - int(stamps["00"])) / 60000
-    assert gap_minutes == settings.KHQR_EXPIRY_MINUTES
+    # The admin-editable setting, whose default is settings.KHQR_EXPIRY_MINUTES.
+    assert gap_minutes == khqr_expiry_minutes()
 
 
 def test_khqr_expired_reads_the_payloads_own_expiry(monkeypatch):
@@ -2740,6 +2742,7 @@ def test_khqr_expired_reads_the_payloads_own_expiry(monkeypatch):
     from decimal import Decimal
 
     from app.config import settings
+    from app.services import khqr as khqr_module
     from app.services.khqr import build_khqr, khqr_expired
 
     monkeypatch.setattr(settings, "KHQR_STATIC_TEMPLATE", "")
@@ -2750,7 +2753,10 @@ def test_khqr_expired_reads_the_payloads_own_expiry(monkeypatch):
     fresh, _ = build_khqr(Decimal("1.00"), bill_number="000001")
     assert not khqr_expired(fresh)
 
-    monkeypatch.setattr(settings, "KHQR_EXPIRY_MINUTES", -1)
+    # Forcing an already-past expiry: patch the accessor rather than the setting it
+    # reads, because the spec puts a minimum of 1 on khqr_expiry_minutes - a negative
+    # value can't be saved through the API, only manufactured here.
+    monkeypatch.setattr(khqr_module, "expiry_minutes", lambda: -1)
     stale, _ = build_khqr(Decimal("1.00"), bill_number="000002")
     assert khqr_expired(stale)
 
@@ -3462,9 +3468,11 @@ def test_editing_an_order_rejects_a_blank_required_field(client, db_session, mon
     assert body["contact_person"] is None
 
 
-def test_paid_quote_alert_is_a_receipt_not_a_new_quote():
+def test_paid_quote_alert_is_an_invoice_not_a_new_quote():
     """A quote whose payment staff recorded is a completed sale - the Telegram alert
-    must not still say "no payment has been made" just because order_type is "quote"."""
+    must not still say "no payment has been made" just because order_type is "quote",
+    and the attached document is named for what it now is (an Invoice since
+    2026-08-17, "Receipt" before that)."""
     from app.schemas import OrderOut
     from app.services.telegram import _order_alert_caption
 
@@ -3481,7 +3489,7 @@ def test_paid_quote_alert_is_a_receipt_not_a_new_quote():
     assert "no payment has been made" in unpaid_caption
 
     paid_caption, paid_doc = _order_alert_caption(OrderOut(**{**base, "payment_status": "paid"}))
-    assert paid_doc == "Receipt"
+    assert paid_doc == "Invoice"
     assert "PAID" in paid_caption
     assert "no payment has been made" not in paid_caption
     assert "via KHQR" not in paid_caption  # no method recorded - don't invent one
@@ -3531,10 +3539,61 @@ def test_public_settings_need_no_auth(client):
 
 
 def test_public_settings_expose_only_public_keys(client):
-    from app.core.settings_spec import PUBLIC_KEYS
+    from app.core.settings_spec import PUBLIC_KEYS, SETTINGS
 
     resp = client.get("/settings/public")
     assert set(resp.json()) == set(PUBLIC_KEYS)
+    # The split has to actually withhold something, or this test passes vacuously and
+    # would keep passing if `public=False` stopped being honoured.
+    private = set(SETTINGS) - set(PUBLIC_KEYS)
+    assert private
+    assert not (private & set(resp.json()))
+
+
+def test_khqr_presentation_settings_are_not_public(client, db_session):
+    """Merchant name/city/expiry are admin-editable but server-side only: no browser
+    needs them, and the payer sees the name through the QR payload itself."""
+    from app.core.settings_spec import SETTINGS
+
+    for key in ("khqr_merchant_name", "khqr_merchant_city", "khqr_expiry_minutes"):
+        assert SETTINGS[key].public is False
+    assert "khqr_merchant_name" not in client.get("/settings/public").json()
+
+    # ...but an admin reading the full settings does get them.
+    make_admin(db_session, email="khqradmin@example.com", password="password123")
+    headers = auth_header(client, "khqradmin@example.com", "password123")
+    assert "khqr_merchant_name" in client.get("/settings/", headers=headers).json()["values"]
+
+
+def test_khqr_settings_default_to_the_environment_and_reach_the_payload(client, db_session):
+    """The spec default IS the env value, so a deployment that configures
+    KHQR_MERCHANT_NAME in .env and never opens Settings behaves exactly as before."""
+    from decimal import Decimal
+
+    from app.config import settings as env
+    from app.core.settings_spec import DEFAULTS
+    from app.services import khqr
+
+    assert DEFAULTS["khqr_merchant_name"] == env.KHQR_MERCHANT_NAME
+    assert DEFAULTS["khqr_expiry_minutes"] == env.KHQR_EXPIRY_MINUTES
+    assert khqr.merchant_name() == env.KHQR_MERCHANT_NAME
+
+    make_admin(db_session, email="khqrbuild@example.com", password="password123")
+    headers = auth_header(client, "khqrbuild@example.com", "password123")
+    client.put("/settings/", json={"values": {
+        "khqr_merchant_name": "NEW MERCHANT",
+        "khqr_merchant_city": "Siem Reap",
+        "khqr_expiry_minutes": 15,
+    }}, headers=headers)
+
+    assert khqr.merchant_name() == "NEW MERCHANT"
+    assert khqr.expiry_minutes() == 15
+
+    # The name and city are written into tags 59/60, so they must show up in a QR built
+    # after the change - this is the whole point of making them editable.
+    payload = khqr._build_from_account_id(Decimal("12.34"), "EB-TEST-1")
+    assert "NEW MERCHANT" in payload
+    assert "Siem Reap" in payload
 
 
 def test_reading_settings_requires_the_admin_permission(client, db_session):
@@ -3703,6 +3762,30 @@ def test_the_last_admin_cannot_revoke_their_own_admin_permission(client, db_sess
     assert resp.status_code == 200
 
 
+def test_default_quote_terms_come_from_settings(client, db_session):
+    """The payment/installation terms were the same two literals in two repos - constants
+    in the Flask app and `or ...` fallbacks in the PDF builder. One setting now, so the
+    cart, the recorded order and the printed document can't disagree."""
+    from app.core.settings_spec import DEFAULTS
+    from app.services import app_settings
+
+    assert DEFAULTS["default_payment_term"] == "COD"
+    assert DEFAULTS["default_install_term"] == "Free within Phnom Penh"
+
+    make_admin(db_session, email="termsadmin@example.com", password="password123")
+    headers = auth_header(client, "termsadmin@example.com", "password123")
+    client.put("/settings/", json={"values": {
+        "default_payment_term": "50% deposit",
+        "default_install_term": "Nationwide, 7 days",
+    }}, headers=headers)
+
+    # Public, because the customer's cart drawer renders them before checkout.
+    public = client.get("/settings/public").json()
+    assert public["default_payment_term"] == "50% deposit"
+    assert public["default_install_term"] == "Nationwide, 7 days"
+    assert app_settings.get_all()["default_install_term"] == "Nationwide, 7 days"
+
+
 def test_invoice_pdf_uses_the_configured_letterhead(client, db_session):
     """The printed PDF reads its letterhead from settings. Mirrored by
     buildPrintTemplate() in the website's main.js - see the eb-quote-parity skill."""
@@ -3732,3 +3815,309 @@ def test_invoice_pdf_uses_the_configured_letterhead(client, db_session):
     values = app_settings.get_all()
     assert values["document_brand_name"] == "TOTALLY OTHER CLINIC"
     assert values["quote_validity_days"] == 7
+
+
+# ---------------------------------------------------------------------------
+# Department QR codes (contact page)
+# ---------------------------------------------------------------------------
+def _png_bytes():
+    """Smallest thing PIL and the content-type check both accept as an image."""
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), "black").save(buffer, "PNG")
+    return buffer.getvalue()
+
+
+def test_qr_codes_are_public_to_read_and_sorted(client, db_session):
+    make_admin(db_session, email="qradmin1@example.com", password="password123")
+    headers = auth_header(client, "qradmin1@example.com", "password123")
+
+    # Created out of order on purpose - the list has to come back by sort_order.
+    client.post("/qr-codes/", data={"title": "Second", "sort_order": 2}, headers=headers)
+    client.post("/qr-codes/", data={"title": "First", "sort_order": 1}, headers=headers)
+
+    # No Authorization header at all: the contact page is served to strangers.
+    resp = client.get("/qr-codes/")
+    assert resp.status_code == 200
+    assert [c["title"] for c in resp.json()] == ["First", "Second"]
+
+
+def test_creating_a_qr_code_stores_its_picture_and_badge(client, db_session):
+    make_admin(db_session, email="qradmin2@example.com", password="password123")
+    headers = auth_header(client, "qradmin2@example.com", "password123")
+
+    resp = client.post(
+        "/qr-codes/",
+        data={
+            "title": "Technician Support",
+            "subtitle": "Technical Support Team",
+            "badge_label": "Support",
+            "badge_variant": "machinery",
+            "badge_icon": "fa-wrench",
+            "sort_order": 3,
+        },
+        files={"file": ("qr.png", _png_bytes(), "image/png")},
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    card = resp.json()
+    assert card["subtitle"] == "Technical Support Team"
+    assert card["badge_variant"] == "machinery"
+    assert card["sort_order"] == 3
+    # Stored as uploaded - a .png, not re-encoded to JPEG, since JPEG artifacts
+    # around a QR's hard edges are what makes a printed code fail to scan.
+    assert card["qr_image"].endswith(".png")
+
+
+def test_qr_code_optional_fields_can_be_cleared(client, db_session):
+    """The blank-means-two-things trap: a form posts an untouched field as "", and an
+    admin erasing a subtitle has to actually erase it."""
+    make_admin(db_session, email="qradmin3@example.com", password="password123")
+    headers = auth_header(client, "qradmin3@example.com", "password123")
+
+    created = client.post(
+        "/qr-codes/",
+        data={"title": "Machine Sale", "subtitle": "Sales - Machinery", "badge_label": "Machinery"},
+        headers=headers,
+    ).json()
+
+    # Empty strings on create are stored as NULL, not as "".
+    blank = client.post(
+        "/qr-codes/", data={"title": "Blank", "subtitle": "", "badge_label": ""}, headers=headers
+    ).json()
+    assert blank["subtitle"] is None and blank["badge_label"] is None
+
+    resp = client.put(
+        f"/qr-codes/{created['id']}", json={"subtitle": None, "badge_label": None}, headers=headers
+    )
+    assert resp.status_code == 200
+    assert resp.json()["subtitle"] is None
+    assert resp.json()["badge_label"] is None
+    # An omitted key still means "leave it alone".
+    assert resp.json()["title"] == "Machine Sale"
+
+
+def test_editing_a_qr_codes_caption_keeps_its_picture(client, db_session):
+    """The PUT carries no file, so it must not blank the image an admin uploaded -
+    that's what the separate /image endpoint is for."""
+    make_admin(db_session, email="qradmin4@example.com", password="password123")
+    headers = auth_header(client, "qradmin4@example.com", "password123")
+
+    card = client.post(
+        "/qr-codes/",
+        data={"title": "Material Sale"},
+        files={"file": ("qr.png", _png_bytes(), "image/png")},
+        headers=headers,
+    ).json()
+    original_image = card["qr_image"]
+    assert original_image
+
+    renamed = client.put(
+        f"/qr-codes/{card['id']}", json={"title": "Materials Team"}, headers=headers
+    ).json()
+    assert renamed["title"] == "Materials Team"
+    assert renamed["qr_image"] == original_image
+
+    # Replacing the picture is its own request, and does change it.
+    replaced = client.post(
+        f"/qr-codes/{card['id']}/image",
+        files={"file": ("new.png", _png_bytes(), "image/png")},
+        headers=headers,
+    ).json()
+    assert replaced["qr_image"] != original_image
+
+
+def test_qr_codes_reject_an_unknown_badge_variant(client, db_session):
+    """The storefront only has CSS for four colours - anything else would render as an
+    unstyled pill, so it's refused at the edge rather than stored."""
+    make_admin(db_session, email="qradmin5@example.com", password="password123")
+    headers = auth_header(client, "qradmin5@example.com", "password123")
+
+    resp = client.post(
+        "/qr-codes/", data={"title": "Nope", "badge_variant": "chartreuse"}, headers=headers
+    )
+    assert resp.status_code == 422
+
+
+def test_writing_qr_codes_requires_the_admin_permission(client, db_session):
+    """Same gate the Settings screen uses: these captions used to BE settings, so who
+    may rewrite the contact page shouldn't change just because the storage did."""
+    _staff_without_admin(db_session, "qrnotadmin@example.com")
+    headers = auth_header(client, "qrnotadmin@example.com", "password123")
+
+    resp = client.post("/qr-codes/", data={"title": "Sneaky"}, headers=headers)
+    assert resp.status_code == 403
+    assert "admin" in resp.json()["detail"]
+
+    # Reading stays open to everyone, including this account.
+    assert client.get("/qr-codes/", headers=headers).status_code == 200
+
+
+def test_deleting_a_qr_code_removes_it_from_the_public_list(client, db_session):
+    make_admin(db_session, email="qradmin6@example.com", password="password123")
+    headers = auth_header(client, "qradmin6@example.com", "password123")
+
+    card = client.post("/qr-codes/", data={"title": "Temporary"}, headers=headers).json()
+    assert client.delete(f"/qr-codes/{card['id']}", headers=headers).status_code == 204
+    assert client.get("/qr-codes/").json() == []
+    assert client.get(f"/qr-codes/{card['id']}").status_code == 404
+
+
+def test_the_removed_qr_settings_group_is_gone(client, db_session):
+    """The captions moved to /qr-codes; leaving the old keys behind would give an admin
+    two places to edit the same card, one of which no longer does anything."""
+    make_admin(db_session, email="qradmin7@example.com", password="password123")
+    headers = auth_header(client, "qradmin7@example.com", "password123")
+
+    body = client.get("/settings/", headers=headers).json()
+    assert "qr" not in {g["id"] for g in body["groups"]}
+    assert not [key for key in body["defaults"] if key.startswith("qr_")]
+
+    resp = client.put("/settings/", json={"values": {"qr_machine_title": "x"}}, headers=headers)
+    assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Orders: who may work them, and paying a cancelled one
+# ---------------------------------------------------------------------------
+def _admin_only_staff(db_session, email, password="password123"):
+    """Holds `admin` and nothing else - the owner who runs the store but was never
+    given a sales flag. The orders area has to let this person in."""
+    from app.core.security import hash_password
+    from app.models import User
+
+    user = User(
+        user_name="Owner",
+        email=email,
+        hashed_password=hash_password(password),
+        role_title="Owner",
+        is_active=True,
+        is_verified=True,
+        user_management=False,
+        price_listing=False,
+        product_management=False,
+        customer_management=False,
+        admin=True,
+    )
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+    return user
+
+
+def test_admin_permission_alone_can_work_orders(client, db_session):
+    """`admin` is "runs this store", not a job title, so it isn't implied by
+    price_listing - and an owner holding only it used to be locked out of the whole
+    orders area, including recording a payment."""
+    make_admin(db_session, email="ordersetup1@example.com", password="password123")
+    setup_headers = auth_header(client, "ordersetup1@example.com", "password123")
+    product = _make_order_product(client, setup_headers, name="Owner Widget")
+    order = client.post(
+        "/orders/", json=_order_payload(product["id"]), headers=setup_headers
+    ).json()
+
+    _admin_only_staff(db_session, "owneronly@example.com")
+    owner_headers = auth_header(client, "owneronly@example.com", "password123")
+
+    assert client.get("/orders/", headers=owner_headers).status_code == 200
+    assert client.get(f"/orders/{order['id']}", headers=owner_headers).status_code == 200
+
+    resp = client.put(
+        f"/orders/{order['id']}", json={"payment_status": "paid"}, headers=owner_headers
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["payment_status"] == "paid"
+    assert resp.json()["paid_at"] is not None
+
+
+def test_working_orders_needs_price_listing_or_admin(client, db_session):
+    """Neither flag is still a 403, and the message names both doors."""
+    from app.core.security import hash_password
+    from app.models import User
+
+    user = User(
+        user_name="Stock Clerk", email="neitherflag@example.com",
+        hashed_password=hash_password("password123"), role_title="Clerk",
+        is_active=True, is_verified=True, user_management=False, price_listing=False,
+        product_management=True, customer_management=False, admin=False,
+    )
+    db_session.add(user)
+    db_session.commit()
+    headers = auth_header(client, "neitherflag@example.com", "password123")
+
+    resp = client.get("/orders/", headers=headers)
+    assert resp.status_code == 403
+    assert "price_listing" in resp.json()["detail"] and "admin" in resp.json()["detail"]
+
+
+def test_a_cancelled_order_cannot_be_marked_paid(client, db_session):
+    """Recording money against a cancelled sale produced a row the totals strip
+    excluded as cancelled while the customer's own order list showed it as paid."""
+    make_admin(db_session, email="cancelpaid@example.com", password="password123")
+    headers = auth_header(client, "cancelpaid@example.com", "password123")
+    product = _make_order_product(client, headers, name="Cancel Widget")
+    order = client.post("/orders/", json=_order_payload(product["id"]), headers=headers).json()
+
+    client.put(f"/orders/{order['id']}", json={"status": "cancelled"}, headers=headers)
+
+    resp = client.put(f"/orders/{order['id']}", json={"payment_status": "paid"}, headers=headers)
+    assert resp.status_code == 409
+    assert "cancelled" in resp.json()["detail"]
+    assert client.get(f"/orders/{order['id']}", headers=headers).json()["payment_status"] != "paid"
+
+    # Reopening and paying in one request is the way through - the effective status is
+    # what's checked, not the stored one.
+    resp = client.put(
+        f"/orders/{order['id']}",
+        json={"status": "confirmed", "payment_status": "paid"},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["payment_status"] == "paid"
+
+
+def test_a_paid_order_still_cannot_be_cancelled(client, db_session):
+    """The mirror rule, which already existed - together they keep paid and cancelled
+    from ever being set from the admin screen in either order."""
+    make_admin(db_session, email="paidcancel@example.com", password="password123")
+    headers = auth_header(client, "paidcancel@example.com", "password123")
+    product = _make_order_product(client, headers, name="Paid Widget")
+    order = client.post("/orders/", json=_order_payload(product["id"]), headers=headers).json()
+
+    client.put(f"/orders/{order['id']}", json={"payment_status": "paid"}, headers=headers)
+    resp = client.put(f"/orders/{order['id']}", json={"status": "cancelled"}, headers=headers)
+    assert resp.status_code == 409
+
+
+def test_a_paid_order_prints_as_an_invoice(client, db_session):
+    """Quotation until paid, Invoice after - the one rule both print engines follow
+    (this one, and `docTitle` in buildPrintTemplate() in the website's main.js). The
+    Telegram attachment is named from the same helper, so the filename staff see always
+    matches the title inside the file."""
+    from app.schemas import OrderOut
+    from app.services.invoice_pdf import build_invoice_pdf, document_title
+    from app.services.telegram import _order_alert_caption
+
+    base = {
+        "id": 1, "order_number": "000001", "quote_code": "260817120000",
+        "items": [], "clinic_name": "C", "phone": "012", "address": "1 St",
+        "discount_type": "cash", "discount_value": "0", "discount_amount": "0",
+        "subtotal": "0.00", "grand_total": "0.00", "status": "pending",
+        "order_type": "quote", "created_at": "2026-08-17T00:00:00Z",
+        "updated_at": "2026-08-17T00:00:00Z",
+    }
+    unpaid = OrderOut(**base)
+    paid = OrderOut(**{**base, "payment_status": "paid"})
+
+    assert document_title(unpaid) == "Quotation"
+    assert document_title(paid) == "Invoice"
+    # A paid *order* (customer KHQR purchase), not just a paid quote, prints the same.
+    assert document_title(OrderOut(**{**base, "order_type": "order", "payment_status": "paid"})) == "Invoice"
+
+    assert _order_alert_caption(paid)[1] == document_title(paid)
+    # Both still build - the title change didn't break the layout either way.
+    assert build_invoice_pdf(unpaid)[:4] == b"%PDF"
+    assert build_invoice_pdf(paid)[:4] == b"%PDF"
