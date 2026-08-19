@@ -81,7 +81,10 @@ def _integration_status() -> dict:
             "max_pdf_mb": env_settings.MAX_PDF_SIZE_MB,
         },
         "google_signin": {"configured": env_settings.google_auth_configured},
-        "session": {"token_expire_minutes": env_settings.ACCESS_TOKEN_EXPIRE_MINUTES},
+        "session": {
+            "token_expire_minutes": env_settings.ACCESS_TOKEN_EXPIRE_MINUTES,
+            "customer_token_expire_minutes": env_settings.CUSTOMER_TOKEN_EXPIRE_MINUTES,
+        },
     }
 
 

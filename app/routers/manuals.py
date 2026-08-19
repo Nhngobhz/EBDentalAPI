@@ -39,7 +39,12 @@ def list_manuals(
     query = db.query(Manual).options(joinedload(Manual.product))
     if product_id is not None:
         query = query.filter(Manual.product_id == product_id)
-    return query.order_by(Manual.id).offset(skip).limit(limit).all()
+    # Grouped by product, then oldest-first within a product, so a product's
+    # documents always come back in the order they were added rather than
+    # shuffling as titles are edited.
+    return (
+        query.order_by(Manual.product_id, Manual.id).offset(skip).limit(limit).all()
+    )
 
 
 @router.get("/{manual_id}", response_model=ManualOut)
@@ -50,6 +55,7 @@ def get_manual(manual_id: int, db: Session = Depends(get_db)):
 @router.post("/", response_model=ManualOut, status_code=status.HTTP_201_CREATED)
 async def create_manual(
     product_id: int = Form(...),
+    title: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
     file: UploadFile | None = File(None),
     current_user: User = _perm,
@@ -60,7 +66,9 @@ async def create_manual(
     exists for replacing the PDF later."""
     if not db.query(Product).filter(Product.id == product_id).first():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="product_id does not exist")
-    manual = Manual(product_id=product_id, description=description)
+    # Built from an explicit field list, NOT payload.model_dump - a new column
+    # added only to the schema would validate here and then be thrown away.
+    manual = Manual(product_id=product_id, title=title, description=description)
     if file is not None:
         manual.pdf = await save_pdf(file, "manuals")
     stamp_updated_by(manual, current_user)

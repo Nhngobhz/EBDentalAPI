@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
+import jwt
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
 from fastapi.security import OAuth2PasswordRequestForm
@@ -16,8 +17,10 @@ from app.core.ratelimit import (
     record_login_failure,
     record_login_success,
 )
+from app.core.deps import oauth2_scheme, principal_id_from_token
 from app.core.security import (
     create_access_token,
+    decode_access_token,
     generate_url_safe_token,
     hash_password,
     verify_password,
@@ -30,6 +33,7 @@ from app.schemas import (
     Message,
     PasswordResetConfirm,
     PasswordResetRequest,
+    Token,
 )
 from app.services.telegram import notify_admin_login
 
@@ -296,6 +300,58 @@ def google_login(
         "token_type": "bearer",
         "account_type": "customer",
         "customer": customer,
+    }
+
+
+@router.post("/refresh", response_model=Token)
+def refresh_session(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    """Swap a still-valid customer token for a fresh one, restarting its 14 days.
+
+    This is what makes a customer's session expire after 14 days of *inactivity*
+    rather than 14 days flat: the storefront calls this in the background while they
+    browse (at most once a day - see slide_customer_session in the Flask app), so a
+    customer who keeps shopping is never logged out, and one who stops is, a fortnight
+    later. No credentials are involved and no new privilege is granted: proving you
+    hold a live token is exactly what you already proved on the last request.
+
+    Staff are refused on purpose. Their 24h is meant to end the session whether or not
+    they're active - the whole point of the short window is that an admin token can
+    reprice the catalogue and edit other accounts, so it should stop working a day
+    after it was issued regardless of how busy that day was. Refusing with 403 (not the
+    401 that an unknown token gets) matters: 401 is what the Flask app reads as
+    "session over, sign out now", so a mistaken staff call here would log the admin out
+    on the spot instead of harmlessly doing nothing."""
+    try:
+        payload = decode_access_token(token)
+    except jwt.PyJWTError:
+        # Expired or tampered with. Nothing to extend - go and log in again.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    customer_id = principal_id_from_token(payload, "customer")
+    if customer_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only customer sessions can be extended",
+        )
+
+    customer = db.query(Customer).filter(Customer.id == customer_id).first()
+    # Re-read from the database rather than trusting the token: this is the one moment
+    # in a fortnight-long session where a customer deactivated since login can be
+    # caught, and handing them a fresh 14 days would be exactly the wrong move.
+    if customer is None or not customer.is_active or not customer.is_verified:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return {
+        "access_token": create_access_token(data={"sub": str(customer.id), "type": "customer"}),
+        "token_type": "bearer",
     }
 
 

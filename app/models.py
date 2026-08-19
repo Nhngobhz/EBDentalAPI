@@ -13,12 +13,14 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     JSON,
     Numeric,
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.ext.declarative import declared_attr
 from sqlalchemy.orm import backref, relationship
@@ -268,6 +270,22 @@ class Product(AuditedMixin, Base):
     uom = Column(String(20), nullable=True)
 
     badge = Column(String(50), nullable=True)
+
+    # False for a product that exists only as somebody else's freebie (the stand
+    # and zirconia teeth that ship with SCAN11) - it still expands into a $0
+    # component line under its parent, but it can't be ordered on its own and is
+    # hidden from the public catalog listing.
+    #
+    # An explicit flag rather than "is it in product_free_items?", because most
+    # freebies ARE sold separately: the water distiller ($114) and SEAL120 ($152)
+    # ride along free with every autoclave and are also ordinary catalog items.
+    # Deriving this would delete them from the storefront. Not a price rule either
+    # - $0 is a consequence of being gift-only, not the definition of it.
+    #
+    # NOT NULL with server_default true: every pre-existing product is sellable,
+    # so the backfill is "all of them" - see migration e4c1a97b25f0.
+    is_purchasable = Column(Boolean, nullable=False, server_default="true")
+
     product_image = Column(String(500), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -367,7 +385,17 @@ class Manual(AuditedMixin, Base):
 
     # Changed from a raw `product_name` string to a foreign key, same
     # reasoning as Product.brand_id. See README.
+    # A product may have SEVERAL manuals - a user guide, a quick-start sheet, a
+    # service manual - so this is deliberately many-to-one and always has been.
+    # What was missing until d1f6b83a45c9 was a way to tell them apart, hence
+    # `title` below.
     product_id = Column(Integer, ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
+
+    # What this particular document is called ("User Manual", "Quick Start
+    # Guide"). Nullable because every manual that existed before the column did
+    # has none, and the storefront falls back to "Product Manual" rather than
+    # rendering a blank heading - see products/detail.html.
+    title = Column(String(200), nullable=True)
 
     description = Column(Text, nullable=True)
     manual_image = Column(String(500), nullable=True)
@@ -467,6 +495,104 @@ class Set(AuditedMixin, Base):
         cascade="all, delete-orphan",
         order_by="SetItem.id",
     )
+
+    # The swappable slots - see SetOptionGroup. Empty for an ordinary fixed set.
+    option_groups = relationship(
+        "SetOptionGroup",
+        back_populates="set",
+        cascade="all, delete-orphan",
+        order_by="SetOptionGroup.sort_order, SetOptionGroup.id",
+    )
+
+
+class SetOptionGroup(Base):
+    """One swappable slot in a Set - "Laptop", "X-ray model", "Compressor".
+
+    A set is therefore its fixed contents (SetItem, always included) PLUS one
+    choice from each group. Groups are additive to Set.items rather than a
+    replacement for them, so an existing set with no groups behaves exactly as
+    it always did: no groups, nothing to choose, one configuration.
+
+    Not AuditedMixin - like SetItem this is structure belonging to its parent
+    Set, and the Set already records who last changed it.
+    """
+
+    __tablename__ = "set_option_groups"
+
+    id = Column(Integer, primary_key=True, index=True)
+    set_id = Column(Integer, ForeignKey("sets.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    # Shown as the heading above the radio buttons on the storefront.
+    name = Column(String(100), nullable=False)
+
+    # Display position. Assigned by the router as the list index, so groups keep
+    # the order the admin arranged them in.
+    sort_order = Column(Integer, nullable=False, server_default="0")
+
+    set = relationship("Set", back_populates="option_groups")
+    choices = relationship(
+        "SetOptionChoice",
+        back_populates="group",
+        cascade="all, delete-orphan",
+        order_by="SetOptionChoice.sort_order, SetOptionChoice.id",
+    )
+
+
+class SetOptionChoice(BundleItemMixin, Base):
+    """One alternative within a SetOptionGroup - the product you get if you pick
+    it, and what picking it adds to the set's price.
+
+    BundleItemMixin for the same reason SetItem has it: this is an (owner,
+    product_id, qty) row, so the mixin's read-through product_name/product_code/
+    uom let it serialize without the router re-joining Product."""
+
+    __tablename__ = "set_option_choices"
+    __table_args__ = (
+        UniqueConstraint("group_id", "product_id", name="uq_set_option_choice"),
+        # At most one default per group. A second one would make "what does this
+        # set cost as standard" ambiguous, and the storefront would silently
+        # preselect whichever row came back first. Partial unique index rather
+        # than a check constraint because the rule spans rows.
+        Index(
+            "uq_set_option_group_default",
+            "group_id",
+            unique=True,
+            postgresql_where=text("is_default"),
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(
+        Integer, ForeignKey("set_option_groups.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    product_id = Column(
+        Integer, ForeignKey("products.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    qty = Column(Integer, nullable=False, server_default="1")
+
+    # What choosing this adds to the set price, relative to the group's default.
+    #
+    # NULL means "work it out from the products" - the difference between this
+    # choice's contents and the default choice's, at their current selling
+    # prices. That's the default behaviour precisely because it can't go stale:
+    # reprice either laptop and the upgrade cost follows on its own, the same way
+    # bundle_old_price already derives a set's "was" price from its contents.
+    #
+    # A stored number overrides that, for when the upgrade is deliberately not
+    # the raw price gap - offering a $90 better laptop for $30 to move stock, say.
+    # May be negative: a cheaper alternative is a legitimate choice.
+    price_delta = Column(Numeric(10, 2), nullable=True)
+
+    # The standard configuration - what the set's own `price` already covers, and
+    # what the storefront preselects. Exactly one per group in practice (see the
+    # partial unique index above); a group with none falls back to its first
+    # choice so a half-configured set still prices.
+    is_default = Column(Boolean, nullable=False, server_default="false")
+
+    sort_order = Column(Integer, nullable=False, server_default="0")
+
+    group = relationship("SetOptionGroup", back_populates="choices")
+    product = relationship("Product")
 
 
 class SetItem(BundleItemMixin, Base):
@@ -674,6 +800,21 @@ class OrderItem(Base):
         Integer, ForeignKey("order_items.id", ondelete="CASCADE"), nullable=True, index=True
     )
 
+    # Which alternative was picked in each of a configurable set's option groups,
+    # as [{"group_id": .., "choice_id": ..}]. NULL on every other kind of line.
+    #
+    # This is NOT how the customer finds out what they bought - the $0 component
+    # lines below already name the chosen products, snapshotted like everything
+    # else. It exists so an EDIT can re-price the line as configured: update_order
+    # rebuilds every line from {set_id, qty} through _build_order_lines, and
+    # without the selection travelling with it a saved upgrade would silently
+    # revert to the set's defaults the first time staff corrected a phone number.
+    #
+    # JSON rather than a join table (the shape SetOptionChoice itself uses)
+    # because an order line is frozen history, like the denormalized name/price
+    # columns beside it - there is nothing to query or join against here.
+    set_options = Column(JSON, nullable=True)
+
     # Snapshotted at order-creation time from the Product/Promotion/Set row - never
     # re-derived later, so a historical order stays accurate even if the product's
     # price/name/code changes or the product/promotion/set itself is deleted. Reused
@@ -788,6 +929,65 @@ class QrCode(AuditedMixin, Base):
 
     # Display position, low to high. Not nullable (with a server_default) because
     # every card has to sort somewhere, and NULL ordering differs between backends.
+    sort_order = Column(Integer, nullable=False, server_default="0")
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class HeroSlide(AuditedMixin, Base):
+    """One slide in the storefront's hero carousel (the big rotating banner at the
+    top of the home page and the products catalog).
+
+    These were three hard-coded <div class="slide"> blocks in the Flask app's
+    templates/partials/hero_slider.html - stock photography and copy that only a
+    developer could change. A table makes the carousel ordinary admin CRUD: add a
+    fourth slide for a campaign, reword one, reorder them, or switch one off out of
+    season without deleting the artwork.
+
+    Note that this is NOT the whole carousel. The first active Promotion still
+    contributes an automatic slide ahead of these, built from its own artwork by the
+    template - see that partial. Rows here are the editable remainder.
+    """
+
+    __tablename__ = "hero_slides"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # The <h2>. Split in two because the storefront renders the tail in the accent
+    # colour ("Equip Your Practice with <span>Excellence</span>"), and asking an admin
+    # to type a <span> into a text box would mean trusting HTML from a form. The
+    # highlight is nullable: a heading that wants no coloured tail just leaves it out.
+    heading = Column(String(200), nullable=False)
+    heading_highlight = Column(String(120), nullable=True)
+    # The paragraph under the heading. Nullable - a purely graphic slide needs none.
+    subheading = Column(String(400), nullable=True)
+
+    # Nullable so a slide can be written before its artwork is ready (and so a failed
+    # upload doesn't lose the copy). Stored like every other image field: an R2 URL, a
+    # local /static/... path, or - for the three seeded rows - the external stock photo
+    # URL they were hard-coded with. See app/core/files.py.
+    slide_image = Column(String(500), nullable=True)
+
+    # The small pill above the heading. Both nullable: no label means no pill at all,
+    # which is why this isn't defaulted.
+    badge_label = Column(String(60), nullable=True)
+    # Font Awesome class shown inside the pill, e.g. "fa-tooth".
+    badge_icon = Column(String(60), nullable=True)
+
+    # The call-to-action. A free-text path ("/products", "/promotions") rather than an
+    # endpoint name or a foreign key: a slide may point anywhere, including off-site,
+    # and a stored Flask endpoint name would break the storefront the day a route is
+    # renamed. No button is rendered unless BOTH of these are set.
+    button_label = Column(String(60), nullable=True)
+    button_url = Column(String(500), nullable=True)
+
+    # Lets a seasonal slide be parked instead of deleted - deleting it would lose the
+    # copy and the uploaded artwork. The storefront asks for active_only; the admin
+    # list shows everything.
+    is_active = Column(Boolean, nullable=False, server_default="true")
+
+    # Display position, low to high. Not nullable (with a server_default) because
+    # every slide has to sort somewhere, and NULL ordering differs between backends.
     sort_order = Column(Integer, nullable=False, server_default="0")
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())

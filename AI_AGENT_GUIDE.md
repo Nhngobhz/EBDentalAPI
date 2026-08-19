@@ -99,9 +99,32 @@ Every authenticated endpoint expects:
 ```
 Authorization: Bearer <access_token>
 ```
-There is no refresh token / refresh endpoint - when the token expires
-(`ACCESS_TOKEN_EXPIRE_MINUTES`, default 24h) the caller has to log in
-again.
+How long a token lasts depends on **who it belongs to**, picked from the
+`type` claim by `token_lifetime()` in `app/core/security.py`:
+
+| Account type | Setting | Default | Extendable? |
+|---|---|---|---|
+| Staff / admin (`"user"`) | `ACCESS_TOKEN_EXPIRE_MINUTES` | 24h | **No** |
+| Customer (`"customer"`) | `CUSTOMER_TOKEN_EXPIRE_MINUTES` | 14 days | Yes, via `POST /auth/refresh` |
+
+Staff tokens are short *and* non-extendable on purpose: one of them can
+reprice the catalogue and edit other people's accounts, so it should stop
+working a day after it was issued no matter how busy that day was. When it
+lapses, staff log in again - there is no way around it.
+
+`POST /auth/refresh` swaps a still-valid **customer** token for a new one
+with a full 14 days ahead of it. That is what makes a customer's session
+14 days of *inactivity* rather than 14 days flat: the Flask storefront
+calls it in the background roughly once a day while the customer browses
+(`slide_customer_session` in `EB Web Project/app.py`). It takes no body -
+just the bearer token - and returns `{access_token, token_type}`. It
+re-reads the customer from the database first, so an account deactivated
+mid-session is refused rather than handed another fortnight.
+
+It answers **403** (not 401) to a staff token. That distinction is load-
+bearing: the Flask app reads a 401 as "this session is over, sign out
+now", so a mistaken staff call here would log the admin straight out
+instead of harmlessly doing nothing.
 
 ### 1.3 Registration (customers only)
 
@@ -352,6 +375,7 @@ record only.
 |---|---|---|
 | `POST /auth/login` | Public | form-encoded `username`+`password`; combined staff/customer login, see 1.1 |
 | `POST /auth/google` | Public | JSON `{"credential": "<Google ID token>"}`; same response shape as `/auth/login`. Signs in an existing staff/customer with that (Google-verified) email, or creates a customer for it. See 1.6 |
+| `POST /auth/refresh` | Customer token | No body. Returns a new customer token with a full lifetime; **403** for a staff token (their session is deliberately not extendable), 401 if the token is expired or the customer is gone/deactivated. See 1.2 |
 | `GET /auth/verify-email?token=` | Public | returns HTML, not JSON (opened from an email link) |
 | `POST /auth/resend-verification` | Public | JSON `{"email": "..."}` |
 | `POST /auth/forgot-password` | Public | JSON `{"email": "..."}`; always returns the same generic message whether or not the email exists (no account enumeration) |
@@ -436,7 +460,7 @@ top of `app/schemas.py`, not a per-class `@field_validator`.
 |---|---|---|
 | `GET /products/` | Public | query `skip`, `limit`, `brand_id`, `category_id`, `q` (name substring); price masking applies, see section 4 |
 | `GET /products/{id}` | Public | same masking |
-| `POST /products/` | `product_management` | JSON `ProductCreate` (`product_name`, `description?`, `badge?`, `product_code?` (SKU, must be globally unique or `400`), `uom?` (unit of measure, free text e.g. `"pcs"`/`"box"`), `price` >0, `discount?` (integer percent, `0`-`100`, defaults `0`), `brand_id` - must reference an existing brand or `400`, `category_id?` - must reference an existing category or `400`, `free_items?` - products given away free with this one, see "Bundle contents" below) |
+| `POST /products/` | `product_management` | JSON `ProductCreate` (`product_name`, `description?`, `badge?`, `product_code?` (SKU, must be globally unique or `400`), `uom?` (unit of measure, free text e.g. `"pcs"`/`"box"`), `price` >0, `discount?` (integer percent, `0`-`100`, defaults `0`), `brand_id` - must reference an existing brand or `400`, `category_id?` - must reference an existing category or `400`, `free_items?` - products given away free with this one, see "Bundle contents" below, `is_purchasable?` - defaults `true`; `false` marks a gift-only product, see "Bundle contents") |
 | `PUT /products/{id}` | `product_management`, **+`price_listing` if the body includes `price` or `discount`** | JSON `ProductUpdate`, all fields optional |
 | `PATCH /products/{id}/price` | `price_listing` only | JSON `{"price"?, "discount"?}` - use this instead of `PUT` if the caller only has `price_listing` (it can't touch `free_items` - use `PUT` for that) |
 | `POST /products/{id}/image` | `product_management` | multipart `file` - the **primary** picture (`product_image`) |
@@ -517,6 +541,15 @@ may come with other products for free. All three use the same field shape:
 - Deleting a `Product` removes it from every bundle (`ON DELETE CASCADE` on
   the join row) - it never blocks the delete, and never touches an
   already-placed order, which carries its own snapshot.
+- **`Product.is_purchasable`** (default `true`) marks a product that exists
+  ONLY as somebody else's freebie. It still expands into its `$0` component
+  line, but `POST`/`PUT /orders/` reject it as a **paid** line with a `400`,
+  and `GET /products/` leaves it out unless you pass
+  `include_unpurchasable=true`. `GET /products/{id}` always serves it, so admin
+  screens can still open one. Set it on the *freebie*, never on the parent.
+  Note it is **not** derivable: most freebies (the water distiller, SEAL120)
+  are also sold on their own, and `price == 0` is a consequence of being
+  gift-only, not the definition.
 - The bundle's `price` is always the admin-entered bundle price. It is
   **never** summed from its members, and the members are never charged for -
   see "component lines" under Orders.

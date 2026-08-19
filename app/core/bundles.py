@@ -29,8 +29,202 @@ def combined_contents_price(rows) -> Decimal | None:
     return total
 
 
-def bundle_old_price(bundle) -> Decimal | None:
+def build_option_groups(db: Session, groups, group_model, choice_model):
+    """Validate submitted option groups and turn them into ORM rows.
+
+    Same 400-not-500 contract as build_bundle_rows: an unknown product, or the
+    same product listed twice inside one group, is a client mistake and is
+    reported as one rather than surfacing as an opaque IntegrityError from
+    uq_set_option_choice.
+
+    Two rules are applied rather than merely checked, because both have a single
+    sensible answer and rejecting would just make the admin form annoying:
+      * a group with no default gets its first choice flagged as one, so every
+        group always has a baseline configuration;
+      * a second default in the same group is dropped to non-default, which the
+        partial unique index would otherwise reject outright.
+    A group with no choices at all IS rejected - it would render as an empty set
+    of radio buttons that the customer can't answer.
+    """
+    rows = []
+    for position, group in enumerate(groups):
+        if not group.choices:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Option group '{group.name}' must have at least one choice",
+            )
+
+        seen: set[int] = set()
+        choice_rows = []
+        default_seen = False
+        for index, choice in enumerate(group.choices):
+            if choice.product_id in seen:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"product_id {choice.product_id} is listed more than once "
+                        f"in option group '{group.name}'"
+                    ),
+                )
+            seen.add(choice.product_id)
+            if not db.query(Product).filter(Product.id == choice.product_id).first():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"product_id {choice.product_id} does not exist",
+                )
+            is_default = choice.is_default and not default_seen
+            default_seen = default_seen or is_default
+            choice_rows.append(
+                choice_model(
+                    product_id=choice.product_id,
+                    qty=choice.qty,
+                    price_delta=choice.price_delta,
+                    is_default=is_default,
+                    sort_order=index,
+                )
+            )
+        if not default_seen:
+            choice_rows[0].is_default = True
+
+        rows.append(
+            group_model(name=group.name, sort_order=position, choices=choice_rows)
+        )
+    return rows
+
+
+def replace_option_groups(db: Session, set_, groups, group_model, choice_model) -> None:
+    """Swap a set's option groups for a newly submitted list.
+
+    Same clear-flush-assign dance as replace_bundle_rows, and load-bearing for
+    the same reason: re-submitting a group that keeps one of its existing
+    products would otherwise re-insert a (group_id, product_id) pair that is
+    still in the table and die on uq_set_option_choice. Rows are built and
+    validated first, so a bad payload 400s without touching what's saved.
+    """
+    rows = build_option_groups(db, groups, group_model, choice_model)
+    set_.option_groups = []
+    db.flush()
+    set_.option_groups = rows
+
+
+def default_choice(group):
+    """The choice a group falls back to when the buyer picks nothing.
+
+    The flagged default, or - for a group that somehow has none - its first
+    choice, so a half-configured set still prices instead of 500ing. Returns
+    None only for a group with no choices at all, which the caller treats as
+    "nothing to pick here".
+    """
+    for choice in group.choices:
+        if choice.is_default:
+            return choice
+    return group.choices[0] if group.choices else None
+
+
+def choice_price_delta(choice, group) -> Decimal:
+    """What picking `choice` adds to its set's price.
+
+    The stored `price_delta` when there is one, otherwise the live difference
+    between this choice's contents and the group default's - see the column
+    comment on SetOptionChoice.price_delta for why NULL means "derive it".
+
+    The default choice is always 0: it's the configuration the set's own price
+    already covers, so it can't also be an upcharge on itself.
+    """
+    base = default_choice(group)
+    if base is None or choice.id == base.id:
+        return Decimal("0")
+    if choice.price_delta is not None:
+        return Decimal(choice.price_delta)
+    if choice.product is None or base.product is None:
+        return Decimal("0")
+    return (choice.product.price * choice.qty) - (base.product.price * base.qty)
+
+
+def resolve_set_options(set_, selections):
+    """Work out which choice each of a set's option groups ends up on.
+
+    `selections` is what the buyer sent - {group_id: choice_id} - and may be
+    partial or empty; any group it doesn't mention falls back to its default, so
+    an unconfigured purchase of a configurable set is still a valid one.
+
+    Returns (chosen, total_delta): the SetOptionChoice per group in group order,
+    and what they add to the set price combined.
+
+    Raises 400 on a choice that isn't in the group it's claimed for, or a group
+    that isn't in this set - both mean the client is working from a stale copy of
+    the set, and silently substituting the default would reprice their order
+    without telling them.
+    """
+    chosen = []
+    total_delta = Decimal("0")
+    group_ids = {g.id for g in set_.option_groups}
+
+    for group_id in selections:
+        if group_id not in group_ids:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"option group {group_id} does not belong to set "
+                    f"'{set_.set_name}' - reload the set and choose again"
+                ),
+            )
+
+    for group in set_.option_groups:
+        picked_id = selections.get(group.id)
+        if picked_id is None:
+            choice = default_choice(group)
+        else:
+            choice = next((c for c in group.choices if c.id == picked_id), None)
+            if choice is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"choice {picked_id} is not an option for '{group.name}' - "
+                        "reload the set and choose again"
+                    ),
+                )
+        if choice is None:  # group with no choices at all - nothing to include
+            continue
+        chosen.append(choice)
+        total_delta += choice_price_delta(choice, group)
+
+    return chosen, total_delta
+
+
+def set_contents(set_, chosen):
+    """What a configured set actually contains: its fixed items, with any item a
+    slot has taken over replaced by that slot's chosen product.
+
+    A group CLAIMS the item its default choice names. "Includes a Smart Ray" plus
+    a slot whose standard choice is that same Smart Ray describes one x-ray, not
+    two - the slot is an upgrade path for the included item, not a second copy of
+    it. Without this the standard build lists Smart Ray twice, and upgrading
+    lists both Smart Ray and Smart Ray Pro, telling the customer they get a
+    machine they aren't getting.
+
+    A slot whose default names a product that ISN'T in `items` claims nothing and
+    simply adds its choice, which is the other legitimate way to build a set.
+    """
+    claimed = set()
+    for group in getattr(set_, "option_groups", []):
+        base = default_choice(group)
+        if base is not None:
+            claimed.add(base.product_id)
+
+    fixed = [item for item in set_.items if item.product_id not in claimed]
+    return fixed + list(chosen or [])
+
+
+def bundle_old_price(bundle, contents=None) -> Decimal | None:
     """The "was" price of a Promotion/Set - what the deal is measured against.
+
+    `contents` overrides `bundle.items` for a configurable set, and should be
+    what set_contents() returned: the fixed items with any slot-claimed one
+    swapped for the chosen product. Option choices price exactly like fixed
+    contents - both expose `.product` and `.qty` - so upgrading to a dearer
+    laptop raises the "was" figure on its own and the saving printed on the quote
+    stays honest without anyone maintaining a second number.
 
     For a bundle WITH contents this is computed, not stored: the members priced
     separately are exactly what the customer would otherwise have paid, so that
@@ -45,7 +239,7 @@ def bundle_old_price(bundle) -> Decimal | None:
     create_order only treats a POSITIVE old_price-minus-price difference as one,
     so such a bundle simply books at its own price with no discount.
     """
-    combined = combined_contents_price(bundle.items)
+    combined = combined_contents_price(bundle.items if contents is None else contents)
     if combined is not None:
         return combined
     return bundle.old_price

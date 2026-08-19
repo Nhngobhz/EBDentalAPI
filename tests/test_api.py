@@ -1394,6 +1394,68 @@ def test_create_category_with_image_in_one_request(client, db_session):
     assert resp.json()["category_image"] is None
 
 
+def test_a_product_can_carry_several_titled_manuals(client, db_session):
+    """A user guide, a quick-start sheet and a service manual on one product,
+    each named. `title` is what makes several documents distinguishable - without
+    it they were three identical-looking rows."""
+    make_admin(db_session, email="manytitles@example.com", password="password123")
+    headers = auth_header(client, "manytitles@example.com", "password123")
+    brand_id = client.post("/brands/", data={"brand_name": "DocsCo"}, headers=headers).json()["id"]
+    product_id = client.post(
+        "/products/",
+        json={"product_name": "Documented Widget", "price": "50.00", "brand_id": brand_id},
+        headers=headers,
+    ).json()["id"]
+
+    fake_pdf = b"%PDF-1.4\n" + b"0" * 50
+    for title in ("User Manual", "Quick Start Guide", "Service Manual"):
+        resp = client.post(
+            "/manuals/",
+            data={"product_id": product_id, "title": title, "description": f"{title} text"},
+            files={"file": (f"{title}.pdf", fake_pdf, "application/pdf")},
+            headers=headers,
+        )
+        assert resp.status_code == 201, resp.text
+        # POST /manuals/ builds its Manual from an explicit argument list, so a
+        # field present only on the schema would be silently dropped here.
+        assert resp.json()["title"] == title
+
+    listed = client.get("/manuals/", params={"product_id": product_id}).json()
+    assert [m["title"] for m in listed] == [
+        "User Manual", "Quick Start Guide", "Service Manual",
+    ]
+
+
+def test_manual_title_is_optional_and_can_be_cleared(client, db_session):
+    make_admin(db_session, email="notitle@example.com", password="password123")
+    headers = auth_header(client, "notitle@example.com", "password123")
+    brand_id = client.post("/brands/", data={"brand_name": "UntitledCo"}, headers=headers).json()["id"]
+    product_id = client.post(
+        "/products/",
+        json={"product_name": "Untitled Widget", "price": "20.00", "brand_id": brand_id},
+        headers=headers,
+    ).json()["id"]
+
+    # Omitted entirely - every manual predating the column looks like this, and
+    # the storefront captions it "Product Manual".
+    created = client.post(
+        "/manuals/", data={"product_id": product_id}, headers=headers
+    ).json()
+    assert created["title"] is None
+
+    named = client.put(
+        f"/manuals/{created['id']}", json={"title": "Install Guide"}, headers=headers
+    ).json()
+    assert named["title"] == "Install Guide"
+
+    # An explicit null clears it again - the admin form sends that when the box
+    # is emptied, so a mistyped title can actually be removed.
+    cleared = client.put(
+        f"/manuals/{created['id']}", json={"title": None}, headers=headers
+    ).json()
+    assert cleared["title"] is None
+
+
 def test_create_manual_with_pdf_in_one_request(client, db_session):
     make_admin(db_session, email="uploader3@example.com", password="password123")
     headers = auth_header(client, "uploader3@example.com", "password123")
@@ -1499,22 +1561,32 @@ def test_admin_set_password_requires_user_management(client, db_session):
 # ---------------------------------------------------------------------------
 # Orders (quotes)
 # ---------------------------------------------------------------------------
-def _make_order_product(client, headers, name="Quoted Widget", price="100.00", free_items=None):
+def _make_order_product(
+    client, headers, name="Quoted Widget", price="100.00", free_items=None,
+    is_purchasable=None,
+):
     brand_id = client.post("/brands/", data={"brand_name": f"OrderCo-{name}"}, headers=headers).json()["id"]
     payload = {"product_name": name, "price": price, "brand_id": brand_id}
     if free_items is not None:
         payload["free_items"] = free_items
+    if is_purchasable is not None:
+        payload["is_purchasable"] = is_purchasable
     resp = client.post("/products/", json=payload, headers=headers)
     assert resp.status_code == 201, resp.text
     return resp.json()
 
 
-def _make_set(client, headers, name="Order Set", price="50.00", old_price=None, items=None):
+def _make_set(
+    client, headers, name="Order Set", price="50.00", old_price=None, items=None,
+    option_groups=None,
+):
     payload = {"set_name": name, "price": price}
     if old_price is not None:
         payload["old_price"] = old_price
     if items is not None:
         payload["items"] = items
+    if option_groups is not None:
+        payload["option_groups"] = option_groups
     resp = client.post("/sets/", json=payload, headers=headers)
     assert resp.status_code == 201, resp.text
     return resp.json()
@@ -1988,6 +2060,427 @@ def test_product_free_items_ride_along_at_zero(client, db_session):
     # The freebie is free: it never reaches the subtotal, so it can't be
     # discounted or paid for either.
     assert body["subtotal"] == "300.00"
+
+
+def test_products_are_purchasable_by_default(client, db_session):
+    make_admin(db_session, email="giftdefault@example.com", password="password123")
+    headers = auth_header(client, "giftdefault@example.com", "password123")
+    product = _make_order_product(client, headers, name="Ordinary Item", price="10.00")
+    assert product["is_purchasable"] is True
+
+
+def test_gift_only_product_cannot_be_ordered_on_its_own(client, db_session):
+    make_admin(db_session, email="gift1@example.com", password="password123")
+    headers = auth_header(client, "gift1@example.com", "password123")
+    gift = _make_order_product(
+        client, headers, name="Gift Stand", price="1.00", is_purchasable=False,
+    )
+    assert gift["is_purchasable"] is False
+
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(None, items=[{"product_id": gift["id"], "qty": 1}]),
+        headers=headers,
+    )
+    assert resp.status_code == 400, resp.text
+    assert "cannot be ordered on its own" in resp.json()["detail"]
+
+
+def test_gift_only_product_still_rides_along_free(client, db_session):
+    """The whole point of the flag: refused as a paid line, still expanded as a
+    $0 component under the product it comes with."""
+    make_admin(db_session, email="gift2@example.com", password="password123")
+    headers = auth_header(client, "gift2@example.com", "password123")
+    gift = _make_order_product(
+        client, headers, name="Gift Teeth", price="1.00", is_purchasable=False,
+    )
+    scanner = _make_order_product(
+        client, headers, name="Gift Scanner", price="500.00",
+        free_items=[{"product_id": gift["id"], "qty": 5}],
+    )
+
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(None, items=[{"product_id": scanner["id"], "qty": 1}]),
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+
+    parent, components = _components_of(body)
+    assert parent["line_amount"] == "500.00"
+    assert [(c["product_name"], c["qty"], c["line_amount"]) for c in components] == [
+        ("Gift Teeth", 5, "0.00")
+    ]
+    # The freebie rode along without adding anything to the bill.
+    assert body["subtotal"] == "500.00"
+
+
+def test_gift_only_product_hidden_from_catalog_listing(client, db_session):
+    make_admin(db_session, email="gift3@example.com", password="password123")
+    headers = auth_header(client, "gift3@example.com", "password123")
+    gift = _make_order_product(
+        client, headers, name="Gift Hidden", price="1.00", is_purchasable=False,
+    )
+    sellable = _make_order_product(client, headers, name="Gift Visible", price="9.00")
+
+    listed = [p["id"] for p in client.get("/products/", params={"limit": 200}).json()]
+    assert sellable["id"] in listed
+    assert gift["id"] not in listed
+
+    # The admin screens opt back in - they have to edit and bundle these.
+    everything = [
+        p["id"]
+        for p in client.get(
+            "/products/", params={"limit": 200, "include_unpurchasable": True}
+        ).json()
+    ]
+    assert gift["id"] in everything
+
+    # Fetched directly it is still served, so the admin can open it.
+    assert client.get(f"/products/{gift['id']}").status_code == 200
+
+
+def test_gift_only_flag_can_be_turned_back_on(client, db_session):
+    """Clearing the flag has to work, not just setting it - a mis-marked product
+    would otherwise be stuck off the storefront."""
+    make_admin(db_session, email="gift4@example.com", password="password123")
+    headers = auth_header(client, "gift4@example.com", "password123")
+    gift = _make_order_product(
+        client, headers, name="Gift Reversible", price="12.00", is_purchasable=False,
+    )
+
+    resp = client.put(
+        f"/products/{gift['id']}", json={"is_purchasable": True}, headers=headers
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["is_purchasable"] is True
+
+    listed = [p["id"] for p in client.get("/products/", params={"limit": 200}).json()]
+    assert gift["id"] in listed
+
+    order = client.post(
+        "/orders/",
+        json=_order_payload(None, items=[{"product_id": gift["id"], "qty": 1}]),
+        headers=headers,
+    )
+    assert order.status_code == 201, order.text
+
+
+def _configurable_set(client, headers, tag, set_price="2000.00"):
+    """A set with a fixed item plus two swappable slots: one whose upgrade is
+    auto-priced from the product gap, one with an explicit override."""
+    fixed = _make_order_product(client, headers, name=f"Camera {tag}", price="900.00")
+    base_xray = _make_order_product(client, headers, name=f"Base Xray {tag}", price="700.00")
+    up_xray = _make_order_product(client, headers, name=f"Up Xray {tag}", price="1000.00")
+    base_light = _make_order_product(client, headers, name=f"Base Light {tag}", price="100.00")
+    up_light = _make_order_product(client, headers, name=f"Up Light {tag}", price="500.00")
+
+    set_ = _make_set(
+        client, headers, name=f"Configurable {tag}", price=set_price,
+        items=[{"product_id": fixed["id"], "qty": 1}],
+        option_groups=[
+            {"name": "Xray", "choices": [
+                {"product_id": base_xray["id"], "is_default": True},
+                # No price_delta -> derived: 1000 - 700 = 300
+                {"product_id": up_xray["id"]},
+            ]},
+            {"name": "Light", "choices": [
+                {"product_id": base_light["id"], "is_default": True},
+                # Explicit override: a 400 gap deliberately sold as +25
+                {"product_id": up_light["id"], "price_delta": "25.00"},
+            ]},
+        ],
+    )
+    groups = {g["name"]: g for g in set_["option_groups"]}
+    return set_, groups
+
+
+def _choice(group, product_name):
+    return next(c for c in group["choices"] if c["product_name"] == product_name)
+
+
+def test_set_option_deltas_derive_from_products_unless_overridden(client, db_session):
+    make_admin(db_session, email="opt1@example.com", password="password123")
+    headers = auth_header(client, "opt1@example.com", "password123")
+    set_, groups = _configurable_set(client, headers, "D1")
+
+    xray, light = groups["Xray"], groups["Light"]
+    # The default is the baseline, so it can never be an upcharge on itself.
+    assert _choice(xray, "Base Xray D1")["effective_delta"] == "0"
+    # Derived from the live product prices...
+    assert _choice(xray, "Up Xray D1")["effective_delta"] == "300.00"
+    # ...unless a figure was stored, which wins over the 400.00 raw gap.
+    assert _choice(light, "Up Light D1")["effective_delta"] == "25.00"
+    assert _choice(light, "Up Light D1")["price_delta"] == "25.00"
+
+    # "was" for the standard configuration counts the default choices as
+    # contents: 900 fixed + 700 base xray + 100 base light.
+    assert set_["old_price"] == "1700.00"
+
+
+def test_unconfigured_set_line_falls_back_to_the_defaults(client, db_session):
+    make_admin(db_session, email="opt2@example.com", password="password123")
+    headers = auth_header(client, "opt2@example.com", "password123")
+    set_, _ = _configurable_set(client, headers, "D2")
+
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(None, items=[{"set_id": set_["id"], "qty": 1}]),
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    parent, components = _components_of(resp.json())
+    # No upgrades chosen, so the set books at exactly its own price.
+    assert parent["unit_price"] == "2000.00"
+    assert sorted(c["product_name"] for c in components) == [
+        "Base Light D2", "Base Xray D2", "Camera D2",
+    ]
+
+
+def test_configured_set_folds_upgrades_into_its_price_and_swaps_components(client, db_session):
+    make_admin(db_session, email="opt3@example.com", password="password123")
+    headers = auth_header(client, "opt3@example.com", "password123")
+    set_, groups = _configurable_set(client, headers, "D3")
+
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(None, items=[{
+            "set_id": set_["id"], "qty": 1,
+            "options": [
+                {"group_id": groups["Xray"]["id"],
+                 "choice_id": _choice(groups["Xray"], "Up Xray D3")["id"]},
+                {"group_id": groups["Light"]["id"],
+                 "choice_id": _choice(groups["Light"], "Up Light D3")["id"]},
+            ],
+        }]),
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    parent, components = _components_of(body)
+
+    # 2000 + 300 derived + 25 overridden, on ONE line rather than three.
+    assert parent["unit_price"] == "2325.00"
+    assert body["grand_total"] == "2325.00"
+    # The chosen products replaced the defaults in the component list.
+    assert sorted(c["product_name"] for c in components) == [
+        "Camera D3", "Up Light D3", "Up Xray D3",
+    ]
+    # Components stay free - upgrades are paid for through the parent's price.
+    assert all(c["line_amount"] == "0.00" for c in components)
+    # "was" tracks the upgraded contents: 900 + 1000 + 500.
+    assert parent["list_price"] == "2400.00"
+
+
+def test_set_option_selection_survives_an_order_edit(client, db_session):
+    """The reason the selection is persisted at all: update_order re-prices every
+    line from scratch, so without it an upgrade would silently revert."""
+    make_admin(db_session, email="opt4@example.com", password="password123")
+    headers = auth_header(client, "opt4@example.com", "password123")
+    set_, groups = _configurable_set(client, headers, "D4")
+    picked = _choice(groups["Xray"], "Up Xray D4")["id"]
+
+    created = client.post(
+        "/orders/",
+        json=_order_payload(None, items=[{
+            "set_id": set_["id"], "qty": 1,
+            "options": [{"group_id": groups["Xray"]["id"], "choice_id": picked}],
+        }]),
+        headers=headers,
+    ).json()
+    parent, _ = _components_of(created)
+    assert parent["unit_price"] == "2300.00"
+    assert parent["set_options"] == [{"group_id": groups["Xray"]["id"], "choice_id": picked}]
+
+    # Re-send the stored selection the way the admin screen does.
+    resp = client.put(
+        f"/orders/{created['id']}",
+        json={"items": [{
+            "set_id": set_["id"], "qty": 3, "options": parent["set_options"],
+        }]},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    edited, components = _components_of(resp.json())
+    assert edited["unit_price"] == "2300.00"
+    assert edited["qty"] == 3
+    assert "Up Xray D4" in [c["product_name"] for c in components]
+
+
+def test_an_option_slot_upgrades_its_included_product_rather_than_adding_one(client, db_session):
+    """A slot whose standard choice is also an Included Product describes ONE
+    machine with an upgrade path, not two. Regression: the standard build used to
+    list the x-ray twice, and the upgraded build listed both the standard machine
+    and the Pro that replaced it."""
+    make_admin(db_session, email="optdup@example.com", password="password123")
+    headers = auth_header(client, "optdup@example.com", "password123")
+    sensor = _make_order_product(client, headers, name="Dup Sensor", price="800.00")
+    base_xray = _make_order_product(client, headers, name="Dup Xray", price="700.00")
+    up_xray = _make_order_product(client, headers, name="Dup Xray Pro", price="1000.00")
+
+    set_ = _make_set(
+        client, headers, name="Dup Set", price="1500.00",
+        # The x-ray is listed as included AND is the slot's standard choice -
+        # exactly how the admin screen now pre-fills a new slot.
+        items=[{"product_id": sensor["id"], "qty": 1}, {"product_id": base_xray["id"], "qty": 1}],
+        option_groups=[{"name": "Xray", "choices": [
+            {"product_id": base_xray["id"], "is_default": True},
+            {"product_id": up_xray["id"]},
+        ]}],
+    )
+    groups = {g["name"]: g for g in set_["option_groups"]}
+
+    standard = client.post(
+        "/orders/",
+        json=_order_payload(None, items=[{"set_id": set_["id"], "qty": 1}]),
+        headers=headers,
+    ).json()
+    _, components = _components_of(standard)
+    names = sorted(c["product_name"] for c in components)
+    assert names == ["Dup Sensor", "Dup Xray"], names
+
+    upgraded = client.post(
+        "/orders/",
+        json=_order_payload(None, items=[{
+            "set_id": set_["id"], "qty": 1,
+            "options": [{"group_id": groups["Xray"]["id"],
+                         "choice_id": _choice(groups["Xray"], "Dup Xray Pro")["id"]}],
+        }]),
+        headers=headers,
+    ).json()
+    _, components = _components_of(upgraded)
+    names = sorted(c["product_name"] for c in components)
+    # The Pro replaced the standard x-ray - it is NOT listed alongside it.
+    assert names == ["Dup Sensor", "Dup Xray Pro"], names
+
+    # And the "was" price counts the swapped contents once: 800 + 1000.
+    parent, _ = _components_of(upgraded)
+    assert parent["list_price"] == "1800.00"
+
+
+def test_an_option_slot_whose_default_is_not_included_still_adds_its_choice(client, db_session):
+    """The other legitimate way to build a set: the slot's products aren't listed
+    as contents at all, so it claims nothing and simply contributes its choice."""
+    make_admin(db_session, email="optadd@example.com", password="password123")
+    headers = auth_header(client, "optadd@example.com", "password123")
+    fixed = _make_order_product(client, headers, name="Add Camera", price="900.00")
+    a = _make_order_product(client, headers, name="Add Light A", price="100.00")
+    b = _make_order_product(client, headers, name="Add Light B", price="300.00")
+
+    set_ = _make_set(
+        client, headers, name="Add Set", price="1000.00",
+        items=[{"product_id": fixed["id"], "qty": 1}],
+        option_groups=[{"name": "Light", "choices": [
+            {"product_id": a["id"], "is_default": True},
+            {"product_id": b["id"]},
+        ]}],
+    )
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(None, items=[{"set_id": set_["id"], "qty": 1}]),
+        headers=headers,
+    )
+    _, components = _components_of(resp.json())
+    assert sorted(c["product_name"] for c in components) == ["Add Camera", "Add Light A"]
+
+
+def test_stale_option_choice_is_rejected_not_silently_defaulted(client, db_session):
+    make_admin(db_session, email="opt5@example.com", password="password123")
+    headers = auth_header(client, "opt5@example.com", "password123")
+    set_, groups = _configurable_set(client, headers, "D5")
+
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(None, items=[{
+            "set_id": set_["id"], "qty": 1,
+            "options": [{"group_id": groups["Xray"]["id"], "choice_id": 99999}],
+        }]),
+        headers=headers,
+    )
+    assert resp.status_code == 400, resp.text
+    assert "not an option" in resp.json()["detail"]
+
+
+def test_option_group_must_offer_at_least_one_choice(client, db_session):
+    make_admin(db_session, email="opt6@example.com", password="password123")
+    headers = auth_header(client, "opt6@example.com", "password123")
+    resp = client.post(
+        "/sets/",
+        json={"set_name": "Empty Group Set", "price": "100.00",
+              "option_groups": [{"name": "Nothing", "choices": []}]},
+        headers=headers,
+    )
+    assert resp.status_code == 400, resp.text
+    assert "at least one choice" in resp.json()["detail"]
+
+
+def test_option_group_always_ends_up_with_exactly_one_default(client, db_session):
+    """A group with no default gets one; a second default is demoted rather than
+    tripping the partial unique index."""
+    make_admin(db_session, email="opt7@example.com", password="password123")
+    headers = auth_header(client, "opt7@example.com", "password123")
+    a = _make_order_product(client, headers, name="Opt A", price="10.00")
+    b = _make_order_product(client, headers, name="Opt B", price="20.00")
+
+    none_flagged = _make_set(
+        client, headers, name="No Default Set", price="100.00",
+        option_groups=[{"name": "Pick", "choices": [
+            {"product_id": a["id"]}, {"product_id": b["id"]},
+        ]}],
+    )
+    flags = [c["is_default"] for c in none_flagged["option_groups"][0]["choices"]]
+    assert flags == [True, False]
+
+    both_flagged = _make_set(
+        client, headers, name="Two Default Set", price="100.00",
+        option_groups=[{"name": "Pick", "choices": [
+            {"product_id": a["id"], "is_default": True},
+            {"product_id": b["id"], "is_default": True},
+        ]}],
+    )
+    flags = [c["is_default"] for c in both_flagged["option_groups"][0]["choices"]]
+    assert flags == [True, False]
+
+
+def test_set_option_groups_are_replaced_wholesale_on_update(client, db_session):
+    make_admin(db_session, email="opt8@example.com", password="password123")
+    headers = auth_header(client, "opt8@example.com", "password123")
+    set_, groups = _configurable_set(client, headers, "D8")
+    keep = _choice(groups["Xray"], "Base Xray D8")["product_id"]
+
+    # Re-submitting a group that keeps an existing product is the ordinary edit -
+    # it must not collide with uq_set_option_choice (see replace_option_groups).
+    resp = client.put(
+        f"/sets/{set_['id']}",
+        json={"option_groups": [{"name": "Xray only", "choices": [
+            {"product_id": keep, "is_default": True},
+        ]}]},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert [g["name"] for g in body["option_groups"]] == ["Xray only"]
+
+    # Omitting the field entirely leaves them alone.
+    unchanged = client.put(
+        f"/sets/{set_['id']}", json={"description": "touched"}, headers=headers
+    ).json()
+    assert [g["name"] for g in unchanged["option_groups"]] == ["Xray only"]
+
+
+def test_set_option_upcharges_are_hidden_from_price_masked_viewers(client, db_session):
+    make_admin(db_session, email="opt9@example.com", password="password123")
+    headers = auth_header(client, "opt9@example.com", "password123")
+    set_, _ = _configurable_set(client, headers, "D9")
+
+    # Anonymous - no price access at all.
+    public = client.get(f"/sets/{set_['id']}").json()
+    assert public["price"] == "XXXX"
+    for group in public["option_groups"]:
+        for choice in group["choices"]:
+            assert choice["effective_delta"] is None
+            assert choice["price_delta"] is None
 
 
 def test_bundle_components_never_enter_the_discount_base(client, db_session):
@@ -4121,3 +4614,177 @@ def test_a_paid_order_prints_as_an_invoice(client, db_session):
     # Both still build - the title change didn't break the layout either way.
     assert build_invoice_pdf(unpaid)[:4] == b"%PDF"
     assert build_invoice_pdf(paid)[:4] == b"%PDF"
+
+
+# ---------------------------------------------------------------------------
+# Hero slides (the storefront's rotating banner)
+# ---------------------------------------------------------------------------
+
+
+def test_hero_slides_are_public_to_read_and_sorted(client, db_session):
+    make_admin(db_session, email="heroadmin1@example.com", password="password123")
+    headers = auth_header(client, "heroadmin1@example.com", "password123")
+
+    # Created out of order on purpose - the banner plays them by sort_order.
+    client.post("/hero-slides/", data={"heading": "Second", "sort_order": 2}, headers=headers)
+    client.post("/hero-slides/", data={"heading": "First", "sort_order": 1}, headers=headers)
+
+    # No Authorization header at all: the home page is served to strangers.
+    resp = client.get("/hero-slides/")
+    assert resp.status_code == 200
+    assert [s["heading"] for s in resp.json()] == ["First", "Second"]
+
+
+def test_parked_hero_slides_are_hidden_from_the_storefront_but_not_the_admin(client, db_session):
+    """is_active is what lets a seasonal slide be switched off instead of deleted -
+    deleting it would lose the copy and the uploaded artwork. The storefront asks for
+    active_only; the admin screen doesn't, because switching one back on is exactly
+    what someone opens that screen to do."""
+    make_admin(db_session, email="heroadmin2@example.com", password="password123")
+    headers = auth_header(client, "heroadmin2@example.com", "password123")
+
+    client.post("/hero-slides/", data={"heading": "Live One"}, headers=headers)
+    parked = client.post(
+        "/hero-slides/", data={"heading": "Off Season", "is_active": "false"}, headers=headers
+    ).json()
+    assert parked["is_active"] is False
+
+    assert [s["heading"] for s in client.get("/hero-slides/?active_only=true").json()] == ["Live One"]
+    assert len(client.get("/hero-slides/").json()) == 2
+
+    # ...and switching it back on is a one-field partial update.
+    resumed = client.put(
+        f"/hero-slides/{parked['id']}", json={"is_active": True}, headers=headers
+    ).json()
+    assert resumed["is_active"] is True
+    assert resumed["heading"] == "Off Season"
+    assert len(client.get("/hero-slides/?active_only=true").json()) == 2
+
+
+def test_creating_a_hero_slide_stores_its_artwork_and_copy(client, db_session):
+    make_admin(db_session, email="heroadmin3@example.com", password="password123")
+    headers = auth_header(client, "heroadmin3@example.com", "password123")
+
+    resp = client.post(
+        "/hero-slides/",
+        data={
+            "heading": "Equip Your Practice with",
+            "heading_highlight": "Excellence",
+            "subheading": "High-quality instruments from world-class brands.",
+            "badge_label": "Premium Dental Supply",
+            "badge_icon": "fa-tooth",
+            "button_label": "Explore Products",
+            "button_url": "/products",
+            "sort_order": 3,
+        },
+        files={"file": ("hero.png", _png_bytes(), "image/png")},
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    slide = resp.json()
+    # The heading is split in two so the storefront can colour the tail without
+    # anyone typing a <span> into an admin form.
+    assert slide["heading"] == "Equip Your Practice with"
+    assert slide["heading_highlight"] == "Excellence"
+    assert slide["button_url"] == "/products"
+    assert slide["sort_order"] == 3
+    # New slides are live unless someone says otherwise.
+    assert slide["is_active"] is True
+    assert slide["slide_image"]
+
+
+def test_hero_slide_optional_fields_can_be_cleared(client, db_session):
+    """The blank-means-two-things trap: a form posts an untouched field as "", and an
+    admin removing a slide's badge or button has to actually remove it."""
+    make_admin(db_session, email="heroadmin4@example.com", password="password123")
+    headers = auth_header(client, "heroadmin4@example.com", "password123")
+
+    created = client.post(
+        "/hero-slides/",
+        data={
+            "heading": "Partner with",
+            "heading_highlight": "Industry Leaders",
+            "badge_label": "Trusted Brands",
+            "button_label": "Browse",
+            "button_url": "/products",
+        },
+        headers=headers,
+    ).json()
+
+    # Empty strings on create are stored as NULL, not as "".
+    blank = client.post(
+        "/hero-slides/",
+        data={"heading": "Bare", "subheading": "", "badge_label": "", "button_url": ""},
+        headers=headers,
+    ).json()
+    assert blank["subheading"] is None
+    assert blank["badge_label"] is None
+    assert blank["button_url"] is None
+
+    resp = client.put(
+        f"/hero-slides/{created['id']}",
+        json={"heading_highlight": None, "badge_label": None, "button_label": None},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["heading_highlight"] is None
+    assert resp.json()["badge_label"] is None
+    assert resp.json()["button_label"] is None
+    # An omitted key still means "leave it alone".
+    assert resp.json()["heading"] == "Partner with"
+    assert resp.json()["button_url"] == "/products"
+
+
+def test_editing_a_hero_slides_copy_keeps_its_artwork(client, db_session):
+    """The PUT carries no file, so rewording a headline must not blank the picture -
+    that's what the separate /image endpoint is for."""
+    make_admin(db_session, email="heroadmin5@example.com", password="password123")
+    headers = auth_header(client, "heroadmin5@example.com", "password123")
+
+    slide = client.post(
+        "/hero-slides/",
+        data={"heading": "Advanced Technology for"},
+        files={"file": ("hero.png", _png_bytes(), "image/png")},
+        headers=headers,
+    ).json()
+    original_image = slide["slide_image"]
+    assert original_image
+
+    reworded = client.put(
+        f"/hero-slides/{slide['id']}", json={"heading": "Better Technology for"}, headers=headers
+    ).json()
+    assert reworded["heading"] == "Better Technology for"
+    assert reworded["slide_image"] == original_image
+
+    # Replacing the artwork is its own request, and does change it.
+    replaced = client.post(
+        f"/hero-slides/{slide['id']}/image",
+        files={"file": ("new.png", _png_bytes(), "image/png")},
+        headers=headers,
+    ).json()
+    assert replaced["slide_image"] != original_image
+
+
+def test_writing_hero_slides_requires_product_management(client, db_session):
+    """Deliberately NOT the `admin` gate the contact page's QR cards use: a hero slide
+    is shop-window marketing, the same job as a promotion, so it answers to
+    product_management. An owner holding only `admin` can look but not write."""
+    _admin_only_staff(db_session, "heronotpm@example.com")
+    headers = auth_header(client, "heronotpm@example.com", "password123")
+
+    resp = client.post("/hero-slides/", data={"heading": "Sneaky"}, headers=headers)
+    assert resp.status_code == 403
+    assert "product_management" in resp.json()["detail"]
+
+    # Reading stays open to everyone, including this account.
+    assert client.get("/hero-slides/", headers=headers).status_code == 200
+
+
+def test_deleting_a_hero_slide_removes_it_from_the_banner(client, db_session):
+    make_admin(db_session, email="heroadmin6@example.com", password="password123")
+    headers = auth_header(client, "heroadmin6@example.com", "password123")
+
+    slide = client.post("/hero-slides/", data={"heading": "Temporary"}, headers=headers).json()
+    assert client.delete(f"/hero-slides/{slide['id']}", headers=headers).status_code == 204
+    assert client.get("/hero-slides/").json() == []
+    assert client.get(f"/hero-slides/{slide['id']}").status_code == 404

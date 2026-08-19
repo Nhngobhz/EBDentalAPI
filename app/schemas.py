@@ -364,6 +364,11 @@ class ProductBase(BaseModel):
     badge: Optional[str] = Field(None, max_length=50)
     product_code: Optional[str] = Field(None, max_length=50)
     uom: Optional[str] = Field(None, max_length=20)
+    # False = gift-only: expands as a $0 component line under whatever it comes
+    # with, but can't be ordered on its own and isn't listed in the public
+    # catalog. Defaults to True so every existing caller keeps creating sellable
+    # products - see models.Product.is_purchasable.
+    is_purchasable: bool = True
 
 
 class ProductCreate(ProductBase):
@@ -397,6 +402,7 @@ class ProductUpdate(BaseModel):
     badge: Optional[str] = Field(None, max_length=50)
     product_code: Optional[str] = Field(None, max_length=50)
     uom: Optional[str] = Field(None, max_length=20)
+    is_purchasable: Optional[bool] = None
     brand_id: Optional[int] = None
     category_id: Optional[int] = None
     # Present here so a product_management holder *can* still create a
@@ -465,10 +471,13 @@ class ProductOut(ProductBase):
 # Manual
 # ---------------------------------------------------------------------------
 class ManualBase(BaseModel):
+    # What this document is called. Optional - see Manual.title.
+    title: Optional[str] = Field(None, max_length=200)
     description: Optional[str] = None
 
 
 class ManualUpdate(BaseModel):
+    title: Optional[str] = Field(None, max_length=200)
     description: Optional[str] = None
     product_id: Optional[int] = None
 
@@ -553,6 +562,49 @@ class PromotionOut(PromotionBase):
 # Same shape as Promotion minus start_date/end_date, since a set isn't
 # time-boxed.)
 # ---------------------------------------------------------------------------
+class SetOptionChoiceIn(BaseModel):
+    product_id: int
+    qty: int = Field(1, gt=0, le=MAX_QTY)
+    # None = derive the upcharge from the price gap to the group's default.
+    # Negative is allowed on purpose: a cheaper alternative is a valid choice.
+    # See SetOptionChoice.price_delta.
+    price_delta: Optional[Decimal] = None
+    is_default: bool = False
+
+
+class SetOptionChoiceOut(BaseModel):
+    id: int
+    product_id: int
+    product_name: str
+    product_code: Optional[str] = None
+    uom: Optional[str] = None
+    qty: int
+    is_default: bool
+    # The stored override, null when the delta is derived. `effective_delta` is
+    # the number actually charged either way - the storefront should price from
+    # that one and only show this to explain where it came from.
+    price_delta: Optional[Decimal] = None
+    # None for a viewer without price access - an upcharge is a price like any
+    # other, masked the same way price/old_price are.
+    effective_delta: Optional[Decimal] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SetOptionGroupIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    choices: list[SetOptionChoiceIn] = []
+
+
+class SetOptionGroupOut(BaseModel):
+    id: int
+    name: str
+    sort_order: int
+    choices: list[SetOptionChoiceOut] = []
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class SetBase(BaseModel):
     set_name: str = Field(..., min_length=1, max_length=200)
     description: Optional[str] = None
@@ -564,6 +616,8 @@ class SetCreate(SetBase):
     # Optional, unlike ProductCreate.brand_id - see Set.brand_id.
     brand_id: Optional[int] = None
     items: list[BundleItemIn] = []
+    # Swappable slots - see SetOptionGroup. Empty for an ordinary fixed set.
+    option_groups: list[SetOptionGroupIn] = []
 
 
 class SetUpdate(BaseModel):
@@ -576,6 +630,8 @@ class SetUpdate(BaseModel):
     brand_id: Optional[int] = None
     # Omitted -> contents left alone; sent (even as []) -> replaced wholesale.
     items: Optional[list[BundleItemIn]] = None
+    # Same omitted-vs-sent rule as `items` above.
+    option_groups: Optional[list[SetOptionGroupIn]] = None
 
 
 class SetOut(SetBase):
@@ -592,6 +648,9 @@ class SetOut(SetBase):
     brand: Optional[BrandMini] = None
     # Member products - same shape/reasoning as PromotionOut.items.
     items: list[BundleItemOut] = []
+    # The set's swappable slots, each with its alternatives priced. Empty list
+    # for a fixed set, which is every set that predates the feature.
+    option_groups: list[SetOptionGroupOut] = []
     created_at: datetime
     updated_at: datetime
     updated_by: Optional[UserMini] = None
@@ -602,10 +661,31 @@ class SetOut(SetBase):
 # ---------------------------------------------------------------------------
 # Order (a finalized storefront quote - see partials/quote_drawer.html)
 # ---------------------------------------------------------------------------
+class OrderLineOptionIn(BaseModel):
+    """One configured slot on a set line - "for the Laptop group, take choice 7".
+
+    Ids rather than product ids: which choice was picked is what determines the
+    upcharge, and two choices in different groups may well name the same product.
+    """
+
+    group_id: int
+    choice_id: int
+
+
+class OrderLineOptionOut(BaseModel):
+    """The selection as stored on the saved line. Enough to re-send the line
+    unchanged when the order is edited, which is the only reason it's persisted -
+    what the customer actually receives is already spelled out by the $0
+    component lines underneath."""
+
+    group_id: int
+    choice_id: int
+
+
 class OrderItemCreate(BaseModel):
-    """Only product_id/promotion_id/set_id + qty are ever accepted from the
-    client - price/discount/name are always looked up and snapshotted
-    server-side, see routers/orders.py. A line buys exactly one of a
+    """Only product_id/promotion_id/set_id + qty (+ `options` for a set) are ever
+    accepted from the client - price/discount/name are always looked up and
+    snapshotted server-side, see routers/orders.py. A line buys exactly one of a
     product, a promotion, or a set - exactly one of the three ids must be
     set."""
 
@@ -613,11 +693,30 @@ class OrderItemCreate(BaseModel):
     promotion_id: Optional[int] = None
     set_id: Optional[int] = None
     qty: int = Field(..., gt=0, le=MAX_QTY)
+    # Which alternative was picked in each of the set's option groups. Omitted or
+    # partial is fine - every unmentioned group falls back to its default, so an
+    # unconfigured purchase of a configurable set still works.
+    options: list[OrderLineOptionIn] = []
 
     @model_validator(mode="after")
     def _exactly_one_id(self):
         if sum(i is not None for i in (self.product_id, self.promotion_id, self.set_id)) != 1:
             raise ValueError("Exactly one of product_id, promotion_id, or set_id must be set")
+        return self
+
+    @model_validator(mode="after")
+    def _options_only_on_sets(self):
+        # Only a set has option groups. Accepting them on a product line would
+        # silently ignore them, which reads as "the upgrade didn't apply".
+        if self.options and self.set_id is None:
+            raise ValueError("options can only be sent on a set_id line")
+        return self
+
+    @model_validator(mode="after")
+    def _one_choice_per_group(self):
+        groups = [o.group_id for o in self.options]
+        if len(groups) != len(set(groups)):
+            raise ValueError("Each option group can only be chosen once per line")
         return self
 
 
@@ -724,6 +823,17 @@ class OrderItemOut(BaseModel):
     discount: Decimal
     qty: int
     line_amount: Decimal
+    # Only ever populated on a configured set line - see OrderItem.set_options.
+    set_options: list[OrderLineOptionOut] = []
+
+    @field_validator("set_options", mode="before")
+    @classmethod
+    def _null_options_are_empty(cls, value):
+        # The column is NULL on every line that isn't a configured set, and a
+        # field default doesn't cover that: with from_attributes the attribute is
+        # present and explicitly None, which fails list validation. Normalized
+        # here so the API always returns a list and callers never branch on null.
+        return value if value is not None else []
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -879,6 +989,46 @@ class QrCodeOut(BaseModel):
     badge_label: Optional[str] = None
     badge_variant: Optional[str] = None
     badge_icon: Optional[str] = None
+    sort_order: int
+    created_at: datetime
+    updated_at: datetime
+    updated_by: Optional[UserMini] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ---------------------------------------------------------------------------
+# Hero slides (the storefront's rotating banner)
+# ---------------------------------------------------------------------------
+
+
+class HeroSlideUpdate(BaseModel):
+    """Partial update. Every field is optional and applied with `exclude_unset`, so
+    omitting a key leaves it alone while sending `null` clears it - which is how the
+    admin form erases a badge, a subheading or a button."""
+
+    heading: Optional[str] = Field(None, min_length=1, max_length=200)
+    heading_highlight: Optional[str] = Field(None, max_length=120)
+    subheading: Optional[str] = Field(None, max_length=400)
+    badge_label: Optional[str] = Field(None, max_length=60)
+    badge_icon: Optional[str] = Field(None, max_length=60)
+    button_label: Optional[str] = Field(None, max_length=60)
+    button_url: Optional[str] = Field(None, max_length=500)
+    is_active: Optional[bool] = None
+    sort_order: Optional[int] = None
+
+
+class HeroSlideOut(BaseModel):
+    id: int
+    heading: str
+    heading_highlight: Optional[str] = None
+    subheading: Optional[str] = None
+    slide_image: Optional[str] = None
+    badge_label: Optional[str] = None
+    badge_icon: Optional[str] = None
+    button_label: Optional[str] = None
+    button_url: Optional[str] = None
+    is_active: bool
     sort_order: int
     created_at: datetime
     updated_at: datetime

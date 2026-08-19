@@ -167,18 +167,28 @@ def list_products(
     brand_id: OptionalInt = None,
     category_id: OptionalInt = None,
     q: str | None = None,
+    include_unpurchasable: bool = False,
     can_view_price: bool = Depends(get_price_visibility),
     db: Session = Depends(get_db),
 ):
     """Public: product catalog browsing needs no account. Price/discount
     are masked unless the caller is staff or a customer with
-    access_permission=True."""
+    access_permission=True.
+
+    Gift-only products (is_purchasable=False) are left out by default - they
+    can't be bought, so a storefront listing that offers them is a dead end.
+    `include_unpurchasable=true` brings them back for the screens that must see
+    every row: the admin product table and the free-item picker that builds
+    bundles out of them.
+    """
     query = db.query(Product).options(
         joinedload(Product.brand),
         joinedload(Product.category),
         _free_item_loader(),
         _image_loader(),
     )
+    if not include_unpurchasable:
+        query = query.filter(Product.is_purchasable.is_(True))
     if brand_id is not None:
         query = query.filter(Product.brand_id == brand_id)
     if category_id is not None:

@@ -46,6 +46,8 @@ from app.models import (
     PromotionItem,
     Set,
     SetItem,
+    SetOptionChoice,
+    SetOptionGroup,
     User,
 )
 
@@ -202,6 +204,7 @@ def export_products(db) -> list[dict]:
                 "product_code": p.product_code,
                 "uom": p.uom,
                 "badge": p.badge,
+                "is_purchasable": p.is_purchasable,
                 "product_image": p.product_image,
                 "images": [img.image for img in images],
                 "free_items": [
@@ -272,6 +275,25 @@ def export_sets(db) -> list[dict]:
                 "brand": s.brand.brand_name if s.brand else None,
                 "set_image": s.set_image,
                 "detail_image": s.detail_image,
+                # Swappable slots. price_delta stays None where it is derived,
+                # so re-seeding keeps the "work it out from the products"
+                # behaviour rather than freezing today's gap into the fixture.
+                "option_groups": [
+                    {
+                        "name": g.name,
+                        "choices": [
+                            {
+                                "product": c.product.product_name,
+                                "qty": c.qty,
+                                "price_delta": _num(c.price_delta),
+                                "is_default": c.is_default,
+                            }
+                            for c in g.choices
+                            if c.product
+                        ],
+                    }
+                    for g in sorted(s.option_groups, key=lambda g: (g.sort_order, g.id))
+                ],
                 "items": [
                     {"product": it.product.product_name, "qty": it.qty}
                     for it in items

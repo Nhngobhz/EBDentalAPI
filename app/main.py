@@ -17,6 +17,7 @@ from app.routers import (
     categories,
     customer_auth,
     customers,
+    hero_slides,
     manuals,
     orders,
     products,
@@ -116,6 +117,7 @@ app.include_router(promotions.router)
 app.include_router(sets.router)
 app.include_router(orders.router)
 app.include_router(qr_codes.router)
+app.include_router(hero_slides.router)
 # Imported as `settings_router` because `settings` in this module is the config object.
 app.include_router(settings_router.router)
 app.include_router(telegram_webhook.router)

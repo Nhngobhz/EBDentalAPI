@@ -33,7 +33,18 @@ class Settings(BaseSettings):
     # --- Security / JWT ------------------------------------------------------
     SECRET_KEY: str = _PLACEHOLDER_SECRET_KEY
     ALGORITHM: str = "HS256"
+    # Staff/admin sessions, deliberately short. One of these tokens can reprice the
+    # catalogue, read every customer and edit other staff accounts, so a browser left
+    # open in a clinic shouldn't stay dangerous for long - expiry is the only thing
+    # that ends a session nobody logged out of.
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours
+    # Customers get a fortnight instead: the worst a stolen customer token can do is
+    # read that person's own orders and place another, and being thrown back to a
+    # login form every day is exactly the friction that loses a storefront its repeat
+    # buyers. Kept a separate setting so shortening one can never quietly shorten the
+    # other - see token_lifetime() in core/security.py, which picks between them off
+    # the token's own "type" claim.
+    CUSTOMER_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 14  # 14 days
     EMAIL_VERIFICATION_EXPIRE_MINUTES: int = 60 * 24  # 24 hours
     PASSWORD_RESET_EXPIRE_MINUTES: int = 30
 

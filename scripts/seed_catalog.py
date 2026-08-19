@@ -50,6 +50,8 @@ from app.models import (
     PromotionItem,
     Set,
     SetItem,
+    SetOptionChoice,
+    SetOptionGroup,
     User,
 )
 from scripts import seed_data
@@ -127,6 +129,8 @@ def seed_products(
             product_code=item.get("product_code"),
             uom=item.get("uom"),
             badge=item.get("badge"),
+            # Defaults True for a seed file exported before this column existed.
+            is_purchasable=item.get("is_purchasable", True),
             product_image=item.get("product_image"),
         )
         db.add(product)
@@ -289,6 +293,40 @@ def seed_sets(
                     set_id=bundle.id,
                     product_id=product.id,
                     qty=member.get("qty", 1),
+                )
+            )
+
+        # Swappable slots. A seed file exported before this feature has no
+        # "option_groups" key at all, which simply leaves the set fixed.
+        for position, group in enumerate(item.get("option_groups") or []):
+            choices = []
+            for index, choice in enumerate(group.get("choices") or []):
+                product = product_by_name.get(choice["product"])
+                if product is None:
+                    print(
+                        f"Product '{choice['product']}' not found, skipping option "
+                        f"choice in '{group['name']}'."
+                    )
+                    continue
+                choices.append(
+                    SetOptionChoice(
+                        product_id=product.id,
+                        qty=choice.get("qty", 1),
+                        price_delta=choice.get("price_delta"),
+                        is_default=choice.get("is_default", False),
+                        sort_order=index,
+                    )
+                )
+            if not choices:
+                continue
+            if not any(c.is_default for c in choices):
+                choices[0].is_default = True
+            db.add(
+                SetOptionGroup(
+                    set_id=bundle.id,
+                    name=group["name"],
+                    sort_order=position,
+                    choices=choices,
                 )
             )
         db.flush()

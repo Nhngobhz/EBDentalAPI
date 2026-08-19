@@ -35,7 +35,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Up
 from sqlalchemy.orm import Session, joinedload
 
 from app.config import settings
-from app.core.bundles import bundle_old_price
+from app.core.bundles import bundle_old_price, resolve_set_options, set_contents
 from app.core.audit import stamp_updated_by
 from app.core.deps import oauth2_scheme, principal_id_from_token, require_any_permission
 from app.core.files import ALLOWED_PDF_TYPES
@@ -215,6 +215,22 @@ def _build_order_lines(db: Session, lines) -> tuple[list[OrderItem], Decimal, De
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"product_id {line.product_id} does not exist",
                 )
+            # Gift-only products are refused HERE, on the paid line, and nowhere
+            # else: _component_items has no such check, so the same product still
+            # rides along free under whatever it comes with. That asymmetry is the
+            # whole feature - "can't buy it, still get it free".
+            #
+            # Server-side because it has to be: the cart is localStorage JSON and
+            # the client can post any product_id it likes. Hiding the button is
+            # cosmetic.
+            if not product.is_purchasable:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"'{product.product_name}' is only available free with "
+                        "another product and cannot be ordered on its own"
+                    ),
+                )
             line_amount = product.price * line.qty
             # Whatever this product comes with for free rides along as $0 lines.
             add_line(
@@ -298,30 +314,56 @@ def _build_order_lines(db: Session, lines) -> tuple[list[OrderItem], Decimal, De
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"set_id {line.set_id} does not exist",
                 )
-            line_amount = set_.price * line.qty
-            # Same contents-derived "was" price as a promotion line above.
-            old_price = bundle_old_price(set_)
+            # Which alternative each swappable slot ends up on, and what those
+            # upgrades add. An unconfigured line resolves every group to its
+            # default and comes back with a delta of 0, i.e. exactly the fixed
+            # set this used to be.
+            selections = {opt.group_id: opt.choice_id for opt in (line.options or [])}
+            chosen, options_delta = resolve_set_options(set_, selections)
+
+            # Upgrades fold into the set's own price rather than becoming their
+            # own lines (user's call): the quote shows one set at one price, and
+            # the $0 component lines underneath spell out the configuration.
+            # max(0): a set of deliberately negative deltas must never price
+            # below nothing.
+            unit_price = max(set_.price + options_delta, Decimal("0"))
+            line_amount = unit_price * line.qty
+            # Same contents-derived "was" price as a promotion line above, except
+            # the chosen options count as contents too - so upgrading to a dearer
+            # laptop lifts the "was" figure and the printed saving stays honest.
+            # Fixed items with any slot-claimed one swapped for the chosen
+            # product - so an upgraded set lists the Pro and NOT the standard
+            # machine it replaced. See set_contents.
+            contents = set_contents(set_, chosen)
+            old_price = bundle_old_price(set_, contents=contents)
             discount = (
-                old_price - set_.price
-                if old_price and old_price > set_.price
+                old_price - unit_price
+                if old_price and old_price > unit_price
                 else Decimal("0")
             )
-            # Same collection-of-products expansion as a promotion above.
+            # Same collection-of-products expansion as a promotion above, with the
+            # configured choices listed alongside the fixed contents.
             add_line(
                 OrderItem(
                     set_id=set_.id,
                     product_name=set_.set_name,
                     product_code=None,
                     uom=None,
-                    unit_price=set_.price,
+                    unit_price=unit_price,
                     # Same contents-derived "before" price as a promotion line.
-                    list_price=old_price or set_.price,
+                    list_price=old_price or unit_price,
                     discount_type="cash",
                     discount=discount,
                     qty=line.qty,
                     line_amount=line_amount,
+                    # Persisted so an edit re-prices this line as configured
+                    # rather than reverting it to defaults - see the column comment.
+                    set_options=(
+                        [{"group_id": g, "choice_id": c} for g, c in selections.items()]
+                        or None
+                    ),
                 ),
-                set_.items,
+                contents,
             )
             subtotal += line_amount
             # Same reasoning as a promotion: already a fixed deal price, excluded from
