@@ -422,7 +422,7 @@ record only.
 |---|---|---|
 | `GET /customers/` | `customer_management` | query `skip`, `limit`, `q` (searches name/email, case-insensitive substring) |
 | `GET /customers/{id}` | `customer_management` | - |
-| `POST /customers/` | `customer_management` | JSON `CustomerCreate`; **no password field** - this creates a record that cannot log in until the customer separately self-registers, or rather, cannot ever gain login this way at all (self-registration is a distinct email-keyed row check) |
+| `POST /customers/` | `customer_management` | JSON `CustomerCreate` (accepts `latitude`/`longitude`/`map_link` - see below); **no password field** - this creates a record that cannot log in until the customer separately self-registers, or rather, cannot ever gain login this way at all (self-registration is a distinct email-keyed row check) |
 | `PUT /customers/{id}` | `customer_management` | JSON `CustomerUpdate`, all optional including `access_permission` - this is the only way a customer's price visibility gets turned on |
 | `POST /customers/{id}/image` | `customer_management` | multipart `file` |
 | `DELETE /customers/{id}` | `customer_management` | **hard delete**, unlike users - returns `204` with no body |
@@ -434,6 +434,37 @@ update path (`PUT /customers/{id}`, `PUT /customers/me`, `PUT /users/{id}`,
 `PUT /users/me`), they're never required, and passing an explicit `null` clears
 one. Validation is shared - see the `Gender` / `DateOfBirth` aliases near the
 top of `app/schemas.py`, not a per-class `@field_validator`.
+
+#### Delivery location (`Customer` only, added 2026-08-19)
+
+`Customer` additionally carries **three** optional location columns, settable on
+every customer create/update path (`POST /customers/`, `PUT /customers/{id}`,
+`PUT /customers/me`, `POST /auth/customer/register`) and cleared by an explicit
+`null`, exactly like the demographics above:
+
+| Field | Type | Notes |
+|---|---|---|
+| `latitude` | Decimal string, `-90`..`90` | `Numeric(9, 6)` - serialized as a **string** like every other Decimal here |
+| `longitude` | Decimal string, `-180`..`180` | same |
+| `map_link` | string, max 500 | the URL the customer pasted |
+
+They are three independent columns, not one derived from another, because the
+two ways a location arrives each yield only half: dropping a pin gives
+coordinates and no link, and a Google Maps **short** link
+(`https://maps.app.goo.gl/...`) gives a link with no readable coordinates. A
+customer may legitimately have either half alone.
+
+`map_link` is validated against a **host allowlist** (`_MAP_LINK_HOST_RE` in
+`app/schemas.py`): `google.<tld>`, `goo.gl`, `openstreetmap.org`, `osm.org`
+only. Anything else is a `422`, including a perfectly valid `https://` URL
+elsewhere. That is deliberate and is not just tidiness - this field is written
+by customers and rendered to *staff* as an "Open in Google Maps" link on the
+admin Customers table, so an unrestricted URL there would let any account put a
+link of its choosing, under a trusted label, in front of the back office.
+
+The same three fields also exist on `Order` (see the Orders table below), where
+they are a **snapshot** of the buyer's pin at the moment of purchase, not a live
+lookup.
 
 ### Brands - `/brands`
 | Method & path | Auth | Body / notes |
@@ -458,7 +489,7 @@ top of `app/schemas.py`, not a per-class `@field_validator`.
 ### Products - `/products`
 | Method & path | Auth | Body / notes |
 |---|---|---|
-| `GET /products/` | Public | query `skip`, `limit`, `brand_id`, `category_id`, `q` (name substring); price masking applies, see section 4 |
+| `GET /products/` | Public | query `skip`, `limit`, `brand_id`, `category_id`, `q` (name substring); price masking applies, see section 4. **Ordered by `product_name` (case-insensitive), `id`** - alphabetical, not insertion order, since 2026-08-19. The `id` tiebreaker matters: two products can share a name, and without a deterministic second key paging would repeat or skip one. |
 | `GET /products/{id}` | Public | same masking |
 | `POST /products/` | `product_management` | JSON `ProductCreate` (`product_name`, `description?`, `badge?`, `product_code?` (SKU, must be globally unique or `400`), `uom?` (unit of measure, free text e.g. `"pcs"`/`"box"`), `price` >0, `discount?` (integer percent, `0`-`100`, defaults `0`), `brand_id` - must reference an existing brand or `400`, `category_id?` - must reference an existing category or `400`, `free_items?` - products given away free with this one, see "Bundle contents" below, `is_purchasable?` - defaults `true`; `false` marks a gift-only product, see "Bundle contents") |
 | `PUT /products/{id}` | `product_management`, **+`price_listing` if the body includes `price` or `discount`** | JSON `ProductUpdate`, all fields optional |
@@ -574,7 +605,7 @@ server-side and never trusted from the request body.
 
 | Method & path | Auth | Body / notes |
 |---|---|---|
-| `POST /orders/` | `Any user` with `price_listing` or `product_management`, OR `Any customer` with `access_permission` | JSON `OrderCreate` (`clinic_name`, `phone`, `address` - all **required**; `contact_person?`, `payment_term?`, `install_term?`; `payment_method`: `"cash"`\|`"khqr"` - **required for customers, ignored for staff**; `discount_type`: `"percent"`\|`"cash"`, default `"cash"`; `discount_value` ≥0, default `0`; `items`: list of `{product_id\|promotion_id\|set_id, qty}`, at least 1). See notes below. |
+| `POST /orders/` | `Any user` with `price_listing` or `product_management`, OR `Any customer` with `access_permission` | JSON `OrderCreate` (`clinic_name`, `phone`, `address` - all **required**; `contact_person?`, `payment_term?`, `install_term?`; `latitude?`/`longitude?`/`map_link?` (the delivery pin, snapshotted onto the order - same shape and same validation as on `Customer`); `payment_method`: `"cash"`\|`"khqr"` - **required for customers, ignored for staff**; `discount_type`: `"percent"`\|`"cash"`, default `"cash"`; `discount_value` ≥0, default `0`; `items`: list of `{product_id\|promotion_id\|set_id, qty}`, at least 1). See notes below. |
 | `GET /orders/` | `price_listing` **or** `admin` | query `skip`, `limit`, `status`, `customer_id` |
 | `GET /orders/mine` | Same bar as `POST /orders/` (staff `price_listing`/`product_management`, or customer `access_permission`) | query `skip`, `limit`. The caller's OWN orders, scoped from the token (customer → `customer_id`, staff → `created_by_user_id`) - never from a query param. Exists because a customer has no `price_listing` and so can't use `GET /orders/` to see even their own history; powers the storefront's account drawer. Declared above `GET /{order_id}` so "mine" isn't parsed as an id. |
 | `GET /orders/mine/{id}` | Same, plus must own the order | The caller's own order in full (line items included) - what the account drawer's detail view shows and re-prints its PDF from. **404, not 403**, on an order the caller doesn't own, so it can't be used to probe which ids exist. |

@@ -452,6 +452,15 @@ _SNAPSHOT_LINE_FIELDS = (
 )
 
 
+def _snap_decimal(value) -> Decimal | None:
+    """A snapshotted Decimal (stored as a string, see _snapshot_lines) back into a
+    Decimal, tolerating both a missing key and a value that predates being written
+    as a string. Used for the checkout's latitude/longitude."""
+    if value is None or value == "":
+        return None
+    return Decimal(str(value))
+
+
 def _snapshot_lines(items: list[OrderItem]) -> list[dict]:
     """Freezes freshly-built (still session-less) OrderItem objects into plain JSON.
 
@@ -575,6 +584,13 @@ def _materialize_checkout(
         contact_person=snap["contact_person"],
         phone=snap["phone"],
         address=snap["address"],
+        # .get(), not [...]: a checkout issued before these keys existed can still
+        # be sitting unpaid in the table when this deploys. Losing a pin is
+        # survivable; a KeyError that refuses to materialize an order somebody has
+        # already paid for is not.
+        latitude=_snap_decimal(snap.get("latitude")),
+        longitude=_snap_decimal(snap.get("longitude")),
+        map_link=snap.get("map_link"),
         payment_term=snap["payment_term"],
         salesperson=snap["salesperson"],
         quoted_by_name=snap["quoted_by_name"],
@@ -674,6 +690,11 @@ def create_checkout(
             "contact_person": payload.contact_person,
             "phone": payload.phone,
             "address": payload.address,
+            # str(), not the Decimal itself - this column is JSON, and the money
+            # fields below are stringified for the same reason. None stays None.
+            "latitude": None if payload.latitude is None else str(payload.latitude),
+            "longitude": None if payload.longitude is None else str(payload.longitude),
+            "map_link": payload.map_link,
             "payment_term": payload.payment_term,
             "install_term": payload.install_term,
             # Derived here exactly as create_order derives them, never client-supplied:
@@ -903,6 +924,9 @@ def create_order(
         contact_person=payload.contact_person,
         phone=payload.phone,
         address=payload.address,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        map_link=payload.map_link,
         payment_term=payload.payment_term,
         salesperson=salesperson,
         quoted_by_name=quoted_by_name,
@@ -1218,10 +1242,20 @@ def update_order(
     # validated OrderItemCreate objects.
     new_items = payload.items if fields.pop("items", None) is not None else None
 
-    # Every field left in `fields` maps to a NOT NULL column except these four, so an
-    # explicit null means "clear it" only for them; anywhere else it would be an attempt
-    # to blank out something the order can't be without.
-    nullable = {"contact_person", "payment_term", "install_term", "payment_status"}
+    # Every field left in `fields` maps to a NOT NULL column except the ones listed
+    # here, so an explicit null means "clear it" only for them; anywhere else it would
+    # be an attempt to blank out something the order can't be without. The three
+    # location fields are on the list because a WRONG pin is worse than no pin - staff
+    # have to be able to blank one back out, not only move it.
+    nullable = {
+        "contact_person",
+        "payment_term",
+        "install_term",
+        "payment_status",
+        "latitude",
+        "longitude",
+        "map_link",
+    }
     for field, value in fields.items():
         if value is None and field not in nullable:
             raise HTTPException(

@@ -61,11 +61,21 @@ async def register(
             detail="An account with this email already exists",
         )
 
+    # NOTE for whoever adds the next field to CustomerBase: this is an EXPLICIT
+    # argument list, not Customer(**payload.model_dump()) - a column added only
+    # to the schema is validated here and then silently dropped. The location
+    # fields below are listed for exactly that reason; the storefront's own
+    # sign-up form does not ask for a pin (it is set later on the profile page),
+    # but the endpoint accepts one, and accepting a value only to discard it is
+    # the worst of the three options.
     customer = Customer(
         customer_name=payload.customer_name,
         email=payload.email,
         address=payload.address,
         phone_num=payload.phone_num,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        map_link=payload.map_link,
         hashed_password=hash_password(payload.password),
         access_permission=False,
         is_active=True,

@@ -6,8 +6,10 @@ Naming convention used throughout:
   *Update        -> payload to update an existing record (all fields optional)
   *Out           -> what gets returned to the client
 """
+import re
 from datetime import date, datetime, timezone
 from decimal import Decimal
+from urllib.parse import urlparse
 from typing import Annotated, Any, Literal, Optional, Union
 
 from pydantic import (
@@ -63,6 +65,71 @@ def _validate_date_of_birth(value: Optional[date]) -> Optional[date]:
 
 # Attached via Annotated rather than a @field_validator repeated in each class.
 DateOfBirth = Annotated[Optional[date], AfterValidator(_validate_date_of_birth)]
+
+
+# --- Optional map location, shared by Customer and Order -------------------
+# A delivery point, stored three ways because the customer can supply it two
+# ways (drop a pin, or paste a Google Maps link) and neither always yields the
+# other - see the column comments on Customer.latitude in models.py.
+#
+# Latitude/longitude are Decimal, not float: they land in Numeric(9, 6) columns
+# and go back out as strings like every other Decimal in this file, so a
+# round-trip never picks up binary-float drift in the sixth decimal place. The
+# bounds are the real ones - anything outside them is a transposed pair or a
+# mis-parsed link, not a place on Earth.
+#
+# Like DateOfBirth above, these carry no default: each field spells out its own
+# `= None`, which is what lets an explicit null mean "clear the pin".
+Latitude = Annotated[Optional[Decimal], Field(ge=-90, le=90)]
+Longitude = Annotated[Optional[Decimal], Field(ge=-180, le=180)]
+
+
+# Hosts a map link may point at. Narrow on purpose, and the reason is worth
+# spelling out: unlike every other free-text URL in this schema (HeroSlide's
+# button_url, say) this one is written by CUSTOMERS and read by STAFF, who see
+# it rendered as an "Open in Google Maps" link on the admin Customers table and
+# on an order. An unrestricted field there is a way for anyone with an account
+# to put a link of their choosing, under a trustworthy label, in front of the
+# people who run the shop. Refusing a scheme that executes is not enough for
+# that - https://evil.example/ needs no scheme trick at all.
+#
+# Everything a real paste produces is in here: the Google Maps site on any
+# country domain, both Google shorteners, and OpenStreetMap.
+_MAP_LINK_HOST_RE = re.compile(
+    r"^(?:[a-z0-9-]+\.)*(?:google\.[a-z.]{2,7}|goo\.gl|openstreetmap\.org|osm\.org)$"
+)
+
+
+def _validate_map_link(value: Optional[str]) -> Optional[str]:
+    """A map link, or a clear refusal. Two gates, for two different attacks:
+
+    1. **Scheme.** `javascript:`/`data:` in an href is stored XSS the moment a
+       page renders it, and escaping does not help - those payloads need no
+       special characters. Same reasoning as resolve_link_url() on the Flask
+       side, which re-checks at render time.
+    2. **Host.** See _MAP_LINK_HOST_RE above - this field is customer-written
+       and staff-clicked, so "is a URL" is not a high enough bar.
+
+    Refusing outright rather than silently dropping the value: someone pasting
+    a link from an app we do not know needs to be told, not left believing
+    their location was saved."""
+    if value is None:
+        return value
+    value = value.strip()
+    if not value:
+        return None
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Map link must be a http:// or https:// URL")
+    if not _MAP_LINK_HOST_RE.match((parsed.hostname or "").lower()):
+        raise ValueError(
+            "Map link must be a Google Maps or OpenStreetMap link "
+            "(for anything else, drop a pin on the map instead)"
+        )
+    return value
+
+
+MapLink = Annotated[Optional[str], Field(max_length=500), AfterValidator(_validate_map_link)]
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +236,10 @@ class CustomerBase(BaseModel):
     phone_num: Optional[str] = Field(None, max_length=30)
     date_of_birth: DateOfBirth = None
     gender: Optional[Gender] = None
+    # Optional delivery pin - see the Latitude/Longitude/MapLink aliases above.
+    latitude: Latitude = None
+    longitude: Longitude = None
+    map_link: MapLink = None
 
 
 class CustomerCreate(CustomerBase):
@@ -186,6 +257,10 @@ class CustomerUpdate(BaseModel):
     phone_num: Optional[str] = Field(None, max_length=30)
     date_of_birth: DateOfBirth = None
     gender: Optional[Gender] = None
+    # Optional delivery pin - see the Latitude/Longitude/MapLink aliases above.
+    latitude: Latitude = None
+    longitude: Longitude = None
+    map_link: MapLink = None
     access_permission: Optional[bool] = None
 
 
@@ -218,6 +293,10 @@ class CustomerSelfUpdate(BaseModel):
     phone_num: Optional[str] = Field(None, max_length=30)
     date_of_birth: DateOfBirth = None
     gender: Optional[Gender] = None
+    # Optional delivery pin - see the Latitude/Longitude/MapLink aliases above.
+    latitude: Latitude = None
+    longitude: Longitude = None
+    map_link: MapLink = None
 
 
 class CustomerLoginResponse(BaseModel):
@@ -726,6 +805,19 @@ class OrderCreate(BaseModel):
     contact_person: Optional[str] = Field(None, max_length=150)
     phone: str = Field(..., min_length=1, max_length=30)
     address: str = Field(..., min_length=1, max_length=255)
+
+    # Where to actually drive to. Optional - a pin is a convenience, never a
+    # condition of buying - and normally not typed at all: the cart auto-fills it
+    # from the signed-in customer's saved location (see QuoteCart.renderInfoForm
+    # in EB Web Project/static/js/main.js). Accepted from the client rather than
+    # read off the Customer row server-side because a staff quote has no customer
+    # to read from, and because a buyer delivering somewhere other than their
+    # usual address is an ordinary thing to do, not an attack - the same reason
+    # contact_person stays client-supplied.
+    latitude: Latitude = None
+    longitude: Longitude = None
+    map_link: MapLink = None
+
     payment_term: Optional[str] = Field(None, max_length=100)
     install_term: Optional[str] = Field(None, max_length=150)
 
@@ -776,6 +868,10 @@ class OrderUpdate(BaseModel):
     contact_person: Optional[str] = Field(None, max_length=150)
     phone: Optional[str] = Field(None, min_length=1, max_length=30)
     address: Optional[str] = Field(None, min_length=1, max_length=255)
+    # Optional delivery pin - see the Latitude/Longitude/MapLink aliases above.
+    latitude: Latitude = None
+    longitude: Longitude = None
+    map_link: MapLink = None
     payment_term: Optional[str] = Field(None, max_length=100)
     install_term: Optional[str] = Field(None, max_length=150)
 
@@ -848,6 +944,9 @@ class OrderOut(BaseModel):
     contact_person: Optional[str] = None
     phone: str
     address: str
+    latitude: Optional[Decimal] = None
+    longitude: Optional[Decimal] = None
+    map_link: Optional[str] = None
     payment_term: Optional[str] = None
     salesperson: Optional[str] = None
     quoted_by_name: Optional[str] = None

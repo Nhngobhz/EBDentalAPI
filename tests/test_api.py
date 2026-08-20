@@ -791,6 +791,233 @@ def test_customer_can_edit_own_date_of_birth_and_gender(client, db_session):
 
 
 # ---------------------------------------------------------------------------
+# Delivery location (Customer.latitude/longitude/map_link, and its snapshot on
+# Order). See the column comments in models.py for why these are three
+# independent fields rather than one derived from another.
+# ---------------------------------------------------------------------------
+def test_staff_can_set_and_clear_a_customer_location(client, db_session):
+    make_admin(db_session, email="locadmin@example.com", password="password123")
+    headers = auth_header(client, "locadmin@example.com", "password123")
+
+    # Optional, like the demographics above - a customer created without one
+    # comes back with all three null rather than a default pin somewhere.
+    resp = client.post(
+        "/customers/",
+        json={"customer_name": "No Pin", "email": "nopin@example.com"},
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["latitude"] is None
+    assert resp.json()["longitude"] is None
+    assert resp.json()["map_link"] is None
+
+    resp = client.post(
+        "/customers/",
+        json={
+            "customer_name": "Pinned Clinic",
+            "email": "pinned@example.com",
+            "latitude": "11.556374",
+            "longitude": "104.928207",
+            "map_link": "https://maps.app.goo.gl/abc123",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    customer_id = resp.json()["id"]
+    # Serialized as strings, like every other Decimal in this API.
+    assert resp.json()["latitude"] == "11.556374"
+    assert resp.json()["longitude"] == "104.928207"
+    assert resp.json()["map_link"] == "https://maps.app.goo.gl/abc123"
+
+    # Explicit nulls clear it. This one matters more than most: a WRONG pin
+    # sends a driver to the wrong building, so "Clear" on the admin picker has
+    # to really erase rather than leave the old coordinates in place.
+    resp = client.put(
+        f"/customers/{customer_id}",
+        json={"latitude": None, "longitude": None, "map_link": None},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["latitude"] is None
+    assert resp.json()["longitude"] is None
+    assert resp.json()["map_link"] is None
+
+
+def test_customer_location_halves_are_independent(client, db_session):
+    """A link with no readable coordinates, and coordinates with no link, are
+    both valid states - neither is derived from the other."""
+    make_customer(db_session, email="halfpin@example.com", password="password123")
+    headers = customer_auth_header(client, "halfpin@example.com", "password123")
+
+    # A Google Maps short link carries no coordinates until its redirect is
+    # followed, and that may fail. The link is still worth keeping.
+    resp = client.put(
+        "/customers/me",
+        json={"map_link": "https://maps.app.goo.gl/onlyalink"},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["map_link"] == "https://maps.app.goo.gl/onlyalink"
+    assert resp.json()["latitude"] is None
+
+    # A pin dropped on the map is the mirror image: coordinates, no link.
+    resp = client.put(
+        "/customers/me",
+        json={"latitude": "11.6", "longitude": "104.9", "map_link": None},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["map_link"] is None
+    assert resp.json()["latitude"] == "11.600000"
+
+    # An update that does not mention the location leaves it alone, so editing
+    # a phone number on the profile page cannot wipe a pin.
+    resp = client.put("/customers/me", json={"phone_num": "012345678"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["latitude"] == "11.600000"
+
+
+def test_customer_location_is_validated(client, db_session):
+    make_admin(db_session, email="locvalidator@example.com", password="password123")
+    headers = auth_header(client, "locvalidator@example.com", "password123")
+
+    def create(email, **fields):
+        return client.post(
+            "/customers/",
+            json={"customer_name": "Bad Location", "email": email, **fields},
+            headers=headers,
+        )
+
+    # Off the planet - a transposed pair or a mis-parsed link, not a place.
+    assert create("badlat@example.com", latitude="95.0").status_code == 422
+    assert create("badlng@example.com", longitude="181.0").status_code == 422
+
+    # A scheme that executes is stored XSS the moment a page renders the href.
+    assert create("badscheme@example.com", map_link="javascript:alert(1)").status_code == 422
+
+    # ...and so is any other host, for a subtler reason: this field is written
+    # by CUSTOMERS and rendered to STAFF as an "Open in Google Maps" link, so
+    # "is a valid URL" is not a high enough bar. See _MAP_LINK_HOST_RE.
+    assert create("badhost@example.com", map_link="https://evil.example/phish").status_code == 422
+    assert create("nearmiss@example.com", map_link="https://google.com.evil.example/x").status_code == 422
+
+    # The shapes people actually paste all pass.
+    links = [
+        "https://maps.app.goo.gl/abc123",
+        "https://www.google.com/maps/place/X/@11.55,104.92,17z",
+        "https://google.com.kh/maps?q=11.55,104.92",
+        "https://www.openstreetmap.org/#map=17/11.55/104.92",
+    ]
+    for i, link in enumerate(links):
+        resp = create(f"goodlink{i}@example.com", map_link=link)
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["map_link"] == link
+
+
+def test_order_snapshots_the_delivery_location(client, db_session):
+    headers, brand_id = _price_test_setup(client, db_session, "orderloc@example.com")
+    product = client.post(
+        "/products/",
+        json={"product_name": "Delivered Thing", "price": "50.00", "brand_id": brand_id},
+        headers=headers,
+    ).json()
+
+    resp = client.post(
+        "/orders/",
+        json=_order_payload(
+            product["id"],
+            latitude="11.556374",
+            longitude="104.928207",
+            map_link="https://maps.app.goo.gl/abc123",
+        ),
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    order_id = resp.json()["id"]
+    assert resp.json()["latitude"] == "11.556374"
+    assert resp.json()["map_link"] == "https://maps.app.goo.gl/abc123"
+
+    # An edit that does not mention the pin leaves it alone - correcting a
+    # phone number must not silently drop where the order is going.
+    resp = client.put(f"/orders/{order_id}", json={"phone": "099999999"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["latitude"] == "11.556374"
+
+    # ...but staff can clear a wrong one outright, unlike address/clinic/phone,
+    # which are NOT NULL and reject an explicit null.
+    resp = client.put(
+        f"/orders/{order_id}",
+        json={"latitude": None, "longitude": None, "map_link": None},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["latitude"] is None
+    assert resp.json()["map_link"] is None
+
+    resp = client.put(f"/orders/{order_id}", json={"address": None}, headers=headers)
+    assert resp.status_code == 400, resp.text
+
+
+def test_order_without_a_location_is_still_valid(client, db_session):
+    """A pin is a convenience, never a condition of buying - and every staff
+    quote for a walk-in has none."""
+    headers, brand_id = _price_test_setup(client, db_session, "orderloc2@example.com")
+    product = client.post(
+        "/products/",
+        json={"product_name": "Unpinned Thing", "price": "50.00", "brand_id": brand_id},
+        headers=headers,
+    ).json()
+
+    resp = client.post("/orders/", json=_order_payload(product["id"]), headers=headers)
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["latitude"] is None
+    assert resp.json()["longitude"] is None
+    assert resp.json()["map_link"] is None
+
+
+def test_self_registration_keeps_a_supplied_location(client, db_session):
+    """POST /auth/customer/register builds its Customer from an EXPLICIT field
+    list, so a column added only to CustomerBase would be validated here and
+    then silently dropped. This is the test that catches that."""
+    resp = client.post(
+        "/auth/customer/register",
+        json={
+            "customer_name": "Pinned Signup",
+            "email": "pinnedsignup@example.com",
+            "password": "password123",
+            "latitude": "11.556374",
+            "longitude": "104.928207",
+            "map_link": "https://maps.app.goo.gl/signup",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["latitude"] == "11.556374"
+    assert resp.json()["map_link"] == "https://maps.app.goo.gl/signup"
+
+
+def test_products_are_listed_alphabetically(client, db_session):
+    """The catalog is browsed, not scrolled in insertion order - and the sort
+    has to happen in the DATABASE, because `limit` slices the result before any
+    client could reorder it."""
+    headers, brand_id = _price_test_setup(client, db_session, "sortbyname@example.com")
+    # Created deliberately out of order, with mixed case, since the sort is
+    # case-insensitive (lower(product_name)).
+    for name in ["zeta drill", "Alpha Chair", "middle Light", "Beta Scaler"]:
+        resp = client.post(
+            "/products/",
+            json={"product_name": name, "price": "10.00", "brand_id": brand_id},
+            headers=headers,
+        )
+        assert resp.status_code == 201, resp.text
+
+    names = [p["product_name"] for p in client.get("/products/", params={"limit": 500}).json()]
+    assert names == sorted(names, key=str.lower)
+    assert names.index("Alpha Chair") < names.index("Beta Scaler")
+    assert names.index("Beta Scaler") < names.index("middle Light")
+    assert names.index("middle Light") < names.index("zeta drill")
+
+
+# ---------------------------------------------------------------------------
 # Customer self-service auth
 # ---------------------------------------------------------------------------
 def test_customer_register_then_login_flow(client, db_session):

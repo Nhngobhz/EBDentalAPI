@@ -1,6 +1,7 @@
 ﻿from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.core.audit import stamp_updated_by
@@ -195,7 +196,25 @@ def list_products(
         query = query.filter(Product.category_id == category_id)
     if q:
         query = query.filter(Product.product_name.ilike(f"%{q}%"))
-    products = query.order_by(Product.id).offset(skip).limit(limit).all()
+    # Alphabetical, not insertion order. This is a *catalog*: a shopper scanning it
+    # for "Curing Light" needs the C's together, and staff paging through the admin
+    # table need the same row to stay in the same place instead of drifting to the
+    # end every time a product is re-created. Brand/Category already sort by name.
+    #
+    # It also has to be the DATABASE that sorts, not the page: `limit` slices the
+    # result, so sorting client-side would only ever alphabetize whichever 50 rows
+    # happened to come back first.
+    #
+    # NULLS LAST is not needed - product_name is NOT NULL - but the id tiebreaker is:
+    # two products can legitimately share a name (same model, different brand), and
+    # without a deterministic second key their relative order can change between
+    # requests, which makes pagination silently drop or repeat one of them.
+    products = (
+        query.order_by(func.lower(Product.product_name), Product.id)
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
     return [_serialize_product(p, can_view_price) for p in products]
 
 

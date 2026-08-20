@@ -175,6 +175,30 @@ class Customer(AuditedMixin, Base):
     date_of_birth = Column(Date, nullable=True)
     gender = Column(String(10), nullable=True)
 
+    # --- Where to deliver ---------------------------------------------------
+    # `address` above is what gets printed; these three are how someone actually
+    # FINDS the place. A Phnom Penh address is often unroutable as text ("behind
+    # the pagoda, opposite the pharmacy"), so the useful artifact is a dropped
+    # pin - set by the customer on their profile page, or by staff on the admin
+    # Customers screen for a walk-in record.
+    #
+    # All three nullable and independent of one another on purpose:
+    #   * every customer that existed before these columns has none of them;
+    #   * a pasted Google Maps SHORT link (maps.app.goo.gl/...) that could not be
+    #     expanded is still stored as map_link with no coordinates - a human can
+    #     open it even when we cannot read a lat/lng out of it;
+    #   * a pin dropped on the map produces coordinates with no link the customer
+    #     ever typed (the Flask layer synthesizes one for display).
+    # Numeric(9, 6) rather than Float: ~11cm of precision, exact in the DB, and
+    # serialized as a string like every other Numeric here (see the module
+    # docstring in EB Web Project/formatting.py).
+    latitude = Column(Numeric(9, 6), nullable=True)
+    longitude = Column(Numeric(9, 6), nullable=True)
+    # Free text, restricted to http(s) in schemas.py and re-checked at render time
+    # by resolve_link_url() - the same treatment HeroSlide.button_url gets, for the
+    # same stored-XSS reason.
+    map_link = Column(String(500), nullable=True)
+
     # --- Added: self-service login support ---------------------------------
     # NULL hashed_password means this Customer record was created by staff
     # and has no login capability - only self-registered customers
@@ -641,6 +665,17 @@ class Order(AuditedMixin, Base):
     contact_person = Column(String(150), nullable=True)
     phone = Column(String(30), nullable=False)
     address = Column(String(255), nullable=False)
+
+    # Snapshot of the buyer's dropped pin, auto-filled from their Customer record
+    # at checkout - a snapshot rather than a live lookup for exactly the reason
+    # clinic_name/phone/address above are: whoever delivers this order has to go
+    # where the buyer pointed *then*, not wherever that customer's profile happens
+    # to point months later. Nullable - a staff quote and every row placed before
+    # these columns existed carries no pin.
+    latitude = Column(Numeric(9, 6), nullable=True)
+    longitude = Column(Numeric(9, 6), nullable=True)
+    map_link = Column(String(500), nullable=True)
+
     payment_term = Column(String(100), nullable=True)
 
     # "Salesperson" on the paper form - always server-derived, never typed in: the acting
