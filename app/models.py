@@ -295,6 +295,24 @@ class Product(AuditedMixin, Base):
 
     badge = Column(String(50), nullable=True)
 
+    # Which half of the storefront this product belongs to: "machinery" or "materials".
+    #
+    # The split used to be purely presentational - site_section() in the Flask app
+    # keys off request.endpoint, not off any data - and that was fine for exactly as
+    # long as every product WAS machinery. Materials arrive from SAP Business One
+    # (which holds that item master and only that one; machinery never enters SAP),
+    # so from now on the two sets share a table and must not share a catalog page.
+    # Every product read path filters on this.
+    #
+    # A plain String + Pydantic Literal rather than a DB enum, for the same reason
+    # discount_type/order_type/gender are - see the comment on Customer.gender:
+    # widening the vocabulary later then needs no migration. QrCode already uses
+    # this exact machinery/materials pair, so the words are not new here.
+    #
+    # NOT NULL with server_default "machinery": every row that existed before this
+    # column is machinery by definition, which makes the backfill "all of them".
+    section = Column(String(20), nullable=False, server_default="machinery")
+
     # False for a product that exists only as somebody else's freebie (the stand
     # and zirconia teeth that ship with SCAN11) - it still expands into a $0
     # component line under its parent, but it can't be ordered on its own and is

@@ -1790,7 +1790,7 @@ def test_admin_set_password_requires_user_management(client, db_session):
 # ---------------------------------------------------------------------------
 def _make_order_product(
     client, headers, name="Quoted Widget", price="100.00", free_items=None,
-    is_purchasable=None,
+    is_purchasable=None, section=None,
 ):
     brand_id = client.post("/brands/", data={"brand_name": f"OrderCo-{name}"}, headers=headers).json()["id"]
     payload = {"product_name": name, "price": price, "brand_id": brand_id}
@@ -1798,6 +1798,8 @@ def _make_order_product(
         payload["free_items"] = free_items
     if is_purchasable is not None:
         payload["is_purchasable"] = is_purchasable
+    if section is not None:
+        payload["section"] = section
     resp = client.post("/products/", json=payload, headers=headers)
     assert resp.status_code == 201, resp.text
     return resp.json()
@@ -2392,6 +2394,87 @@ def test_gift_only_flag_can_be_turned_back_on(client, db_session):
         headers=headers,
     )
     assert order.status_code == 201, order.text
+
+
+def test_products_default_to_machinery(client, db_session):
+    """Every product that existed before the machinery/materials split is machinery,
+    and so is anything created without an opinion. Materials only ever arrive by
+    saying so explicitly - in practice, from the SAP item sync."""
+    make_admin(db_session, email="section1@example.com", password="password123")
+    headers = auth_header(client, "section1@example.com", "password123")
+    product = _make_order_product(client, headers, name="Unstated Item", price="10.00")
+    assert product["section"] == "machinery"
+
+
+def test_materials_are_hidden_from_the_machinery_catalog(client, db_session):
+    """The property the section column exists for.
+
+    GET /products/ defaults to machinery rather than to everything, so a materials
+    product is invisible to every caller that has not deliberately asked for it -
+    the storefront catalog, the sitewide product global, search. Getting this wrong
+    is how a consumable ends up on the machinery shop front.
+    """
+    make_admin(db_session, email="section2@example.com", password="password123")
+    headers = auth_header(client, "section2@example.com", "password123")
+    machine = _make_order_product(client, headers, name="Dental Chair", price="900.00")
+    material = _make_order_product(
+        client, headers, name="Composite Syringe", price="9.00", section="materials",
+    )
+
+    default_listing = [p["id"] for p in client.get("/products/", params={"limit": 200}).json()]
+    assert machine["id"] in default_listing
+    assert material["id"] not in default_listing
+
+    materials_only = [
+        p["id"]
+        for p in client.get("/products/", params={"limit": 200, "section": "materials"}).json()
+    ]
+    assert material["id"] in materials_only
+    assert machine["id"] not in materials_only
+
+    # The admin table spans both halves, the same way it opts into gift-only rows.
+    everything = [
+        p["id"]
+        for p in client.get("/products/", params={"limit": 200, "section": "all"}).json()
+    ]
+    assert {machine["id"], material["id"]} <= set(everything)
+
+    # Fetched directly it is still served, so admin screens can open it.
+    assert client.get(f"/products/{material['id']}").status_code == 200
+
+
+def test_section_can_be_changed_after_creation(client, db_session):
+    """Setting it is not enough: a product filed into the wrong half would
+    otherwise be stranded off both storefronts with no way back."""
+    make_admin(db_session, email="section3@example.com", password="password123")
+    headers = auth_header(client, "section3@example.com", "password123")
+    product = _make_order_product(
+        client, headers, name="Misfiled Item", price="20.00", section="materials",
+    )
+
+    resp = client.put(
+        f"/products/{product['id']}", json={"section": "machinery"}, headers=headers
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["section"] == "machinery"
+
+    listed = [p["id"] for p in client.get("/products/", params={"limit": 200}).json()]
+    assert product["id"] in listed
+
+
+def test_section_rejects_an_unknown_value(client, db_session):
+    make_admin(db_session, email="section4@example.com", password="password123")
+    headers = auth_header(client, "section4@example.com", "password123")
+    brand_id = client.post(
+        "/brands/", data={"brand_name": "SectionCo"}, headers=headers
+    ).json()["id"]
+    resp = client.post(
+        "/products/",
+        json={"product_name": "Bad Section", "price": "5.00", "brand_id": brand_id,
+              "section": "implants"},
+        headers=headers,
+    )
+    assert resp.status_code == 422
 
 
 def _configurable_set(client, headers, tag, set_price="2000.00"):
@@ -4023,12 +4106,51 @@ def test_a_paid_order_stays_editable(client, db_session, monkeypatch):
     # The edit is attributed, which is the whole audit trail a paid-order amendment has.
     assert body["updated_by"]["user_name"] == "Admin User"
 
-    # Payment can also be reversed now, and the row deleted outright.
+    # Payment can also be reversed now, and the row deleted outright - though deleting a
+    # row that is STILL paid is admin-only, see the test below.
     assert client.put(
         f"/orders/{order['id']}", json={"payment_status": "unpaid"}, headers=headers
     ).status_code == 200
     assert client.delete(f"/orders/{order['id']}", headers=headers).status_code == 204
     assert client.get(f"/orders/{order['id']}", headers=headers).status_code == 404
+
+
+def test_only_an_admin_can_delete_a_paid_order(client, db_session, monkeypatch):
+    """The one piece of the old paid-order freeze that came back (2026-08-20).
+
+    Editing a completed sale leaves a trail in updated_by/updated_at; deleting it leaves
+    nothing at all, line items included. So it stays possible - the owner asked for it -
+    but only for `admin`, not for every price_listing salesperson who can raise a quote.
+    An UNPAID order is still anybody's to delete."""
+    _fast_alert_wait(monkeypatch)
+    make_admin(db_session, email="paiddeleteadmin@example.com", password="password123")
+    admin_headers = auth_header(client, "paiddeleteadmin@example.com", "password123")
+    _staff_without_admin(db_session, "paiddeletestaff@example.com")
+    staff_headers = auth_header(client, "paiddeletestaff@example.com", "password123")
+
+    product = _make_order_product(client, admin_headers, name="PaidDeleteWidget")
+
+    # Unpaid: the salesperson deletes their own mistake, as before.
+    unpaid = client.post(
+        "/orders/", json=_order_payload(product["id"]), headers=admin_headers
+    ).json()
+    assert client.delete(f"/orders/{unpaid['id']}", headers=staff_headers).status_code == 204
+
+    paid = client.post(
+        "/orders/", json=_order_payload(product["id"]), headers=admin_headers
+    ).json()
+    assert client.put(
+        f"/orders/{paid['id']}", json={"payment_status": "paid"}, headers=admin_headers
+    ).status_code == 200
+
+    refused = client.delete(f"/orders/{paid['id']}", headers=staff_headers)
+    assert refused.status_code == 403, refused.text
+    assert "admin" in refused.json()["detail"]
+    # Refused, not half-done.
+    assert client.get(f"/orders/{paid['id']}", headers=admin_headers).status_code == 200
+
+    assert client.delete(f"/orders/{paid['id']}", headers=admin_headers).status_code == 204
+    assert client.get(f"/orders/{paid['id']}", headers=admin_headers).status_code == 404
 
 
 def test_a_paid_orders_status_is_final(client, db_session, monkeypatch):

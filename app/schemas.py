@@ -395,6 +395,20 @@ class CategoryMini(BaseModel):
 # since ProductBase needs it first in file order.
 DiscountType = Literal["percent", "cash"]
 
+# Which half of the storefront a product belongs to - see models.Product.section.
+# Narrower than QrBadgeVariant below, which also carries "implants": that one labels
+# a contact-page card, while this one decides which catalog a product appears in,
+# and there are exactly two catalogs.
+Section = Literal["machinery", "materials"]
+
+# What GET /products/ accepts. Deliberately NOT `Optional[Section] = None` meaning
+# "every section": the default has to be the SAFE answer, because the failure mode
+# this whole column exists to prevent is materials silently appearing on a machinery
+# page. A caller that says nothing gets machinery - exactly what it got before this
+# column existed - and "all" is a deliberate opt-in for the screens that must see
+# every row, the same way include_unpurchasable already works on that endpoint.
+SectionFilter = Literal["machinery", "materials", "all"]
+
 
 # ---------------------------------------------------------------------------
 # Bundle contents - the shared "this thing contains these products" shape used
@@ -443,6 +457,10 @@ class ProductBase(BaseModel):
     badge: Optional[str] = Field(None, max_length=50)
     product_code: Optional[str] = Field(None, max_length=50)
     uom: Optional[str] = Field(None, max_length=20)
+    # Defaults to "machinery" so every existing caller - the admin product form,
+    # the seed scripts, the test suite - keeps creating machinery products without
+    # being changed. Only the SAP item sync ever sends "materials".
+    section: Section = "machinery"
     # False = gift-only: expands as a $0 component line under whatever it comes
     # with, but can't be ordered on its own and isn't listed in the public
     # catalog. Defaults to True so every existing caller keeps creating sellable
@@ -481,6 +499,7 @@ class ProductUpdate(BaseModel):
     badge: Optional[str] = Field(None, max_length=50)
     product_code: Optional[str] = Field(None, max_length=50)
     uom: Optional[str] = Field(None, max_length=20)
+    section: Optional[Section] = None
     is_purchasable: Optional[bool] = None
     brand_id: Optional[int] = None
     category_id: Optional[int] = None

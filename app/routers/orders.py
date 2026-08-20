@@ -413,6 +413,11 @@ def _reject_if_paid(order: Order) -> None:
     it applied). `updated_by_user_id`/`updated_at` record who changed a paid order, which
     is now the only trail of an amendment to a completed sale - the printed receipt the
     customer already holds will not match a later edit.
+
+    One piece of the old freeze did come back, and it lives in delete_order rather than
+    here because it isn't a blanket rule: DELETE on a paid order now needs the `admin`
+    permission (2026-08-20). Editing a completed sale leaves a trail; destroying it
+    leaves nothing at all.
     """
     return None
 
@@ -1367,13 +1372,22 @@ def update_order(
 
 
 @router.delete("/{order_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_order(order_id: int, _: User = _perm, db: Session = Depends(get_db)):
+def delete_order(order_id: int, current_user: User = _perm, db: Session = Depends(get_db)):
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-    # Paid orders are deletable too since 2026-08-11 (_reject_if_paid is a no-op). This
-    # destroys the record of a completed sale, including its line items - there is no
-    # soft-delete and no archive to recover it from.
+    # Paid orders are deletable too since 2026-08-11 (_reject_if_paid is a no-op), but
+    # since 2026-08-20 only by `admin`. Deleting one destroys the record of a completed
+    # sale, line items and all - there is no soft-delete and no archive to recover it
+    # from - so it is the owner's call, not something a price_listing salesperson can do
+    # to a row the Orders page has already locked. Note this is narrower than the
+    # endpoint's own gate: `admin` here is a second door on top of _perm, exactly as the
+    # discount checks in create_order/update_order ask for product_management.
+    if order.payment_status == "paid" and not current_user.admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This order has been paid - only an admin can delete it",
+        )
     _reject_if_paid(order)
     db.delete(order)
     db.commit()

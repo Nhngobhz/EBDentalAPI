@@ -9,6 +9,17 @@ os.environ["TELEGRAM_BOT_TOKEN"] = ""
 os.environ["TELEGRAM_CHAT_ID"] = ""
 os.environ["MAIL_USERNAME"] = ""
 os.environ["MAIL_PASSWORD"] = ""
+# Uploads must never leave this machine during a test run. app/core/storage.py falls
+# back to local disk only when R2 is UNconfigured, and a developer's .env normally has
+# real R2 credentials in it - so without these five lines every image/PDF upload test
+# quietly pushes objects into the live Cloudflare bucket, over the network. That made
+# the upload tests both slow (network round trips, ~30s each) and failure-prone, and it
+# wrote test fixtures into production storage.
+os.environ["R2_ACCOUNT_ID"] = ""
+os.environ["R2_ACCESS_KEY_ID"] = ""
+os.environ["R2_SECRET_ACCESS_KEY"] = ""
+os.environ["R2_BUCKET_NAME"] = ""
+os.environ["R2_PUBLIC_BASE_URL"] = ""
 
 import pytest
 from fastapi.testclient import TestClient

@@ -30,7 +30,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from fpdf import FPDF
-from fpdf.enums import CellBordersLayout, TableBordersLayout
+from fpdf.enums import TableBordersLayout
 from fpdf.fonts import FontFace
 
 from app.schemas import OrderOut
@@ -299,20 +299,17 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
     item_rows = []
     # Component lines (a promotion/set's member products, a product's free
     # gifts - see OrderItem.parent_item_id) are $0 sub-lines of the paid line
-    # above them: they don't get their own No., and their price columns read
-    # "Free"/$0.00. Numbering therefore counts only real, priced lines.
-    line_no = 0
-    for item in order.items:
+    # above them: their price columns read "Free"/$0.00. They are still numbered,
+    # in one run with the paid lines (2026-08-20), so every physical item on the
+    # document can be counted off - hence enumerate over the flat list rather than
+    # a counter that only advances on priced rows. Mirrors buildPrintTemplate in
+    # main.js.
+    for line_no, item in enumerate(order.items, start=1):
         is_component = getattr(item, "parent_item_id", None) is not None
         old_unit_price = _old_unit_price(item)
         undiscounted_subtotal += old_unit_price * item.qty
         if item.discount_type == "cash":
             cash_discount_total += (old_unit_price - Decimal(item.unit_price)) * item.qty
-        if is_component:
-            line_no_text = ""
-        else:
-            line_no += 1
-            line_no_text = str(line_no)
         code = item.product_code or "—"
         # Product code/name are plain free text - unlike Clinic/Address, the website
         # doesn't tag this column .qpt-khmer either, but a browser still auto-falls-back
@@ -322,7 +319,7 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
         description = f"    • {item.product_name}" if is_component else item.product_name
         discount_text = "—" if is_component else _format_item_discount(item.discount, item.discount_type)
         item_rows.append((
-            (line_no_text, None), (code, khmer_style if _has_khmer(code) else None),
+            (str(line_no), None), (code, khmer_style if _has_khmer(code) else None),
             (description, khmer_style if _has_khmer(item.product_name) else None),
             (str(item.qty), None), (item.uom or "PCS", None), (_money(old_unit_price), None),
             (discount_text, None), (_money(display_amount), None),
@@ -350,30 +347,27 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
     with pdf.table(
         col_widths=col_widths,
         first_row_as_headings=True,
-        num_heading_rows=2,
+        num_heading_rows=1,
         text_align=("CENTER", "LEFT", "LEFT", "CENTER", "CENTER", "RIGHT", "CENTER", "RIGHT"),
         borders_layout=TableBordersLayout.ALL,
         line_height=5,
         padding=1.2,
     ) as table:
-        # head1's "UP before & After Discount" cell and head2's two filler cells (needed
-        # to fill out the grid under a colspan header in a rowspan=2 layout) skip the
-        # border between them, so the two don't render as a separate boxed sliver row -
-        # just one seamless header cell with a divider that only kicks in at the data
-        # rows below.
-        no_bottom = CellBordersLayout.LEFT | CellBordersLayout.RIGHT | CellBordersLayout.TOP
-        no_top = CellBordersLayout.LEFT | CellBordersLayout.RIGHT | CellBordersLayout.BOTTOM
-        head1 = table.row()
-        head1.cell("No.", rowspan=2)
-        head1.cell("Code", rowspan=2)
-        head1.cell("Description", rowspan=2)
-        head1.cell("Qty", rowspan=2)
-        head1.cell("UOM", rowspan=2)
-        head1.cell("UP before & After Discount", colspan=2, border=no_bottom)
-        head1.cell("Amount", rowspan=2)
-        head2 = table.row()
-        head2.cell("", border=no_top)
-        head2.cell("", border=no_top)
+        # ONE heading row. This used to be two: every other column carried rowspan=2 and
+        # a second row of empty filler cells sat under the "UP before & After Discount"
+        # colspan header, purely to fill out the grid. Even with the shared borders
+        # suppressed it still drew a divider down the lower half of that header cell,
+        # which is the stray line the owner asked to be rid of (2026-08-20). The website's
+        # own builder (buildPrintTemplate in main.js) dropped the same filler row, so the
+        # two documents still match line for line.
+        head = table.row()
+        head.cell("No.")
+        head.cell("Code")
+        head.cell("Description")
+        head.cell("Qty")
+        head.cell("UOM")
+        head.cell("UP before & After Discount", colspan=2)
+        head.cell("Amount")
 
         for cells in item_rows:
             row = table.row()

@@ -95,6 +95,15 @@ def resolve_pending_quotation_pdf(order_id: int, pdf_bytes: bytes) -> None:
 
 
 async def deliver_order_alert(order: "OrderOut") -> None:
+    # Bail out before the wait, not just inside send_order_alert (which guards on the
+    # same condition further down). The 20s below exists to collect the browser's
+    # rendered PDF *for the alert* - with no alert to send, it buys a PDF that is
+    # immediately discarded, and every caller pays the full timeout to get nothing.
+    # That is what made the test suite take 15 minutes: ~20s per order created, on
+    # every order, because tests deliberately run with Telegram unconfigured.
+    if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
+        logger.debug("Telegram not configured - skipping the quotation PDF wait.")
+        return
     future = register_pending_quotation_pdf(order.id)
     try:
         pdf_bytes = await asyncio.wait_for(future, timeout=_QUOTATION_PDF_WAIT_SECONDS)

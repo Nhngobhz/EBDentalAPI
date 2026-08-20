@@ -11,7 +11,13 @@ from app.core.files import save_image, save_named_image
 from app.core.query import Limit, OptionalInt, Skip
 from app.database import get_db
 from app.models import Brand, Category, Product, ProductFreeItem, ProductImage, User
-from app.schemas import ProductCreate, ProductOut, ProductPriceUpdate, ProductUpdate
+from app.schemas import (
+    ProductCreate,
+    ProductOut,
+    ProductPriceUpdate,
+    ProductUpdate,
+    SectionFilter,
+)
 
 router = APIRouter(prefix="/products", tags=["Products"])
 
@@ -168,6 +174,7 @@ def list_products(
     brand_id: OptionalInt = None,
     category_id: OptionalInt = None,
     q: str | None = None,
+    section: SectionFilter = "machinery",
     include_unpurchasable: bool = False,
     can_view_price: bool = Depends(get_price_visibility),
     db: Session = Depends(get_db),
@@ -181,6 +188,11 @@ def list_products(
     `include_unpurchasable=true` brings them back for the screens that must see
     every row: the admin product table and the free-item picker that builds
     bundles out of them.
+
+    `section` defaults to "machinery" rather than to "everything", and that default
+    is the point: materials come from SAP and must never turn up on a machinery
+    page, so a caller that forgets to ask gets the same rows it got before the
+    column existed. Pass "all" from the screens that genuinely span both.
     """
     query = db.query(Product).options(
         joinedload(Product.brand),
@@ -190,6 +202,8 @@ def list_products(
     )
     if not include_unpurchasable:
         query = query.filter(Product.is_purchasable.is_(True))
+    if section != "all":
+        query = query.filter(Product.section == section)
     if brand_id is not None:
         query = query.filter(Product.brand_id == brand_id)
     if category_id is not None:
