@@ -5,14 +5,18 @@ Things get pushed to the configured Telegram chat:
   1. Every successful staff (User) login - see notify_admin_login().
      "Admin-level" logins (user_management=True) are flagged distinctly
      from regular staff logins so admins stand out in the chat.
-  2. Unhandled application errors - see notify_error() and, for anything
-     logged with logger.error()/logger.critical() anywhere in the app,
+  2. Unhandled application errors - anything logged with
+     logger.error()/logger.critical() anywhere in the app is forwarded by
      app/core/logging_conf.py's TelegramErrorHandler.
   3. Every new order - see deliver_order_alert(), called from
      routers/orders.py::create_order. Includes the quotation PDF and inline
      Delivered/Cancelled buttons; button presses land on the webhook in
      routers/telegram_webhook.py. If the PDF upload itself fails, the alert still
      goes out as text - see _send_order_alert_without_pdf().
+
+This module is about *sending*. The wording and layout of every message it puts on
+the wire lives in app/services/telegram_format.py, and the reaction to a button press
+in app/routers/telegram_webhook.py.
 
 If TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are not configured, these
 functions are no-ops (logged at debug level) so the app works fully
@@ -33,12 +37,21 @@ back to the fpdf2 approximation only if it doesn't (browser closed/crashed/offli
 exactly one Telegram alert always goes out, never zero and never two.
 """
 import asyncio
-import html
 import json
 from typing import TYPE_CHECKING
 
 from app.config import settings
 from app.core.logging_conf import get_logger
+from app.services.telegram_format import (
+    MESSAGE_LIMIT,
+    OrderAlert,
+    render_khqr_pending,
+    render_login,
+    render_order_alert,
+    render_pdf_missing_notice,
+    split_for_messages,
+    visible_length,
+)
 
 if TYPE_CHECKING:
     from decimal import Decimal
@@ -125,20 +138,6 @@ def _api_url(method: str) -> str:
     return _API_BASE.format(token=settings.TELEGRAM_BOT_TOKEN, method=method)
 
 
-def _esc(value: object) -> str:
-    """Escape a value before it goes into a parse_mode=HTML message.
-
-    Every caption/message below is sent with parse_mode="HTML", and several
-    interpolate free text the *customer* typed (clinic_name, address) or that a
-    staff member chose (user_name, role_title). Telegram rejects a message whose
-    entities don't parse - so a clinic literally named "Smith <Dental>" didn't
-    produce a mangled alert, it produced NO alert (and the text-only fallback,
-    built from the same caption, failed identically). Escaping keeps the alert
-    deliverable whatever anyone types, and closes the matching injection of
-    arbitrary markup into the staff chat."""
-    return html.escape(str(value if value is not None else ""), quote=False)
-
-
 def _describe(exc: BaseException) -> str:
     """Renders an exception for a log line.
 
@@ -163,7 +162,9 @@ def _describe_response(resp) -> str:
     return f"HTTP {resp.status_code} - {description}"
 
 
-async def send_telegram_message(text: str, topic_id: str | None = None) -> None:
+async def send_telegram_message(
+    text: str, topic_id: str | None = None, reply_to_message_id: int | None = None
+) -> None:
     if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
         logger.debug("Telegram not configured - skipping notification.")
         return
@@ -178,6 +179,8 @@ async def send_telegram_message(text: str, topic_id: str | None = None) -> None:
     }
     if topic_id:
         payload["message_thread_id"] = int(topic_id)
+    if reply_to_message_id is not None:
+        payload["reply_to_message_id"] = reply_to_message_id
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(_api_url("sendMessage"), json=payload)
@@ -190,75 +193,26 @@ async def send_telegram_message(text: str, topic_id: str | None = None) -> None:
 async def notify_admin_login(
     user_name: str, email: str, role_title: str, is_admin_level: bool
 ) -> None:
-    icon = "\U0001F6E1" if is_admin_level else "\U0001F464"
-    text = (
-        f"{icon} <b>Staff login</b>\n"
-        f"User: {_esc(user_name)} ({_esc(email)})\n"
-        f"Role: {_esc(role_title)}\n"
-        f"Admin-level (user_management): {'Yes' if is_admin_level else 'No'}"
+    await send_telegram_message(
+        render_login(user_name, email, role_title, is_admin_level),
+        topic_id=settings.TELEGRAM_LOGIN_TOPIC_ID,
     )
-    await send_telegram_message(text, topic_id=settings.TELEGRAM_LOGIN_TOPIC_ID)
 
 
-async def notify_error(error_type: str, message: str, path: str | None = None) -> None:
-    text = (
-        f"\U0001F6A8 <b>Application error</b>\n"
-        f"Type: {_esc(error_type)}\n"
-        f"Message: {_esc(message)}\n" + (f"Path: {_esc(path)}" if path else "")
-    )
-    await send_telegram_message(text, topic_id=settings.TELEGRAM_ERROR_TOPIC_ID)
+def _document_word(order: "OrderOut") -> str:
+    """The word in the attached file's name: "Invoice" once the order is paid,
+    "Quotation" until then.
 
-
-def _order_alert_caption(order: "OrderOut") -> tuple[str, str]:
-    """Returns (caption, document_word) for an order's Telegram alert. Three shapes:
-    a PAID row (from the payment-status check or a staff Mark-as-Paid, carrying the
-    invoice), an unpaid QUOTE (staff cart, or a customer who chose Cash - explicitly
-    flagged so staff never mistake it for a paid sale), and the plain new-order shape
-    kept as a fallback for anything else.
-
-    Paid is checked FIRST, and on payment_status alone: a quote whose payment staff
-    recorded at the counter is a completed sale, and announcing it as "no payment has
-    been made" because order_type still says "quote" would be exactly backwards."""
+    Taken from the PDF builder rather than spelled again here: the filename staff see
+    in Telegram has to match the title inside the document they open. That word became
+    "Invoice" (from "Receipt") on 2026-08-17. Imported inside the function like
+    build_invoice_pdf below - invoice_pdf pulls in fpdf2 and both bundled fonts, which
+    nothing needs until an alert actually carries a document."""
     if order.payment_status == "paid":
-        via = " via KHQR" if order.payment_method == "khqr" else ""
-        label = "QUOTE" if order.order_type == "quote" else "Order"
-        caption = (
-            f"✅ <b>{label} PAID{via}</b>\n"
-            f"No: {_esc(order.order_number)} (Code: {_esc(order.quote_code)})\n"
-            f"Clinic: {_esc(order.clinic_name)}\n"
-            f"Salesperson: {_esc(order.salesperson or '-')}\n"
-            f"Amount received: $ {order.grand_total:.2f}"
-        )
-        # Taken from the PDF builder rather than spelled again here: the filename staff
-        # see in Telegram has to match the title inside the document they open. That
-        # word became "Invoice" (from "Receipt") on 2026-08-17. Imported inside the
-        # function like build_invoice_pdf below - invoice_pdf pulls in fpdf2 and both
-        # bundled fonts, which nothing needs until an alert actually carries a document.
         from app.services.invoice_pdf import document_title
 
-        return caption, document_title(order)
-    if order.order_type == "quote":
-        payment_line = (
-            "Payment: Cash (to be collected)\n" if order.payment_method == "cash" else ""
-        )
-        caption = (
-            f"\U0001F4C4 <b>New QUOTE</b>\n"
-            f"Quote No: {_esc(order.order_number)} (Code: {_esc(order.quote_code)})\n"
-            f"Clinic: {_esc(order.clinic_name)}\n"
-            f"Salesperson: {_esc(order.salesperson or '-')}\n"
-            f"{payment_line}"
-            f"Grand Total: $ {order.grand_total:.2f}\n"
-            f"ℹ️ This is a quotation - no payment has been made."
-        )
-        return caption, "Quotation"
-    caption = (
-        f"\U0001F6CD <b>New order</b>\n"
-        f"Order No: {_esc(order.order_number)} (Code: {_esc(order.quote_code)})\n"
-        f"Clinic: {_esc(order.clinic_name)}\n"
-        f"Salesperson: {_esc(order.salesperson or '-')}\n"
-        f"Grand Total: $ {order.grand_total:.2f}"
-    )
-    return caption, "Quotation"
+        return document_title(order)
+    return "Quotation"
 
 
 async def send_khqr_pending_alert_for_checkout(
@@ -272,14 +226,10 @@ async def send_khqr_pending_alert_for_checkout(
 
     The full PDF-carrying alert with buttons goes out via deliver_order_alert() at the
     moment the order is actually created, i.e. once the money has arrived."""
-    text = (
-        f"\U0001F551 <b>Customer is paying by KHQR</b>\n"
-        f"Ref: {_esc(reference)}\n"
-        f"Customer: {_esc(customer_name)}\n"
-        f"Amount due: $ {grand_total:.2f}\n"
-        f"No order exists yet - one is created, with its invoice, once the payment lands."
+    await send_telegram_message(
+        render_khqr_pending(reference, grand_total, customer_name),
+        topic_id=settings.TELEGRAM_ORDER_TOPIC_ID,
     )
-    await send_telegram_message(text, topic_id=settings.TELEGRAM_ORDER_TOPIC_ID)
 
 
 async def send_order_alert(order: "OrderOut", pdf_bytes: bytes | None = None) -> None:
@@ -300,7 +250,9 @@ async def send_order_alert(order: "OrderOut", pdf_bytes: bytes | None = None) ->
 
     import httpx
 
-    caption, doc_word = _order_alert_caption(order)
+    alert = render_order_alert(order)
+    caption = alert.caption()
+    doc_word = _document_word(order)
     reply_markup = {
         "inline_keyboard": [[
             {"text": "✅ Delivered", "callback_data": f"order:{order.id}:delivered"},
@@ -352,9 +304,10 @@ async def send_order_alert(order: "OrderOut", pdf_bytes: bytes | None = None) ->
                         "Telegram rejected the order alert for order %s: %s",
                         order.id, _describe_response(resp),
                     )
-                    await _send_order_alert_without_pdf(order, caption, reply_markup)
+                    await _send_order_alert_without_pdf(order, alert, reply_markup)
                     return
                 logger.info("Telegram order alert sent for order %s.", order.id)
+                await _send_items_followup(order, alert, resp)
                 return
     except Exception as exc:
         logger.warning(
@@ -364,18 +317,57 @@ async def send_order_alert(order: "OrderOut", pdf_bytes: bytes | None = None) ->
         await _send_order_alert_without_pdf(order, caption, reply_markup)
 
 
-async def _send_order_alert_without_pdf(order: "OrderOut", caption: str, reply_markup: dict) -> None:
+async def _send_items_followup(order: "OrderOut", alert: OrderAlert, document_response) -> None:
+    """Posts the line items underneath an alert whose caption couldn't hold them.
+
+    A document's caption is capped at 1024 characters (a plain message gets 4096), so
+    an order past roughly a dozen lines cannot carry its own item list - the caption
+    falls back to the compact rendering and the full list arrives here instead, as a
+    reply threaded under the document so the two read as one thing.
+
+    The buttons deliberately stay on the document, not on this: exactly one message
+    per order is actionable, and the webhook's message_id handling is unchanged.
+    Nothing here is fatal - the alert itself has already landed, and losing the
+    itemisation is worth strictly less than the noise of a retry storm."""
+    if not alert.needs_items_followup:
+        return
+    try:
+        message_id = ((document_response.json() or {}).get("result") or {}).get("message_id")
+    except Exception:
+        message_id = None
+    for chunk in split_for_messages(alert.items_message):
+        await send_telegram_message(
+            chunk,
+            topic_id=settings.TELEGRAM_ORDER_TOPIC_ID,
+            reply_to_message_id=message_id,
+        )
+
+
+async def _send_order_alert_without_pdf(
+    order: "OrderOut", alert: OrderAlert, reply_markup: dict
+) -> None:
     """Last-resort alert when sendDocument fails (upload timed out, connection dropped,
     Telegram rejected the file...). A text message is small enough to get through almost
     anything the document upload can't, so a placed order is never silently invisible -
     staff still get the order number, clinic and total, plus the same Delivered/Cancelled
     buttons, and can pull the PDF from the admin Orders page. Deliberately not retried
-    beyond this: one alert, degraded, beats none."""
+    beyond this: one alert, degraded, beats none.
+
+    The FULL rendering is used here, not alert.caption(): the 1024-character cap that
+    forces the compact one is a property of document captions, and this is a plain
+    message with four times the room. With no PDF to open, the itemisation is the only
+    record of what was ordered that reaches the chat at all."""
     import httpx
 
+    notice = render_pdf_missing_notice()
+    text = alert.full + "\n\n" + notice
+    if visible_length(text) > MESSAGE_LIMIT:
+        # A genuinely enormous order. Shedding the item list is better than having
+        # Telegram reject the one message that says an order exists at all.
+        text = alert.compact + "\n\n" + notice
     payload = {
         "chat_id": settings.TELEGRAM_CHAT_ID,
-        "text": caption + "\n\n⚠️ <i>The quotation PDF could not be attached - open the order in the admin Orders page to print it.</i>",
+        "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
         "reply_markup": json.dumps(reply_markup),

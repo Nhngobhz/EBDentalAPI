@@ -9,7 +9,6 @@ in addition to going to the console and to app.log.
 The Telegram send happens in a short-lived daemon thread so a slow/broken
 Telegram API never blocks a request.
 """
-import html
 import logging
 import logging.handlers
 import threading
@@ -31,23 +30,40 @@ class TelegramErrorHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
             return
+        # The record is taken apart here rather than run through self.format(): the
+        # cause and the traceback are formatted very differently for a phone screen
+        # (see telegram_format.render_error), and only this side still has them as
+        # separate things.
         try:
-            message = self.format(record)
+            summary = record.getMessage()
+            traceback_text = (
+                self.formatter.formatException(record.exc_info)
+                if record.exc_info and self.formatter
+                else None
+            )
         except Exception:
             return
         threading.Thread(
-            target=self._send, args=(message, record.levelname), daemon=True
+            target=self._send,
+            args=(record.levelname, record.name, summary, traceback_text),
+            daemon=True,
         ).start()
 
     @staticmethod
-    def _send(message: str, level: str) -> None:
+    def _send(level: str, logger_name: str, summary: str, traceback_text: str | None) -> None:
         try:
+            # Imported here, not at module scope: this module is imported by
+            # app.config's consumers before most of the app exists, and the renderer
+            # has no business being on that path until something actually fails.
+            from app.services.telegram_format import render_error
+
             url = _TELEGRAM_URL.format(token=settings.TELEGRAM_BOT_TOKEN)
-            # Escaped: this is sent with parse_mode=HTML, and the log line it wraps
-            # routinely contains "<" (repr of an object, a generic type, a snippet
-            # of user input). Unescaped, Telegram rejected the whole message - so
-            # exactly the errors most worth seeing were the ones that never arrived.
-            text = f"\U0001F6A8 <b>{html.escape(level)}</b>\n<pre>{html.escape(message[:3500])}</pre>"
+            # render_error escapes everything it interpolates: this is sent with
+            # parse_mode=HTML, and a log line routinely contains "<" (repr of an
+            # object, a generic type, a snippet of user input). Unescaped, Telegram
+            # rejected the whole message - so exactly the errors most worth seeing
+            # were the ones that never arrived.
+            text = render_error(level, logger_name, summary, traceback_text)
             payload = {
                 "chat_id": settings.TELEGRAM_CHAT_ID,
                 "text": text,

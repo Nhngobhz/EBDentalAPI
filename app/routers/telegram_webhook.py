@@ -18,12 +18,37 @@ from app.config import settings
 from app.core.logging_conf import get_logger
 from app.database import get_db
 from app.models import Order
+from app.schemas import OrderOut
 from app.services.telegram import answer_callback_query, clear_order_alert_buttons
+from app.services.telegram_format import render_order_alert, render_status_change
 
 router = APIRouter(prefix="/telegram", tags=["Telegram"])
 logger = get_logger("telegram_webhook")
 
 _VALID_STATUSES = {"delivered", "cancelled"}
+
+
+def _caption_after_decision(order: Order, message: dict, label: str) -> str:
+    """The alert's caption once Delivered/Cancelled has been pressed.
+
+    Rendered afresh from the order rather than reused from the message. Telegram hands
+    a caption back as PLAIN text - every entity it parsed on the way in is gone - so
+    the previous version, which re-escaped that and sent it as HTML, silently stripped
+    all the bold, the structure and the Maps link off the alert the moment anyone
+    touched a button. Re-rendering also means the caption reflects any edit made to the
+    order since it was announced.
+
+    The compact/full choice is re-run because editMessageCaption enforces the same
+    1024-character cap that sendDocument does.
+
+    The old plain-text rebuild survives as the fallback: a failure to re-render must
+    still clear the buttons, or the decision stays clickable forever."""
+    try:
+        alert = render_order_alert(OrderOut.model_validate(order))
+        return render_status_change(alert.caption(), label)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not re-render the caption for order %s: %s", order.id, exc)
+        return render_status_change(html.escape(message.get("caption") or "", quote=False), label)
 
 
 @router.post("/webhook/{secret}")
@@ -83,12 +108,9 @@ async def telegram_webhook(
         label = "Delivered ✅" if new_status == "delivered" else "Cancelled ❌"
         await answer_callback_query(callback_query["id"], f"Order marked {label}.")
         if chat_id is not None and message_id is not None:
-            # Telegram hands the caption back as PLAIN text (the HTML entities it
-            # parsed on the way in are gone), and editMessageCaption re-parses it as
-            # HTML - so it has to be re-escaped or a clinic name containing "<"
-            # makes the edit fail and the buttons stay clickable forever.
-            original_caption = html.escape(message.get("caption") or "", quote=False)
-            await clear_order_alert_buttons(chat_id, message_id, f"{original_caption}\n\nStatus: {label}")
+            await clear_order_alert_buttons(
+                chat_id, message_id, _caption_after_decision(order, message, label)
+            )
     finally:
         db.close()
 

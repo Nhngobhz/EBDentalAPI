@@ -4310,13 +4310,91 @@ def test_editing_an_order_rejects_a_blank_required_field(client, db_session, mon
     assert body["contact_person"] is None
 
 
+def _press_order_button(client, monkeypatch, order_id, action="delivered"):
+    """Drive one Delivered/Cancelled button press through the real webhook, returning
+    the caption it tried to write back. Both outbound Telegram calls are stubbed - the
+    point is what we would have sent, not sending it."""
+    from app.routers import telegram_webhook as hook
+
+    monkeypatch.setattr(settings, "TELEGRAM_WEBHOOK_SECRET", "s3cret")
+    sent = {}
+
+    async def fake_clear(chat_id, message_id, new_caption):
+        sent["caption"] = new_caption
+
+    async def fake_answer(callback_query_id, text):
+        sent["answer"] = text
+
+    monkeypatch.setattr(hook, "clear_order_alert_buttons", fake_clear)
+    monkeypatch.setattr(hook, "answer_callback_query", fake_answer)
+
+    resp = client.post(
+        "/telegram/webhook/s3cret",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "s3cret"},
+        json={
+            "callback_query": {
+                "id": "cbq-1",
+                "data": f"order:{order_id}:{action}",
+                # Telegram hands the caption back as PLAIN text - every entity it
+                # parsed on the way in is gone. Reusing this is what used to strip
+                # the formatting off the alert.
+                "message": {"message_id": 77, "chat": {"id": -100123}, "caption": "NEW QUOTE"},
+            }
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    return sent
+
+
+def test_pressing_delivered_keeps_the_alert_formatted(client, db_session, monkeypatch):
+    """The button press used to rebuild the caption from Telegram's plain-text copy,
+    so every bold header and the Maps link vanished the moment anyone tapped it. The
+    caption is re-rendered from the order instead."""
+    make_admin(db_session, email="tgbutton@example.com", password="password123")
+    headers = auth_header(client, "tgbutton@example.com", "password123")
+    product = _make_order_product(client, headers)
+    order = client.post(
+        "/orders/",
+        json=_order_payload(
+            product["id"],
+            clinic_name="Sunrise Dental",
+            latitude="11.5564",
+            longitude="104.9282",
+        ),
+        headers=headers,
+    ).json()
+
+    sent = _press_order_button(client, monkeypatch, order["id"])
+
+    caption = sent["caption"]
+    assert "<b>Status: Delivered ✅</b>" in caption
+    assert "<b>Sunrise Dental</b>" in caption  # markup survived
+    assert "NEW QUOTE" in caption
+    assert 'href="https://www.google.com/maps?q=11.556400,104.928200"' in caption
+    assert "Quoted Widget" in caption  # and so did the itemisation
+    assert client.get(f"/orders/{order['id']}", headers=headers).json()["status"] == "delivered"
+
+
+def test_pressing_cancelled_records_the_status(client, db_session, monkeypatch):
+    make_admin(db_session, email="tgbutton2@example.com", password="password123")
+    headers = auth_header(client, "tgbutton2@example.com", "password123")
+    product = _make_order_product(client, headers)
+    order = client.post("/orders/", json=_order_payload(product["id"]), headers=headers).json()
+
+    sent = _press_order_button(client, monkeypatch, order["id"], action="cancelled")
+
+    assert "<b>Status: Cancelled ❌</b>" in sent["caption"]
+    assert client.get(f"/orders/{order['id']}", headers=headers).json()["status"] == "cancelled"
+
+
 def test_paid_quote_alert_is_an_invoice_not_a_new_quote():
     """A quote whose payment staff recorded is a completed sale - the Telegram alert
     must not still say "no payment has been made" just because order_type is "quote",
     and the attached document is named for what it now is (an Invoice since
     2026-08-17, "Receipt" before that)."""
     from app.schemas import OrderOut
-    from app.services.telegram import _order_alert_caption
+    from app.services.telegram import _document_word
+    from app.services.telegram_format import render_order_alert
 
     base = {
         "id": 1, "order_number": "000001", "quote_code": "260808010101",
@@ -4326,19 +4404,20 @@ def test_paid_quote_alert_is_an_invoice_not_a_new_quote():
         "order_type": "quote", "created_at": "2026-08-08T00:00:00Z",
         "updated_at": "2026-08-08T00:00:00Z",
     }
-    unpaid_caption, unpaid_doc = _order_alert_caption(OrderOut(**base))
-    assert unpaid_doc == "Quotation"
-    assert "no payment has been made" in unpaid_caption
+    unpaid = OrderOut(**base)
+    assert _document_word(unpaid) == "Quotation"
+    assert "no payment received yet" in render_order_alert(unpaid).full
 
-    paid_caption, paid_doc = _order_alert_caption(OrderOut(**{**base, "payment_status": "paid"}))
-    assert paid_doc == "Invoice"
+    paid = OrderOut(**{**base, "payment_status": "paid"})
+    paid_caption = render_order_alert(paid).full
+    assert _document_word(paid) == "Invoice"
     assert "PAID" in paid_caption
-    assert "no payment has been made" not in paid_caption
+    assert "no payment received yet" not in paid_caption
     assert "via KHQR" not in paid_caption  # no method recorded - don't invent one
 
-    khqr_caption, _ = _order_alert_caption(
+    khqr_caption = render_order_alert(
         OrderOut(**{**base, "order_type": "order", "payment_method": "khqr", "payment_status": "paid"})
-    )
+    ).full
     assert "PAID via KHQR" in khqr_caption
 
 
@@ -5025,7 +5104,7 @@ def test_a_paid_order_prints_as_an_invoice(client, db_session):
     matches the title inside the file."""
     from app.schemas import OrderOut
     from app.services.invoice_pdf import build_invoice_pdf, document_title
-    from app.services.telegram import _order_alert_caption
+    from app.services.telegram import _document_word
 
     base = {
         "id": 1, "order_number": "000001", "quote_code": "260817120000",
@@ -5043,7 +5122,7 @@ def test_a_paid_order_prints_as_an_invoice(client, db_session):
     # A paid *order* (customer KHQR purchase), not just a paid quote, prints the same.
     assert document_title(OrderOut(**{**base, "order_type": "order", "payment_status": "paid"})) == "Invoice"
 
-    assert _order_alert_caption(paid)[1] == document_title(paid)
+    assert _document_word(paid) == document_title(paid)
     # Both still build - the title change didn't break the layout either way.
     assert build_invoice_pdf(unpaid)[:4] == b"%PDF"
     assert build_invoice_pdf(paid)[:4] == b"%PDF"
