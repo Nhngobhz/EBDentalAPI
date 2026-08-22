@@ -291,13 +291,23 @@ PDFs must be `application/pdf` and ≤20MB. A rejected upload returns `400`
 with the reason in `detail`, not a generic validation error - check the
 file's actual `Content-Type` header if this happens unexpectedly.
 
-Uploaded files are stored in Cloudflare R2 (`app/core/storage.py`); the
-`*_image`/`pdf` fields returned in responses are full `https://` URLs
-pointing at the R2 bucket's public domain. If R2 isn't configured (no
-`R2_ACCESS_KEY_ID` set, e.g. in local dev), uploads fall back to local disk
-under `static/uploads/<category>/` and are returned as `/static/...` paths
-instead - either way, treat the field as an opaque URL/path to display or
-link to, not something to construct yourself.
+Uploaded files are stored on local disk (`app/core/storage.py`) under
+`static/uploads/<category>/`, and the `*_image`/`pdf` fields returned in
+responses are root-relative `/static/uploads/...` paths served by this API's
+own `/static` mount.
+
+This changed in August 2026. Files used to live in a Cloudflare R2 bucket and
+those fields used to be absolute `https://pub-....r2.dev/...` URLs; the system
+now runs self-hosted, so `scripts/localize_media.py` mirrored the bucket onto
+disk and repointed every row. The R2 code path still exists and still wins
+whenever `R2_ACCESS_KEY_ID` and friends are set - they are commented out in
+`.env`, so don't re-enable them casually.
+
+Either way, treat the field as an opaque URL/path to display or link to, not
+something to construct yourself: it may be absolute or root-relative depending
+on when the row was written, and the Flask app's `resolve_image_url()`
+(`formatting.py`) is what turns the relative form into a browsable URL against
+`STORE_API_BASE_URL`.
 
 ---
 

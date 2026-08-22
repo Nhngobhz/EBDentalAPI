@@ -35,15 +35,18 @@ from pathlib import Path
 
 from app.database import SessionLocal
 from app.models import (
+    AppSetting,
     Brand,
     Category,
     Customer,
+    HeroSlide,
     Manual,
     Product,
     ProductFreeItem,
     ProductImage,
     Promotion,
     PromotionItem,
+    QrCode,
     Set,
     SetItem,
     SetOptionChoice,
@@ -204,6 +207,7 @@ def export_products(db) -> list[dict]:
                 "product_code": p.product_code,
                 "uom": p.uom,
                 "badge": p.badge,
+                "section": p.section,
                 "is_purchasable": p.is_purchasable,
                 "product_image": p.product_image,
                 "images": [img.image for img in images],
@@ -221,6 +225,7 @@ def export_manuals(db) -> list[dict]:
     return [
         {
             "product": m.product.product_name,
+            "title": m.title,
             "description": m.description,
             "manual_image": m.manual_image,
             "pdf": m.pdf,
@@ -320,6 +325,7 @@ def export_users(db) -> list[dict]:
             "price_listing": u.price_listing,
             "product_management": u.product_management,
             "customer_management": u.customer_management,
+            "admin": u.admin,
             "is_active": u.is_active,
             "is_verified": u.is_verified,
         }
@@ -336,6 +342,9 @@ def export_customers(db) -> list[dict]:
             "address": c.address,
             "phone_num": c.phone_num,
             "customer_image": c.customer_image,
+            "latitude": _num(c.latitude),
+            "longitude": _num(c.longitude),
+            "map_link": c.map_link,
             "date_of_birth": c.date_of_birth.isoformat() if c.date_of_birth else None,
             "gender": c.gender,
             "access_permission": c.access_permission,
@@ -343,6 +352,56 @@ def export_customers(db) -> list[dict]:
             "is_verified": c.is_verified,
         }
         for c in db.query(Customer).order_by(Customer.id).all()
+    ]
+
+
+def export_app_settings(db) -> list[dict]:
+    """The site-wide settings that have been overridden away from their spec
+    default. Keyed by `key`, which is the table's own primary key, so no
+    natural-key translation is needed. Rows for keys the spec no longer defines
+    are exported as they are - the reader ignores them, same as the app does."""
+    return [
+        {"key": s.key, "value": s.value}
+        for s in db.query(AppSetting).order_by(AppSetting.key).all()
+    ]
+
+
+def export_qr_codes(db) -> list[dict]:
+    """The contact page's department QR cards. `title` is the natural key on the
+    way back in."""
+    return [
+        {
+            "title": q.title,
+            "subtitle": q.subtitle,
+            "qr_image": q.qr_image,
+            "badge_label": q.badge_label,
+            "badge_variant": q.badge_variant,
+            "badge_icon": q.badge_icon,
+            "sort_order": q.sort_order,
+        }
+        for q in db.query(QrCode).order_by(QrCode.sort_order, QrCode.id).all()
+    ]
+
+
+def export_hero_slides(db) -> list[dict]:
+    """The storefront hero carousel. `heading` is the natural key - two slides
+    with the same heading would be indistinguishable to a reader anyway. The
+    promotion-derived first slide is not here: the template builds that one from
+    the live Promotion, it is not a row."""
+    return [
+        {
+            "heading": h.heading,
+            "heading_highlight": h.heading_highlight,
+            "subheading": h.subheading,
+            "slide_image": h.slide_image,
+            "badge_label": h.badge_label,
+            "badge_icon": h.badge_icon,
+            "button_label": h.button_label,
+            "button_url": h.button_url,
+            "is_active": h.is_active,
+            "sort_order": h.sort_order,
+        }
+        for h in db.query(HeroSlide).order_by(HeroSlide.sort_order, HeroSlide.id).all()
     ]
 
 
@@ -357,6 +416,9 @@ def main() -> None:
         sets = export_sets(db)
         users = export_users(db)
         customers = export_customers(db)
+        app_settings = export_app_settings(db)
+        qr_codes = export_qr_codes(db)
+        hero_slides = export_hero_slides(db)
     finally:
         db.close()
 
@@ -384,6 +446,14 @@ def main() -> None:
             "password they had there.",
         ),
         _block("CUSTOMERS", customers),
+        _block(
+            "APP_SETTINGS",
+            app_settings,
+            "Overrides only. A key absent here reads as its default from\n"
+            "app/core/settings_spec.py, so this block being short is normal.",
+        ),
+        _block("QR_CODES", qr_codes),
+        _block("HERO_SLIDES", hero_slides),
     ]
     OUT_PATH.write_text("\n\n".join(chunks), encoding="utf-8")
 
@@ -397,6 +467,9 @@ def main() -> None:
         ("sets", sets),
         ("users", users),
         ("customers", customers),
+        ("app settings", app_settings),
+        ("qr codes", qr_codes),
+        ("hero slides", hero_slides),
     ]:
         print(f"  {len(rows):>4} {label}")
 

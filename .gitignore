@@ -10,8 +10,10 @@ env/
 app.log
 *.log
 
-static/uploads/**/*
-!static/uploads/**/.gitkeep
+# static/uploads USED to be ignored, back when uploads lived in Cloudflare R2
+# and anything on disk was a throwaway local-dev artifact. Since the move to
+# the self-hosted Windows server that tree IS the media library - the only
+# copy of every product photo, brand logo and manual PDF - so it is committed.
 
 .DS_Store
 .idea/

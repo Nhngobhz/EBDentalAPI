@@ -246,6 +246,10 @@ scripts/create_admin.py   Bootstrap script for the first admin account
 scripts/seed_catalog.py   Replays scripts/seed_data.py into an empty database
 scripts/seed_data.py      GENERATED catalog fixtures (do not hand-edit)
 scripts/export_seed_data.py  Dumps a live database back out as seed_data.py
+scripts/localize_media.py    One-off: pulls the old Cloudflare R2 bucket onto
+                          local disk and repoints the database at it
+static/uploads/           The media library - every product photo, brand logo,
+                          QR card and manual PDF. Committed, not ignored.
 tests/                  pytest suite (run against a real Postgres db)
 schema.sql              Reference DDL dump (informational only)
 docker-compose.yml, Dockerfile, entrypoint.sh
@@ -342,6 +346,32 @@ comments). The important ones:
 | `MAIL_USERNAME` / `MAIL_PASSWORD` / `MAIL_SERVER` / `MAIL_PORT` | SMTP creds. Leave `MAIL_USERNAME` empty to run in "dry run" mode (emails are logged, not sent) - useful while developing |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Leave empty to disable Telegram notifications entirely |
 | `CORS_ORIGINS` | Comma-separated allowed origins, or `*` |
+| `UPLOAD_DIR` | Where uploaded files are written (`static/uploads`), served back at `/static/uploads/...` |
+| `R2_*` | **Disabled.** Cloudflare R2 object storage. Left commented out in `.env` since the move to self-hosting - see "File storage" below |
+
+### File storage
+
+Uploads are written to `UPLOAD_DIR` (`static/uploads/`) and served straight back
+by this API's `/static` mount. Nothing leaves the machine.
+
+This used to be a Cloudflare R2 bucket, with `*_image` / `pdf` columns holding
+absolute `https://pub-....r2.dev/...` URLs. Now that the whole system runs
+self-hosted on a Windows server, every object was mirrored down and every row
+repointed at its local copy by:
+
+```bash
+python -m scripts.localize_media --dry-run   # report first
+python -m scripts.localize_media
+```
+
+The R2 credentials are still in `.env`, commented out, purely so that script can
+be re-run against the bucket if something turns out to be missing.
+**Uncommenting them sends new uploads back to R2** - `app/core/storage.py`
+prefers R2 whenever it is fully configured.
+
+Because `static/uploads/` is now the only copy of the media, it is committed to
+the repository rather than ignored. Back it up with the database, not separately:
+a row pointing at a file that isn't there renders as a broken image.
 
 ### Setting up the Telegram bot
 1. Message **@BotFather** on Telegram → `/newbot` → copy the token into `TELEGRAM_BOT_TOKEN`.

@@ -1,7 +1,8 @@
 """
 Dev helper: fill an empty database with the catalog, bypassing the API -
 brands, categories, products (with their gallery photos and free-with-purchase
-items), manuals, promotions, sets, staff users and customers.
+items), manuals, promotions, sets, staff users, customers, the site-wide
+setting overrides, the contact page's QR cards and the hero carousel slides.
 
 Usage:
     python -m scripts.seed_catalog
@@ -39,15 +40,18 @@ from datetime import date
 
 from app.database import SessionLocal
 from app.models import (
+    AppSetting,
     Brand,
     Category,
     Customer,
+    HeroSlide,
     Manual,
     Product,
     ProductFreeItem,
     ProductImage,
     Promotion,
     PromotionItem,
+    QrCode,
     Set,
     SetItem,
     SetOptionChoice,
@@ -129,6 +133,9 @@ def seed_products(
             product_code=item.get("product_code"),
             uom=item.get("uom"),
             badge=item.get("badge"),
+            # Defaults to the catalog's original single section for a seed file
+            # exported before this column existed.
+            section=item.get("section", "machinery"),
             # Defaults True for a seed file exported before this column existed.
             is_purchasable=item.get("is_purchasable", True),
             product_image=item.get("product_image"),
@@ -208,6 +215,7 @@ def seed_manuals(db, product_by_name: dict[str, Product]) -> None:
 
         manual = Manual(
             product_id=product.id,
+            title=item.get("title"),
             description=item.get("description"),
             manual_image=item.get("manual_image"),
             pdf=item.get("pdf"),
@@ -355,6 +363,9 @@ def seed_users(db) -> None:
             price_listing=item["price_listing"],
             product_management=item["product_management"],
             customer_management=item["customer_management"],
+            # Separate from the four permission flags: a seed file exported before
+            # this flag existed grants it to nobody, which is the safe default.
+            admin=item.get("admin", False),
         )
         db.add(user)
         db.flush()
@@ -375,6 +386,9 @@ def seed_customers(db) -> None:
             address=item.get("address"),
             phone_num=item.get("phone_num"),
             customer_image=item.get("customer_image"),
+            latitude=item.get("latitude"),
+            longitude=item.get("longitude"),
+            map_link=item.get("map_link"),
             date_of_birth=_date(item.get("date_of_birth")),
             gender=item.get("gender"),
             access_permission=item["access_permission"],
@@ -384,6 +398,69 @@ def seed_customers(db) -> None:
         db.add(customer)
         db.flush()
         print(f"Created customer '{customer.email}' (id={customer.id}, vip={customer.access_permission}).")
+
+
+def seed_app_settings(db) -> None:
+    """Site-wide setting overrides. A seed file exported before these were
+    captured has no APP_SETTINGS at all, which just leaves every setting on its
+    spec default - the same thing a fresh database does."""
+    for item in getattr(seed_data, "APP_SETTINGS", []):
+        key = item["key"]
+        existing = db.query(AppSetting).filter(AppSetting.key == key).first()
+        if existing:
+            print(f"Setting '{key}' already set, skipping.")
+            continue
+
+        db.add(AppSetting(key=key, value=item.get("value")))
+        db.flush()
+        print(f"Set '{key}'.")
+
+
+def seed_qr_codes(db) -> None:
+    for item in getattr(seed_data, "QR_CODES", []):
+        title = item["title"]
+        existing = db.query(QrCode).filter(QrCode.title == title).first()
+        if existing:
+            print(f"QR code '{title}' already exists (id={existing.id}), skipping.")
+            continue
+
+        qr = QrCode(
+            title=title,
+            subtitle=item.get("subtitle"),
+            qr_image=item.get("qr_image"),
+            badge_label=item.get("badge_label"),
+            badge_variant=item.get("badge_variant"),
+            badge_icon=item.get("badge_icon"),
+            sort_order=item.get("sort_order", 0),
+        )
+        db.add(qr)
+        db.flush()
+        print(f"Created QR code '{title}' (id={qr.id}).")
+
+
+def seed_hero_slides(db) -> None:
+    for item in getattr(seed_data, "HERO_SLIDES", []):
+        heading = item["heading"]
+        existing = db.query(HeroSlide).filter(HeroSlide.heading == heading).first()
+        if existing:
+            print(f"Hero slide '{heading}' already exists (id={existing.id}), skipping.")
+            continue
+
+        slide = HeroSlide(
+            heading=heading,
+            heading_highlight=item.get("heading_highlight"),
+            subheading=item.get("subheading"),
+            slide_image=item.get("slide_image"),
+            badge_label=item.get("badge_label"),
+            badge_icon=item.get("badge_icon"),
+            button_label=item.get("button_label"),
+            button_url=item.get("button_url"),
+            is_active=item.get("is_active", True),
+            sort_order=item.get("sort_order", 0),
+        )
+        db.add(slide)
+        db.flush()
+        print(f"Created hero slide '{heading}' (id={slide.id}).")
 
 
 def main() -> None:
@@ -398,6 +475,9 @@ def main() -> None:
         seed_sets(db, product_by_name, brand_by_name)
         seed_users(db)
         seed_customers(db)
+        seed_app_settings(db)
+        seed_qr_codes(db)
+        seed_hero_slides(db)
         db.commit()
         print("Done.")
     finally:
