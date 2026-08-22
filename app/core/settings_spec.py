@@ -33,7 +33,11 @@ class Setting:
     key: str
     group: str
     label: str
-    type: str  # text | textarea | url | email | number | bool
+    # image: the value is a stored picture URL/path (exactly like every *_image field
+    # in the schema - see app/core/files.py), written by POST /settings/image/{key}
+    # rather than typed. Anything that renders the form has to offer a file input for
+    # it, not a text box.
+    type: str  # text | textarea | url | email | number | bool | image
     default: Any
     help: str = ""
     public: bool = True
@@ -161,6 +165,25 @@ _DOCUMENT = (
             "Printed as \"Tel: <value>\" under the letterhead name."),
     Setting("quote_validity_days", "document", "Quote validity (days)", "number", 30,
             "How long a quotation says it stays valid for.", minimum=1, maximum=365),
+    # The rest of the terms box printed at the foot of a QUOTATION, under the validity
+    # line: two more lines of standing wording, and the bank QR with the account name
+    # under it. Quotation only - an invoice is already paid and a cancelled order is not
+    # payable, so neither prints a "scan to pay" QR (see buildPrintTemplate in main.js
+    # and build_invoice_pdf here; both drop the whole block).
+    Setting("quote_deposit_note", "document", "Deposit line", "text",
+            "After receiving the deposit, Seller shall issue Proforma Invoice.",
+            "Printed under the validity line. Leave empty to drop the line."),
+    Setting("quote_payment_note", "document", "Payment line", "text",
+            "ABA Bank Account: Please scan QR code for payment",
+            "Printed under the deposit line, next to the QR. Leave empty to drop it."),
+    Setting("quote_payment_qr", "document", "Payment QR picture", "image", "",
+            "The bank QR printed at the right of that box. Upload the picture your "
+            "banking app produced - it is stored exactly as uploaded (never "
+            "re-compressed), because JPEG ringing around a QR's hard edges is what "
+            "makes a small printed code fail to scan."),
+    Setting("quote_payment_qr_caption", "document", "Payment QR caption", "text",
+            "Bong Sucheng Home 49",
+            "The account name printed under the QR."),
     # Keys still say "receipt" because the printed document was called one until
     # 2026-08-17; only the word on the page (and these labels) changed, and renaming a
     # settings key would strand whatever the admin had typed under the old one.
@@ -296,6 +319,16 @@ def coerce(key: str, raw: Any) -> Any:
         if not value.startswith(("http://", "https://", "tel:", "mailto:")):
             raise SettingError(
                 f"{spec.label} must start with http://, https://, tel: or mailto:"
+            )
+    if spec.type == "image" and value:
+        # Normally written by POST /settings/image/{key}, which stores whatever
+        # save_object() returned - an R2 URL or a local "/static/uploads/..." path.
+        # A hand-written PUT could still put anything here, and the value lands in a
+        # src= on the printed quote, so the same javascript:/data: guard as `url`
+        # applies - plus the site-relative form the local-disk fallback produces.
+        if not value.startswith(("http://", "https://", "/")):
+            raise SettingError(
+                f"{spec.label} must be an uploaded picture, or a full https:// URL"
             )
     if spec.type == "email" and value and "@" not in value:
         raise SettingError(f"{spec.label} must be an email address")

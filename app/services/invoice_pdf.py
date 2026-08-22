@@ -25,16 +25,21 @@ the rendered glyphs themselves are correct. This is a narrow fpdf2/HarfBuzz-shap
 bug, not something introduced here - only affects text extraction/searchability, never
 what's actually printed/displayed.
 """
+import io
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
+import httpx
 from fpdf import FPDF
 from fpdf.enums import TableBordersLayout
 from fpdf.fonts import FontFace
 
+from app.core.logging_conf import get_logger
 from app.schemas import OrderOut
 from app.services import app_settings
+
+logger = get_logger("invoice_pdf")
 
 _FONTS_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
 # Mirrors the website print template's font stack exactly: 'Inter' is the default
@@ -106,6 +111,40 @@ def _item_display_amount(old_unit_price: Decimal, line_amount, qty, discount_typ
 
 def _money(value) -> str:
     return f"$ {Decimal(value):.2f}"
+
+
+# The payment-QR block in the terms box at the foot of a quotation. Sizes in mm, since
+# that is the unit build_invoice_pdf() works in. 24mm is about what the paper original
+# prints and comfortably above the ~15mm where a phone camera starts to struggle.
+_QR_SIZE_MM = 24
+_QR_CAPTION_MM = 4  # the account-name line under the QR
+_QR_GUTTER_MM = 3  # gap kept clear between the wrapped terms text and the QR
+
+
+def _payment_qr_image(url: str):
+    """The configured payment QR as a file-like object fpdf2 can place, or None.
+
+    The stored value is an ordinary image field (app/core/files.py): a full R2 URL, or
+    a "/static/uploads/..." path this same container serves off its own disk.
+
+    Every failure returns None rather than raising. This runs inside the Telegram
+    order alert, and a QR that 404s must not be the reason a customer's quotation
+    never gets built - the document simply prints without it.
+    """
+    url = (url or "").strip()
+    if not url:
+        return None
+    try:
+        if url.startswith(("http://", "https://")):
+            response = httpx.get(url, timeout=5.0, follow_redirects=True)
+            response.raise_for_status()
+            return io.BytesIO(response.content)
+        # Local-disk fallback: the leading "/" is the URL path, not a filesystem root -
+        # UPLOAD_DIR is relative to the process's working directory (see storage.py).
+        return io.BytesIO(Path(url.lstrip("/")).read_bytes())
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        logger.warning("Could not load the quotation payment QR from %r: %s", url, exc)
+        return None
 
 
 CANCELLED_NOTE = "This order was cancelled. It is not an invoice and is not payable."
@@ -182,10 +221,27 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
         if order.payment_method == "khqr"
         else site["receipt_note_cash"]
     )
-    validity_note = (
-        CANCELLED_NOTE if is_cancelled
-        else f"Quotation valid for {site['quote_validity_days']} days from the date issued."
+    # The terms box at the foot of the item table. A quotation carries the shop's
+    # standing terms and the bank QR to pay against; a paid invoice and a cancelled
+    # order each carry one line saying so and no QR - "please scan to pay" on a document
+    # that is already settled, or void, reads as a mistake. Mirrored by the
+    # validityNote/termsLines block in buildPrintTemplate() in the website's main.js.
+    if is_paid_document:
+        terms_lines = [paid_note]
+    elif is_cancelled:
+        terms_lines = [CANCELLED_NOTE]
+    else:
+        terms_lines = [
+            line for line in (
+                f"Quotation is valid for {site['quote_validity_days']} days from the date issued.",
+                site["quote_deposit_note"],
+                site["quote_payment_note"],
+            ) if line
+        ]
+    qr_image = None if (is_paid_document or is_cancelled) else _payment_qr_image(
+        site["quote_payment_qr"]
     )
+    qr_caption = site["quote_payment_qr_caption"] if qr_image is not None else ""
 
     # ---- header: brand (left) / the document title + No/Date (right) ----
     # Font sizes/positions mirror qpt-brand-name/qpt-title (1.6-1.7rem) and
@@ -290,6 +346,24 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
     col_widths = (8, 18, 50, 10, 12, 24, 38, 30)
     _use_latin_font(pdf, 8)
 
+    # The terms cell spans the first six columns, and the QR is drawn into the right
+    # end of it AFTER the table (fpdf2 cells hold either text or an image, never both).
+    # Nothing stops a cell's own text from wrapping the full width and running straight
+    # under that picture - so the lines are wrapped HERE, against the narrower width the
+    # QR actually leaves, and handed to the cell already broken. Measured with the same
+    # font and size the table is about to render in, which is why this sits after
+    # _use_latin_font above.
+    terms_width = sum(col_widths[:6])
+    _CELL_PADDING = 1.2  # the table's `padding=` below, per side
+    text_width = terms_width - 2 * _CELL_PADDING
+    if qr_image is not None:
+        text_width -= _QR_SIZE_MM + _QR_GUTTER_MM
+    terms_text = "\n".join(
+        line
+        for source in terms_lines
+        for line in pdf.multi_cell(text_width, 5, source, dry_run=True, output="LINES")
+    )
+
     khmer_style = FontFace(family=_KHMER_FONT)
     undiscounted_subtotal = Decimal("0")
     # Only $ (cash) item discounts feed the "Discount($)" total row - a % item discount
@@ -380,10 +454,7 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
                 row.cell("")
 
         totals_row = table.row()
-        totals_row.cell(
-            paid_note if is_paid_document else validity_note,
-            colspan=6, rowspan=4, align="L", v_align="TOP",
-        )
+        totals_row.cell(terms_text, colspan=6, rowspan=4, align="L", v_align="TOP")
         totals_row.cell("Sub-Total($):", colspan=1, align="L")
         totals_row.cell(_money(undiscounted_subtotal), align="R")
 
@@ -399,6 +470,27 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
         row4 = table.row()
         row4.cell("Grand Total:", style=bold, align="L")
         row4.cell(_money(order.grand_total), style=bold, align="R")
+
+    # ---- payment QR, drawn into the terms cell the table just laid out ----
+    # Bottom-anchored, because the only coordinate fpdf2 gives back for a table is where
+    # the table ended - and the four totals rows this cell spans are always taller than
+    # the QR block, so sitting it on the cell's bottom edge needs no row-height
+    # arithmetic and stays correct if a row ever grows.
+    if qr_image is not None:
+        table_bottom = pdf.get_y()
+        qr_x = pdf.l_margin + terms_width - _CELL_PADDING - _QR_SIZE_MM
+        caption_top = table_bottom - _CELL_PADDING - _QR_CAPTION_MM
+        pdf.image(qr_image, x=qr_x, y=caption_top - _QR_SIZE_MM, w=_QR_SIZE_MM, h=_QR_SIZE_MM)
+        if qr_caption:
+            # Right-aligned to the QR's own right edge, running left into the space the
+            # wrapped terms text was kept out of - the account name is longer than the
+            # picture is wide.
+            _use_latin_font(pdf, 7)
+            pdf.set_xy(qr_x - 20, caption_top)
+            pdf.cell(_QR_SIZE_MM + 20, _QR_CAPTION_MM, qr_caption, align="R")
+        # set_xy above moved the cursor into the middle of the table; put it back on the
+        # table's bottom edge so the signature strip lands where it always did.
+        pdf.set_y(table_bottom)
 
     # ---- signature strip, mirrors qpt-sign-strip ----
     pdf.ln(14)

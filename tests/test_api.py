@@ -4659,6 +4659,90 @@ def test_invoice_pdf_uses_the_configured_letterhead(client, db_session):
     assert values["quote_validity_days"] == 7
 
 
+def test_a_payment_qr_is_uploaded_rather_than_typed(client, db_session):
+    """`image`-typed settings hold a stored picture URL that only the upload endpoint
+    writes - there is no text box for one on the Settings screen."""
+    make_admin(db_session, email="qrsetting@example.com", password="password123")
+    headers = auth_header(client, "qrsetting@example.com", "password123")
+
+    resp = client.post(
+        "/settings/image/quote_payment_qr",
+        files={"file": ("aba.png", _png_bytes(), "image/png")},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    stored = resp.json()["value"]
+    assert stored.startswith("/static/uploads/settings/")
+
+    # Public: the printed quote is built in the customer's own browser.
+    assert client.get("/settings/public").json()["quote_payment_qr"] == stored
+
+
+def test_only_picture_settings_accept_an_upload(client, db_session):
+    make_admin(db_session, email="qrsetting2@example.com", password="password123")
+    headers = auth_header(client, "qrsetting2@example.com", "password123")
+
+    files = {"file": ("aba.png", _png_bytes(), "image/png")}
+    assert client.post(
+        "/settings/image/document_brand_name", files=files, headers=headers
+    ).status_code == 400
+    assert client.post(
+        "/settings/image/not_a_setting", files=files, headers=headers
+    ).status_code == 404
+
+    # And a typed value still has to look like a stored picture, not a javascript: URL
+    # - it lands in a src= on the printed quote.
+    resp = client.put(
+        "/settings/",
+        json={"values": {"quote_payment_qr": "javascript:alert(1)"}},
+        headers=headers,
+    )
+    assert resp.status_code == 400
+
+
+def test_the_payment_qr_prints_on_a_quotation_but_not_once_it_is_paid(client, db_session):
+    """The terms box carries the bank QR only while there is still something to pay -
+    a paid invoice and a cancelled order print their own one-line note instead. The
+    same rule lives in buildPrintTemplate() in the website's main.js; see the
+    eb-quote-parity skill."""
+    from app.schemas import OrderOut
+    from app.services import invoice_pdf
+
+    make_admin(db_session, email="qrprint@example.com", password="password123")
+    headers = auth_header(client, "qrprint@example.com", "password123")
+    client.post(
+        "/settings/image/quote_payment_qr",
+        files={"file": ("aba.png", _png_bytes(), "image/png")},
+        headers=headers,
+    )
+
+    asked_for = []
+    original = invoice_pdf._payment_qr_image
+    invoice_pdf._payment_qr_image = lambda url: asked_for.append(url) or original(url)
+    try:
+        def build(**overrides):
+            payload = {
+                "id": 1, "order_number": "EB-9", "quote_code": "260822120000",
+                "items": [], "clinic_name": "C", "phone": "012", "address": "1 St",
+                "discount_type": "cash", "discount_value": "0", "discount_amount": "0",
+                "subtotal": "0.00", "grand_total": "0.00", "status": "pending",
+                "order_type": "quote", "created_at": "2026-08-22T00:00:00Z",
+                "updated_at": "2026-08-22T00:00:00Z",
+            }
+            payload.update(overrides)
+            return build_pdf(OrderOut(**payload))
+
+        build_pdf = invoice_pdf.build_invoice_pdf
+        assert build()[:4] == b"%PDF"
+        assert len(asked_for) == 1  # a quotation asks for the picture
+
+        assert build(payment_status="paid")[:4] == b"%PDF"
+        assert build(status="cancelled")[:4] == b"%PDF"
+        assert len(asked_for) == 1  # ... and neither of those did
+    finally:
+        invoice_pdf._payment_qr_image = original
+
+
 # ---------------------------------------------------------------------------
 # Department QR codes (contact page)
 # ---------------------------------------------------------------------------
