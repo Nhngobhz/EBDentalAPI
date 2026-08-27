@@ -24,6 +24,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
+from app.core.activity import set_actor
 from app.core.security import decode_access_token
 from app.database import get_db
 from app.models import Customer, User
@@ -83,6 +84,10 @@ def get_current_user(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated"
         )
+    # Everything this request goes on to write is attributed here, once, rather than
+    # by each router remembering to say so. See app/core/activity.py - it rides on
+    # `db`, which FastAPI hands to the route body as the same Session object.
+    set_actor(db, user=user)
     return user
 
 
@@ -122,6 +127,10 @@ def get_current_customer(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated"
         )
+    # A customer editing their own profile or placing an order is activity too, and
+    # it is the case `updated_by_user_id` explicitly cannot record - there is no
+    # `User` involved, so that column correctly stays NULL and says nothing.
+    set_actor(db, customer=customer)
     return customer
 
 

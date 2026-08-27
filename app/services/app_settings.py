@@ -23,6 +23,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.core.activity import record_event
 from app.core.settings_spec import DEFAULTS, PUBLIC_KEYS, SETTINGS, SettingError, coerce
 from app.database import SessionLocal
 from app.models import AppSetting
@@ -128,6 +129,17 @@ def reset(db: Session, keys: list[str], user_id: int | None = None) -> dict[str,
     if unknown:
         raise SettingError(f"Unknown setting '{unknown[0]}'")
     if keys:
+        # Logged by hand because the delete below is a bulk statement: it never loads
+        # the rows, so the flush listener in app/core/activity.py has nothing to see.
+        # The sibling `save()` needs no such help - it deletes through the ORM.
+        for key in keys:
+            record_event(
+                db,
+                action="settings_reset",
+                entity_type="app_settings",
+                entity_label=key,
+                note="Reset to default",
+            )
         db.query(AppSetting).filter(AppSetting.key.in_(keys)).delete(synchronize_session=False)
         db.commit()
     invalidate()

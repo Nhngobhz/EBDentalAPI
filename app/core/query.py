@@ -7,6 +7,7 @@ Pydantic treats `""` as invalid input for `int | None`, not as "absent" -
 
 `Skip`/`Limit` are the bounded pagination pair every list endpoint uses.
 """
+from datetime import date
 from typing import Annotated
 
 from fastapi import Query
@@ -20,6 +21,11 @@ def _empty_str_to_none(value: object) -> object:
 
 
 OptionalInt = Annotated[int | None, BeforeValidator(_empty_str_to_none)]
+
+# Same problem, same fix, for the date-range filters on the activity log: an admin
+# who clears the "from" box posts `?date_from=`, which is "no lower bound" and not a
+# malformed date.
+OptionalDate = Annotated[date | None, BeforeValidator(_empty_str_to_none)]
 
 # Largest page any caller may request. 500 is exactly what the widest existing
 # caller asks for (the Flask app's catalog/admin pages fetch 200-500 at a time),

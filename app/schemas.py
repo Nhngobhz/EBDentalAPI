@@ -1153,3 +1153,47 @@ class HeroSlideOut(BaseModel):
     updated_by: Optional[UserMini] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+# ---------------------------------------------------------------------------
+# Activity log
+# ---------------------------------------------------------------------------
+class ActivityLogOut(BaseModel):
+    """One recorded change, as the admin screens read it.
+
+    `changes` is deliberately loose - `dict[str, list]` of {field: [old, new]} - and
+    not a typed model per entity. The log spans twenty tables whose columns are
+    strings, numbers, dates and JSON; pinning a schema onto that would mean a schema
+    change every time a column is added, which is exactly the coupling the listener
+    exists to avoid. The screens render it as text either way.
+    """
+
+    id: int
+    occurred_at: datetime
+    actor_type: Literal["user", "customer", "system"]
+    actor_user_id: Optional[int] = None
+    actor_customer_id: Optional[int] = None
+    # The name as it was, not a join to the account - which may have been renamed or
+    # deleted since. See the column comment in models.py.
+    actor_label: Optional[str] = None
+    action: str
+    entity_type: str
+    entity_id: Optional[int] = None
+    entity_label: Optional[str] = None
+    changes: Optional[dict[str, Any]] = None
+    note: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ActivityLogPage(BaseModel):
+    """An envelope rather than a bare list, which every other endpoint here returns.
+
+    The log is the one table with no natural ceiling - products and orders are counted
+    in hundreds, this grows forever - so its screen needs a real pager, and a pager
+    needs to know how many rows the filter matched. `total` is the count BEFORE
+    skip/limit.
+    """
+
+    items: list[ActivityLogOut]
+    total: int

@@ -12,6 +12,7 @@ from app.config import settings
 from app.core.logging_conf import get_logger, setup_logging
 from app.database import Base, engine
 from app.routers import (
+    activity,
     auth,
     brands,
     categories,
@@ -106,6 +107,7 @@ async def add_static_cache_headers(request: Request, call_next):
         response.headers.setdefault("Cache-Control", "public, max-age=3600")
     return response
 
+app.include_router(activity.router)
 app.include_router(auth.router)
 app.include_router(customer_auth.router)
 app.include_router(users.router)

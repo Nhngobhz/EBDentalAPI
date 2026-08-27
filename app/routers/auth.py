@@ -8,6 +8,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.core.activity import record_event
 from app.core.email import send_password_reset_email, send_verification_email
 from app.core.google_auth import GoogleAuthError, verify_google_id_token
 from app.core.logging_conf import get_logger
@@ -136,6 +137,20 @@ async def login(
             )
 
         user.last_login = datetime.now(timezone.utc)
+        # `last_login` is on the activity log's ignore list, so nothing records this
+        # unless it is said explicitly - which it is, because "who was signed in when
+        # that price changed" is half of reading the log at all. Staff only: customer
+        # sign-ins are traffic, not activity, and would bury the entries that matter.
+        # `actor_user` is passed because the session has no actor yet - this request
+        # is what establishes one.
+        record_event(
+            db,
+            action="login",
+            entity_type="users",
+            entity_id=user.id,
+            entity_label=user.user_name,
+            actor_user=user,
+        )
         db.commit()
         record_login_success(request, form_data.username)
 
@@ -183,6 +198,18 @@ async def login(
     # deactivated/unverified branches above raise 403 without recording anything -
     # those callers proved they know the password, they just can't use it yet.
     record_login_failure(request, form_data.username)
+    # Committed here rather than left to the end of the request, which is the one
+    # place that matters: this path raises, so the session is closed without a commit
+    # and the entry would roll back with it. Spraying can't flood the table - the
+    # lockout in check_login_allowed above stops the attempt before it reaches here.
+    record_event(
+        db,
+        action="login_failed",
+        entity_type="users",
+        entity_label=form_data.username,
+        note="Wrong email or password",
+    )
+    db.commit()
     raise unauthorized
 
 
@@ -247,6 +274,15 @@ def google_login(
         if picture and not user.user_image:
             user.user_image = picture
         user.last_login = now
+        record_event(
+            db,
+            action="login",
+            entity_type="users",
+            entity_id=user.id,
+            entity_label=user.user_name,
+            note="Signed in with Google",
+            actor_user=user,
+        )
         db.commit()
         db.refresh(user)
 

@@ -1044,3 +1044,103 @@ class HeroSlide(AuditedMixin, Base):
     sort_order = Column(Integer, nullable=False, server_default="0")
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ActivityLog(Base):
+    """One recorded change: who did what to which row, and what the values were.
+
+    The `AuditedMixin` pair on the entity tables answers "who wrote this row last".
+    That is genuinely all it answers - it is overwritten by the next write, keeps no
+    previous value, and vanishes with the row when something is deleted. This table is
+    the history those columns can't be: append-only, one row per change, holding the
+    old value as well as the new one, and surviving the deletion of whatever it
+    describes.
+
+    Written by the flush listener in app/core/activity.py rather than by calls in the
+    routers, for the same reason `stamp_updated_by` is one helper instead of fifteen
+    assignments - except more so, since a listener also covers the writes nobody
+    remembers to instrument (an order's line items, a set's contents, a product's free
+    items: nine of the twenty tables here carry no audit columns at all).
+
+    Nothing updates or deletes rows here. That is the point of the table, not an
+    oversight - a log that can be edited answers no question worth asking - so there
+    is no `updated_at`, no `AuditedMixin`, and no admin screen that writes to it.
+    """
+
+    __tablename__ = "activity_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Not `created_at`: every other table's `created_at` is when the *thing* came into
+    # being, and confusing the two on a log is how you end up reading the wrong
+    # timeline. Its own column (not the id's implicit order) because ids only
+    # correlate with time within one database.
+    occurred_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+    # "user" (staff), "customer" (self-service), or "system" (the checkout sweep and
+    # anything else with no request behind it). A plain String rather than a DB enum,
+    # like discount_type and order_type - a fourth kind of actor should not need a
+    # migration. The allowed set is the Literal in schemas.py.
+    actor_type = Column(String(20), nullable=False, server_default="system")
+
+    # SET NULL, not CASCADE: deleting a staff member must not quietly erase the record
+    # of what they did. `actor_label` is why that stays readable afterwards.
+    actor_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    actor_customer_id = Column(
+        Integer, ForeignKey("customers.id", ondelete="SET NULL"), nullable=True
+    )
+
+    # The actor's name as it was at the time, copied rather than joined. A join gives
+    # you today's name and nothing at all once the account is gone; this is the same
+    # snapshot reasoning OrderItem uses for product names. Nullable only for "system".
+    actor_label = Column(String(150), nullable=True)
+
+    # "create" / "update" / "delete" for ordinary row changes, plus the handful of
+    # things that aren't row changes at all and would otherwise go unrecorded:
+    # "login", "login_failed", "settings_reset". String, again, so the next one is a
+    # code change only.
+    action = Column(String(30), nullable=False)
+
+    # The __tablename__ of whatever changed ("products", "orders", ...), not a
+    # prettier display name: it is the one identifier that can't drift, and the admin
+    # screen maps it to a label at read time. Indexed with entity_id because the
+    # per-record History panel asks exactly that pair.
+    entity_type = Column(String(60), nullable=False)
+    # Nullable because not everything logged is a row: a failed login has no entity,
+    # and app_settings is keyed by a string rather than an integer (its key goes in
+    # entity_label).
+    entity_id = Column(Integer, nullable=True)
+    # How the row named itself at the time - a product name, an order number. Same
+    # snapshot reasoning as actor_label, and the only thing left to show for a row
+    # that has since been deleted.
+    entity_label = Column(String(300), nullable=True)
+
+    # {"price": [120.0, 95.0], "product_name": ["X", "Y"]} - old first, new second.
+    # JSON rather than a changes table with a row per field, because nothing ever
+    # queries an individual field: this is read back whole, by a human, in the order
+    # it was written. Passwords and tokens are recorded as changed with their values
+    # replaced (see REDACTED_FIELDS in app/core/activity.py) - a log of who changed a
+    # password must not become a log of what it was changed to.
+    changes = Column(JSON, nullable=True)
+
+    # Free text for the things a diff can't say on its own ("marked paid", "confirmed
+    # a KHQR payment"). Nullable and usually empty - most rows are self-explanatory
+    # from action + entity + changes.
+    note = Column(String(500), nullable=True)
+
+    actor_user = relationship("User", foreign_keys=[actor_user_id])
+    actor_customer = relationship("Customer", foreign_keys=[actor_customer_id])
+
+    __table_args__ = (
+        # The two questions the screens actually ask: "what happened lately, filtered
+        # by who/what" (the Reports list) and "what happened to this one row" (the
+        # History panel). The newest-first ordering needs no index of its own -
+        # `occurred_at` already carries index=True, and a single-column btree is read
+        # backwards just as cheaply as forwards.
+        Index("ix_activity_log_entity", "entity_type", "entity_id"),
+        Index("ix_activity_log_actor_user", "actor_user_id"),
+    )

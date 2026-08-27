@@ -5300,3 +5300,284 @@ def test_deleting_a_hero_slide_removes_it_from_the_banner(client, db_session):
     assert client.delete(f"/hero-slides/{slide['id']}", headers=headers).status_code == 204
     assert client.get("/hero-slides/").json() == []
     assert client.get(f"/hero-slides/{slide['id']}").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Activity log
+# ---------------------------------------------------------------------------
+# What these are actually protecting: the log is written by a flush listener
+# (app/core/activity.py), not by the routers, so nothing in a router's own tests
+# would notice it silently stopping. Each test below drives a real endpoint and
+# then asks the log what it saw.
+
+
+def _log(client, headers, **params):
+    resp = client.get("/activity/", params=params, headers=headers)
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def _entries_for(client, headers, entity_type, entity_id):
+    resp = client.get(f"/activity/entity/{entity_type}/{entity_id}", headers=headers)
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def test_activity_log_records_create_update_and_delete(client, db_session):
+    """The whole lifecycle of a row, including the part `updated_by_user_id` cannot
+    reach: after the delete, the log is the only place the brand ever existed."""
+    make_admin(db_session, email="actlog1@example.com", password="password123")
+    headers = auth_header(client, "actlog1@example.com", "password123")
+
+    brand_id = client.post("/brands/", data={"brand_name": "Trackable"}, headers=headers).json()["id"]
+    client.put(f"/brands/{brand_id}", json={"brand_name": "Trackable Renamed"}, headers=headers)
+    assert client.delete(f"/brands/{brand_id}", headers=headers).status_code == 204
+
+    entries = _log(client, headers, entity_type="brands")["items"]
+    # Newest first.
+    assert [e["action"] for e in entries] == ["delete", "update", "create"]
+
+    created, updated, deleted = entries[2], entries[1], entries[0]
+    assert created["changes"]["brand_name"] == [None, "Trackable"]
+    assert updated["changes"]["brand_name"] == ["Trackable", "Trackable Renamed"]
+    # The row is gone; its last known name is not.
+    assert deleted["entity_label"] == "Trackable Renamed"
+    assert deleted["changes"]["brand_name"] == ["Trackable Renamed", None]
+
+
+def test_activity_log_records_the_previous_value_after_an_intervening_commit(client, db_session):
+    """The subtle one. Attribute history alone loses the old value once a commit has
+    expired the object, so a second edit in the same request would file
+    "price: null -> 88.00". app/core/activity.py falls back to reading the pre-flush
+    row; without that fallback this assertion fails and nothing else does."""
+    make_admin(db_session, email="actlog2@example.com", password="password123")
+    headers = auth_header(client, "actlog2@example.com", "password123")
+
+    brand_id = client.post("/brands/", data={"brand_name": "PriceCo"}, headers=headers).json()["id"]
+    product = client.post(
+        "/products/",
+        json={"product_name": "Priced Item", "price": "100.00", "brand_id": brand_id},
+        headers=headers,
+    ).json()
+    client.put(f"/products/{product['id']}", json={"price": "88.00"}, headers=headers)
+
+    latest = _log(client, headers, entity_type="products")["items"][0]
+    assert latest["changes"]["price"] == ["100.00", "88.00"]
+
+
+def test_activity_log_never_stores_a_password(client, db_session):
+    """A record of who changed a password must not become a record of what it became.
+    The change is still logged - only the values are replaced."""
+    make_admin(db_session, email="actlog3@example.com", password="password123")
+    headers = auth_header(client, "actlog3@example.com", "password123")
+
+    staff = client.post(
+        "/users/",
+        json={
+            "user_name": "New Hire",
+            "email": "newhire@example.com",
+            "password": "hunter2hunter2",
+            "role_title": "Sales",
+        },
+        headers=headers,
+    ).json()
+
+    entry = _entries_for(client, headers, "users", staff["id"])[0]
+    assert entry["action"] == "create"
+    assert entry["changes"]["hashed_password"] == ["***", "***"]
+    serialized = str(entry)
+    assert "hunter2hunter2" not in serialized
+    # Nor the hash itself, which is worth just as little in a log and just as much to
+    # somebody with an offline cracker.
+    assert "$2b$" not in serialized
+
+
+def test_activity_log_ignores_bookkeeping_only_writes(client, db_session):
+    """A sign-in writes `last_login`, and `updated_at` moves on every flush. Neither
+    is a change anybody made, and a log that recorded them would be unreadable."""
+    make_admin(db_session, email="actlog4@example.com", password="password123")
+    headers = auth_header(client, "actlog4@example.com", "password123")
+
+    # Three more sign-ins, each of which writes last_login.
+    for _ in range(3):
+        auth_header(client, "actlog4@example.com", "password123")
+
+    updates = _log(client, headers, entity_type="users", action="update")["items"]
+    assert updates == []
+    # The sign-ins themselves are recorded, just not as edits to the user row.
+    logins = _log(client, headers, action="login")["items"]
+    assert len(logins) >= 3
+    assert all(e["actor_label"] == "Admin User" for e in logins)
+
+
+def test_activity_log_records_a_refused_sign_in(client, db_session):
+    """Committed on a request that raises 401 - a path where the session is closed
+    without a commit, so the entry would roll back if auth.py didn't force one."""
+    make_admin(db_session, email="actlog5@example.com", password="password123")
+
+    resp = client.post(
+        "/auth/login", data={"username": "actlog5@example.com", "password": "wrongpassword"}
+    )
+    assert resp.status_code == 401
+
+    headers = auth_header(client, "actlog5@example.com", "password123")
+    refused = _log(client, headers, action="login_failed")["items"]
+    assert len(refused) == 1
+    assert refused[0]["entity_label"] == "actlog5@example.com"
+    assert refused[0]["actor_type"] == "system"
+
+
+def test_activity_log_files_order_line_changes_under_the_order(client, db_session):
+    """An order's lines are replaced wholesale (`order.items = built`), so the removals
+    happen through a delete-orphan cascade that `session.deleted` never sees. Both
+    sides have to show up, and both have to be filed under the order rather than under
+    a table nobody can navigate to."""
+    make_admin(db_session, email="actlog6@example.com", password="password123")
+    headers = auth_header(client, "actlog6@example.com", "password123")
+
+    brand_id = client.post("/brands/", data={"brand_name": "LineCo"}, headers=headers).json()["id"]
+    first = client.post(
+        "/products/",
+        json={"product_name": "Line A", "price": "10.00", "brand_id": brand_id},
+        headers=headers,
+    ).json()
+    second = client.post(
+        "/products/",
+        json={"product_name": "Line B", "price": "20.00", "brand_id": brand_id},
+        headers=headers,
+    ).json()
+
+    order = client.post(
+        "/orders/",
+        json={
+            "clinic_name": "Test Clinic",
+            "phone": "012345678",
+            "address": "Phnom Penh",
+            "items": [{"product_id": first["id"], "qty": 1}],
+        },
+        headers=headers,
+    ).json()
+
+    # Creating the order must NOT also log its lines - the create entry covers them,
+    # and fifteen "added line item" rows under one "created order" buries it.
+    on_create = _entries_for(client, headers, "orders", order["id"])
+    assert [e["action"] for e in on_create] == ["create"]
+
+    client.put(
+        f"/orders/{order['id']}",
+        json={"items": [{"product_id": second["id"], "qty": 3}]},
+        headers=headers,
+    )
+
+    notes = [e["note"] for e in _entries_for(client, headers, "orders", order["id"])]
+    assert "Added line item" in notes
+    assert "Removed line item" in notes
+
+    added = next(
+        e for e in _entries_for(client, headers, "orders", order["id"])
+        if e["note"] == "Added line item"
+    )
+    assert added["entity_type"] == "orders"
+    assert added["entity_id"] == order["id"]
+    assert added["changes"]["product_name"] == [None, "Line B"]
+    assert added["changes"]["qty"] == [None, 3]
+
+
+def test_activity_log_attributes_a_customer_editing_their_own_profile(client, db_session):
+    """The case `updated_by_user_id` structurally cannot record: there is no `User`
+    involved, so that column correctly stays NULL and says nothing at all."""
+    make_admin(db_session, email="actlog7@example.com", password="password123")
+    make_customer(db_session, email="selfedit@example.com", password="customerpass1")
+
+    customer_headers = customer_auth_header(client, "selfedit@example.com", "customerpass1")
+    resp = client.put("/customers/me", json={"phone_num": "0999888777"}, headers=customer_headers)
+    assert resp.status_code == 200, resp.text
+
+    headers = auth_header(client, "actlog7@example.com", "password123")
+    entry = _log(client, headers, entity_type="customers", actor_type="customer")["items"][0]
+    assert entry["actor_type"] == "customer"
+    assert entry["actor_label"] == "Test Customer"
+    assert entry["actor_user_id"] is None
+    assert entry["changes"]["phone_num"] == [None, "0999888777"]
+
+
+def test_activity_log_filters_combine(client, db_session):
+    make_admin(db_session, email="actlog8@example.com", password="password123")
+    headers = auth_header(client, "actlog8@example.com", "password123")
+
+    client.post("/brands/", data={"brand_name": "Zebrawood"}, headers=headers)
+    client.post("/categories/", data={"category_name": "Maplewood"}, headers=headers)
+
+    # Free text searches the recorded values, not just the labels.
+    hits = _log(client, headers, q="Zebrawood")["items"]
+    assert [e["entity_type"] for e in hits] == ["brands"]
+
+    both = _log(client, headers, action="create")["items"]
+    # The staff account the fixture created is in here too, and correctly so: the
+    # listener is on the session, not on the HTTP layer, so a row written straight
+    # through the ORM is logged like any other - with no actor, as "system".
+    assert {e["entity_type"] for e in both} == {"brands", "categories", "users"}
+    seeded = next(e for e in both if e["entity_type"] == "users")
+    assert seeded["actor_type"] == "system"
+
+    narrowed = _log(client, headers, action="create", entity_type="categories")["items"]
+    assert len(narrowed) == 1
+    assert narrowed[0]["entity_label"] == "Maplewood"
+
+    # `total` counts what the filter matched, not what the page returned.
+    page = _log(client, headers, action="create", limit=1)
+    assert page["total"] == len(both)
+    assert len(page["items"]) == 1
+
+
+def test_activity_log_is_admin_only(client, db_session):
+    """Not the price_listing-or-admin pair the rest of the Reports screen uses: the log
+    spans staff accounts and permissions as well as prices. The per-record History
+    panel answers to the same rule, so it can't be used as a way around the list."""
+    from app.core.security import hash_password
+    from app.models import User
+
+    seller = User(
+        user_name="Seller", email="actlog9@example.com",
+        hashed_password=hash_password("password123"), role_title="Sales",
+        is_active=True, is_verified=True, user_management=False, price_listing=True,
+        product_management=True, customer_management=False, admin=False,
+    )
+    db_session.add(seller)
+    db_session.commit()
+    headers = auth_header(client, "actlog9@example.com", "password123")
+
+    assert client.get("/activity/", headers=headers).status_code == 403
+    assert client.get("/activity/filters", headers=headers).status_code == 403
+    assert client.get("/activity/entity/products/1", headers=headers).status_code == 403
+    # And anonymously.
+    assert client.get("/activity/").status_code == 401
+
+
+def test_activity_log_has_no_way_to_write_to_it(client, db_session):
+    """Append-only is the point of the table, so the router offers no verb that could
+    edit or clear it. A screen that could rewrite the log answers no question."""
+    make_admin(db_session, email="actlog10@example.com", password="password123")
+    headers = auth_header(client, "actlog10@example.com", "password123")
+
+    client.post("/brands/", data={"brand_name": "Permanent"}, headers=headers)
+    entry_id = _log(client, headers)["items"][0]["id"]
+
+    for method, path in [
+        ("post", "/activity/"),
+        ("put", f"/activity/{entry_id}"),
+        ("patch", f"/activity/{entry_id}"),
+        ("delete", f"/activity/{entry_id}"),
+    ]:
+        resp = getattr(client, method)(path, headers=headers)
+        assert resp.status_code in (404, 405), f"{method.upper()} {path} -> {resp.status_code}"
+
+
+def test_entity_history_is_empty_rather_than_404_for_an_untouched_record(client, db_session):
+    """Every row that existed before this table did has no history, and so does a
+    record nobody has edited. "Nothing yet" is a real answer, not an error."""
+    make_admin(db_session, email="actlog11@example.com", password="password123")
+    headers = auth_header(client, "actlog11@example.com", "password123")
+
+    assert _entries_for(client, headers, "products", 999999) == []
+    assert _entries_for(client, headers, "not_a_table", 1) == []
