@@ -408,7 +408,7 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
     # Pads the table with blank rows so it always looks like a full, pre-printed form
     # (like the paper original) even when there are only a few items - mirrors
     # MIN_TABLE_ROWS in main.js's buildPrintTemplate.
-    MIN_TABLE_ROWS = 22
+    MIN_TABLE_ROWS = 21
     blank_rows_needed = max(0, MIN_TABLE_ROWS - len(item_rows))
 
     # Shaping only needs to be on for the table at all if some cell actually needs the
@@ -493,7 +493,9 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
         pdf.set_y(table_bottom)
 
     # ---- signature strip, mirrors qpt-sign-strip ----
-    pdf.ln(14)
+    # ~20mm below the table, matching .qpt-sign-strip's 76px margin-top on the
+    # website's 794px-wide (= 210mm) template.
+    pdf.ln(20)
     sign_y = pdf.get_y()
     sign_width = content_width / 5
     signatures = (
