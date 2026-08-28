@@ -2450,6 +2450,50 @@ def test_materials_are_hidden_from_the_machinery_catalog(client, db_session):
     assert client.get(f"/products/{material['id']}").status_code == 200
 
 
+def test_spare_parts_are_their_own_catalogue_inside_the_machinery_shop(client, db_session):
+    """Spare parts are sold in the machinery shop but must not land in its catalog.
+
+    The 754 SAP spare parts have no photographs and 194 sub-groups of their own,
+    against 110 hand-curated machines - blending them would swamp the catalogue the
+    machinery shop is. So they are a section, which makes the exclusion the DEFAULT:
+    every machinery query written before spare parts existed still says
+    section="machinery" and still means exactly the curated catalogue.
+    """
+    make_admin(db_session, email="spare1@example.com", password="password123")
+    headers = auth_header(client, "spare1@example.com", "password123")
+    machine = _make_order_product(client, headers, name="Dental Unit", price="1200.00")
+    spare = _make_order_product(
+        client, headers, name="Copper Water Valve", price="1.80", section="spare_parts",
+    )
+
+    default_listing = [p["id"] for p in client.get("/products/", params={"limit": 200}).json()]
+    assert machine["id"] in default_listing
+    assert spare["id"] not in default_listing
+
+    spares_only = [
+        p["id"]
+        for p in client.get(
+            "/products/", params={"limit": 200, "section": "spare_parts"}
+        ).json()
+    ]
+    assert spare["id"] in spares_only
+    assert machine["id"] not in spares_only
+
+    # The admin table and the dashboard span every catalogue.
+    everything = [
+        p["id"]
+        for p in client.get("/products/", params={"limit": 200, "section": "all"}).json()
+    ]
+    assert {machine["id"], spare["id"]} <= set(everything)
+
+    # The two endpoints the spare-parts page is actually built on - it is paged
+    # server-side like materials, so both have to understand the new section or the
+    # pager and the filter rail would describe the machinery catalogue instead.
+    assert client.get("/products/count", params={"section": "spare_parts"}).json()["count"] == 1
+    facets = client.get("/products/facets", params={"section": "spare_parts"}).json()
+    assert [b["count"] for b in facets["brands"]] == [1]
+
+
 def test_section_can_be_changed_after_creation(client, db_session):
     """Setting it is not enough: a product filed into the wrong half would
     otherwise be stranded off both storefronts with no way back."""
@@ -5822,37 +5866,55 @@ def test_sap_sync_delists_withdrawn_items_and_refuses_a_partial_extract():
         return SimpleNamespace(section=section, delisted_at=delisted_at)
 
     # One withdrawn, one still offered, one machinery product that is not in SAP at
-    # all and must never be touched by any of this.
+    # all and must never be touched by any of this, and one spare part that belongs
+    # to the OTHER SAP catalogue - a materials extract contains no spare parts, so
+    # its silence about them is not a withdrawal either.
     existing = {
         "GONE": product(),
         "KEPT": product(),
         "MACHINE": product(section="machinery"),
+        "SPARE": product(section="spare_parts"),
     }
     report = Report()
-    _apply_delisting(existing, {"KEPT"}, {"GONE": "frozen in SAP"}, report, now, 1.0)
+    _apply_delisting(
+        existing, {"KEPT"}, {"GONE": "frozen in SAP"}, report, now, "materials", 1.0
+    )
 
     assert report.delisted == [("GONE", "frozen in SAP")]
     assert existing["GONE"].delisted_at == now
     assert existing["KEPT"].delisted_at is None
     # Machinery never enters SAP, so its absence from the extract means nothing.
     assert existing["MACHINE"].delisted_at is None
+    # Neither does a spare part's: this run read SAP group 101/106 only.
+    assert existing["SPARE"].delisted_at is None
 
     # An item that comes back is un-hidden without anyone intervening.
     report = Report()
-    _apply_delisting(existing, {"KEPT", "GONE"}, {}, report, now, 1.0)
+    _apply_delisting(existing, {"KEPT", "GONE"}, {}, report, now, "materials", 1.0)
     assert report.relisted == ["GONE"]
     assert existing["GONE"].delisted_at is None
 
     # The safety rail: a partial extract would delist everything, so it stops.
     report = Report()
     try:
-        _apply_delisting(existing, set(), {}, report, now, 0.10)
+        _apply_delisting(existing, set(), {}, report, now, "materials", 0.10)
     except SystemExit as exc:
         assert "Refusing to delist" in str(exc)
     else:
         raise AssertionError("a 100% delist should have been refused")
     # Nothing was stamped on the way out.
     assert all(p.delisted_at is None for p in existing.values())
+
+    # The mirror image, and the reason spare parts are their own section rather
+    # than machinery: a spare-parts run must delist only spare parts. Were they
+    # stored as "machinery", this call would hide every hand-curated machine on the
+    # site, none of which SAP has ever listed.
+    report = Report()
+    _apply_delisting(existing, set(), {}, report, now, "spare_parts", 1.0)
+    assert [code for code, _ in report.delisted] == ["SPARE"]
+    assert existing["MACHINE"].delisted_at is None
+    assert existing["GONE"].delisted_at is None
+    assert existing["KEPT"].delisted_at is None
 def test_products_can_be_sorted_and_the_sort_is_done_by_the_database(client, db_session):
     """GET /products/?sort=... orders the whole result set, not the page.
 

@@ -354,14 +354,30 @@ class Product(AuditedMixin, Base):
 
     badge = Column(String(50), nullable=True)
 
-    # Which half of the storefront this product belongs to: "machinery" or "materials".
+    # Which catalogue this product belongs to: "machinery", "materials" or
+    # "spare_parts".
     #
     # The split used to be purely presentational - site_section() in the Flask app
     # keys off request.endpoint, not off any data - and that was fine for exactly as
     # long as every product WAS machinery. Materials arrive from SAP Business One
-    # (which holds that item master and only that one; machinery never enters SAP),
-    # so from now on the two sets share a table and must not share a catalog page.
-    # Every product read path filters on this.
+    # (which holds that item master), so from now on the sets share a table and must
+    # not share a catalog page. Every product read path filters on this.
+    #
+    # "spare_parts" is a catalogue, not a third shop, and the distinction is the
+    # reason it is a value here rather than a flag beside it. Spare parts are SAP
+    # item group 103: they are sold in the machinery shop under its header, its
+    # brands and its cart, but there are 754 of them with no photographs and 194
+    # sub-groups of their own, and mixing them into the 110 hand-curated machines
+    # would swamp that catalogue and overflow the page it is fetched with. Giving
+    # them their own section value makes that separation the DEFAULT rather than
+    # something every machinery query has to remember to ask for - and it is what
+    # scopes sap_sync's delisting, which hides everything in the section it owns
+    # that SAP has stopped listing. Were spare parts stored as "machinery", one
+    # sync run would delist all 110 hand-maintained machines, none of which SAP
+    # has ever heard of.
+    #
+    # The Flask shell still knows two shops (site_section.SECTIONS): a spare-parts
+    # page is machinery-shelled, and there is deliberately no third logo or nav.
     #
     # A plain String + Pydantic Literal rather than a DB enum, for the same reason
     # discount_type/order_type/gender are - see the comment on Customer.gender:

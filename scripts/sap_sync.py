@@ -1,9 +1,22 @@
 """
-Bring the materials catalogue in our Postgres into line with SAP.
+Bring the SAP-sourced catalogues in our Postgres into line with SAP.
 
 Reads the SAP company database (read-only, via scripts/sap_db_pull) and upserts
-what it finds into `products` as section="materials". SAP is the authority for the
-item master; this database is the authority for everything about presenting it.
+what it finds into `products`. SAP is the authority for the item master; this
+database is the authority for everything about presenting it.
+
+Two catalogues, defined in scripts/sap_db_pull.CATALOGUES:
+
+    materials    SAP groups 101 + 106  ->  products.section = "materials"
+    spare-parts  SAP group  103        ->  products.section = "spare_parts"
+
+They are separate sections rather than one, and spare parts are NOT stored as
+"machinery" even though that is the shop they are sold in. The reason is
+delisting: this script hides everything in the section it owns that SAP has
+stopped listing, so a spare-parts run that owned "machinery" would delist all 110
+hand-curated machines, none of which SAP has ever heard of. A section per
+catalogue makes each run's authority exactly the rows it is actually the authority
+for. See models.Product.section.
 
 What the sync owns, and what it must never touch
 ------------------------------------------------
@@ -41,10 +54,11 @@ which kept the real text - see _display_name, and the section the run report gro
 listing exactly which rows it had to do that for.
 
 Usage:
-    python -m scripts.sap_sync                  # dry run - reports, writes nothing
-    python -m scripts.sap_sync --apply          # actually write
-    python -m scripts.sap_sync --from-file sap_extract/materials.json --apply
-    python -m scripts.sap_sync --transport local --apply   # on the server
+    python -m scripts.sap_sync                       # dry run, both catalogues
+    python -m scripts.sap_sync --apply               # actually write, both
+    python -m scripts.sap_sync --catalogue spare-parts --apply
+    python -m scripts.sap_sync --catalogue materials --from-file         sap_extract/materials.json --apply
+    python -m scripts.sap_sync --transport local --apply    # on the server
 """
 from __future__ import annotations
 
@@ -72,21 +86,13 @@ from app.models import Brand, Category, Product
 # is.
 import app.core.activity  # noqa: F401
 
-from scripts.sap_db_pull import GROUP_NAMES, TRANSPORTS, build_query, _run_sql
-
-# Item groups that make up the materials half of the storefront: 101 Materials and
-# 106 Lab Material. 103 Spare Part / 104 Equipment are deliberately excluded - they
-# overlap the hand-maintained machinery catalogue, and importing them would create
-# a second, SAP-shaped copy of products that already exist here.
-MATERIAL_GROUPS = [101, 106]
+from scripts.sap_db_pull import CATALOGUES, GROUP_NAMES, TRANSPORTS, build_query, _run_sql
 
 # products.brand_id is NOT NULL, and roughly a fifth of the SAP items have no
 # U_Brand at all. They need somewhere to go that is honest about what it means -
 # an existing real brand would be a lie, and skipping the items would drop 1,600
 # sellable products off the site.
 FALLBACK_BRAND = "Unbranded"
-
-SECTION = "materials"
 
 # SAP has a currency literally named "$", separate from its "USD", and exactly one
 # item is priced in it. It is *probably* someone picking the wrong entry from the
@@ -96,7 +102,7 @@ SECTION = "materials"
 # SAP - a one-field correction there, after which the item syncs normally.
 ACCEPTED_CURRENCIES = {"USD"}
 
-# The largest share of the materials catalogue one run may hide before it stops and
+# The largest share of one catalogue that a single run may hide before it stops and
 # asks. Withdrawals come in ones and tens; a run that wants to delist a fifth of the
 # catalogue has almost certainly read a partial extract - see _apply_delisting.
 DEFAULT_MAX_DELIST_RATIO = 0.10
@@ -105,13 +111,14 @@ DEFAULT_MAX_DELIST_RATIO = 0.10
 class Report:
     """Counts and, more usefully, the specific rows that need a person to look."""
 
-    def __init__(self) -> None:
+    def __init__(self, label: str = "catalogue") -> None:
+        self.label = label
         self.created: list[str] = []
         self.updated: list[tuple[str, list[str]]] = []
         self.unchanged = 0
         self.skipped_no_price: list[str] = []
         self.skipped_currency: list[tuple[str, str]] = []
-        self.skipped_machinery: list[str] = []
+        self.skipped_foreign: list[tuple[str, str]] = []
         self.new_brands: list[str] = []
         self.new_categories: list[str] = []
         self.delisted: list[tuple[str, str]] = []
@@ -121,7 +128,7 @@ class Report:
 
     def render(self, applied: bool) -> str:
         mode = "APPLIED" if applied else "DRY RUN - nothing was written"
-        L = [f"# SAP materials sync - {mode}", ""]
+        L = [f"# SAP {self.label} sync - {mode}", ""]
         L.append(f"- Created: **{len(self.created)}**")
         L.append(f"- Updated: **{len(self.updated)}**")
         L.append(f"- Unchanged: {self.unchanged}")
@@ -154,7 +161,7 @@ class Report:
             L.append("")
 
         skipped = (
-            len(self.skipped_no_price) + len(self.skipped_currency) + len(self.skipped_machinery)
+            len(self.skipped_no_price) + len(self.skipped_currency) + len(self.skipped_foreign)
         )
         L.append(f"## Skipped ({skipped})")
         L.append("")
@@ -166,10 +173,10 @@ class Report:
             L.append(f"**Not priced in USD ({len(self.skipped_currency)})** - "
                      "fix the currency in SAP, then re-run:")
             L.extend(f"  - {c} (currency `{cur}`)" for c, cur in self.skipped_currency[:20])
-        if self.skipped_machinery:
-            L.append(f"**Code already used by a machinery product "
-                     f"({len(self.skipped_machinery)})** - left untouched:")
-            L.extend(f"  - {c}" for c in self.skipped_machinery[:20])
+        if self.skipped_foreign:
+            L.append(f"**Code already used by a product in another catalogue "
+                     f"({len(self.skipped_foreign)})** - left untouched:")
+            L.extend(f"  - {c} (currently in `{sec}`)" for c, sec in self.skipped_foreign[:20])
         if not skipped:
             L.append("_Nothing skipped._")
         L.append("")
@@ -321,8 +328,12 @@ def _price_for(list_price: Decimal, discount, discount_type: str) -> Decimal:
     return charged.quantize(Decimal("0.01")) if charged > 0 else list_price
 
 
-def sync(db, rows: list[dict], report: Report, now: datetime,
+def sync(db, rows: list[dict], report: Report, now: datetime, section: str,
          max_delist_ratio: float = DEFAULT_MAX_DELIST_RATIO) -> None:
+    """Upsert one catalogue's extract into `products`, then delist what SAP dropped.
+
+    `section` is both where new rows land and the limit of this run's authority:
+    nothing outside it is written, and nothing outside it is delisted."""
     brands = NameCache(db, Brand, "brand_name", report.new_brands)
     categories = NameCache(db, Category, "category_name", report.new_categories)
     fallback_brand = brands.get_or_create(FALLBACK_BRAND)
@@ -366,8 +377,13 @@ def sync(db, rows: list[dict], report: Report, now: datetime,
             continue
 
         product = existing.get(code)
-        if product is not None and product.section != SECTION:
-            report.skipped_machinery.append(code)
+        if product is not None and product.section != section:
+            # The code is already held by a product in another catalogue. Never
+            # converted, only reported: a hand-curated machinery product carries
+            # photographs, a description and a price staff set, and moving it into
+            # a synced section would hand all of that to SAP. A collision means the
+            # code was reused, not that the product changed catalogue.
+            report.skipped_foreign.append((code, product.section))
             continue
 
         list_price = Decimal(price).quantize(Decimal("0.01"))
@@ -386,7 +402,7 @@ def sync(db, rows: list[dict], report: Report, now: datetime,
             product = Product(
                 product_code=code,
                 product_name=name,
-                section=SECTION,
+                section=section,
                 list_price=list_price,
                 price=list_price,
                 discount=Decimal("0"),
@@ -430,16 +446,20 @@ def sync(db, rows: list[dict], report: Report, now: datetime,
         else:
             report.unchanged += 1
 
-    _apply_delisting(existing, offered, withdrawn, report, now, max_delist_ratio)
+    _apply_delisting(existing, offered, withdrawn, report, now, section, max_delist_ratio)
 
 
-def _apply_delisting(existing, offered, withdrawn, report, now, max_delist_ratio):
-    """Hide materials SAP has stopped offering, and un-hide any that came back.
+def _apply_delisting(existing, offered, withdrawn, report, now, section, max_delist_ratio):
+    """Hide items SAP has stopped offering, and un-hide any that came back.
 
-    Only the section this sync owns: machinery never enters SAP, so "absent from
-    the extract" says nothing about it, and delisting one would be pure damage.
+    Strictly the one section this run owns. The hand-curated machinery catalogue
+    never enters SAP, so "absent from the extract" says nothing at all about it and
+    delisting one of its products would be pure damage - and the same holds between
+    the two SAP catalogues, since a materials run reads no spare parts and a
+    spare-parts run reads no materials. Scoping by section is what stops each run
+    concluding that the other's catalogue has been withdrawn.
     """
-    ours = {code: p for code, p in existing.items() if p.section == SECTION}
+    ours = {code: p for code, p in existing.items() if p.section == section}
     stale = [code for code in ours if code not in offered]
 
     # The safety rail, and the reason this is a function rather than four lines
@@ -451,9 +471,9 @@ def _apply_delisting(existing, offered, withdrawn, report, now, max_delist_ratio
     # until a human says otherwise.
     if ours and len(stale) > len(ours) * max_delist_ratio:
         raise SystemExit(
-            f"Refusing to delist {len(stale)} of {len(ours)} materials "
-            f"({len(stale) / len(ours):.0%}) - that looks like a partial extract "
-            f"rather than {len(stale)} withdrawals. Re-run with "
+            f"Refusing to delist {len(stale)} of {len(ours)} products in section "
+            f"'{section}' ({len(stale) / len(ours):.0%}) - that looks like a partial "
+            f"extract rather than {len(stale)} withdrawals. Re-run with "
             f"--max-delist-ratio 1.0 if it really is correct."
         )
 
@@ -471,8 +491,78 @@ def _apply_delisting(existing, offered, withdrawn, report, now, max_delist_ratio
             )
 
 
+def run_catalogue(name: str, args, now: datetime) -> Report:
+    """Read one catalogue's extract and sync it, in a transaction of its own.
+
+    A session per catalogue rather than one spanning both, so a spare-parts run
+    that trips the delisting rail cannot roll back a materials run that had already
+    completed correctly - and so the two reports describe what was really written.
+    """
+    catalogue = CATALOGUES[name]
+    section = catalogue["section"]
+
+    if args.from_file:
+        print(f"Reading {args.from_file}...", flush=True)
+        payload = Path(args.from_file).read_text(encoding="utf-8")
+    else:
+        groups = ", ".join(f"{c} {GROUP_NAMES.get(c, '?')}" for c in catalogue["groups"])
+        print(f"Reading SAP {name} ({groups})...", flush=True)
+        payload = _run_sql(build_query(catalogue["groups"]), args.transport)
+
+    # parse_float=Decimal: these are prices. Letting them become binary floats and
+    # converting to Decimal afterwards is how 15.00 turns into 14.999999999999998
+    # on a Numeric column.
+    rows = json.loads(payload, parse_float=Decimal)
+    for row in rows:
+        raw = row.get("stock")
+        if isinstance(raw, str):
+            row["stock"] = json.loads(raw, parse_float=Decimal)
+    if not rows:
+        print(f"{name}: extract is empty - refusing to run.", file=sys.stderr)
+        sys.exit(1)
+    print(f"{len(rows)} SAP items.", flush=True)
+
+    report = Report(catalogue["label"].lower())
+    db = SessionLocal()
+    # Attribute the change log to the sync rather than to a person. set_actor()
+    # only takes a User or a Customer, and neither is true here - writing the
+    # underlying key directly keeps actor_type "system" (which is accurate) while
+    # still labelling every row, so a surprise price change is traceable to a run
+    # of this script instead of appearing to come from nowhere. The catalogue is
+    # named in the label because two jobs now write through this path, and "which
+    # sync repriced this" is the first question anyone asks of the log.
+    db.info["activity_actor"] = ("system", None, f"SAP sync ({name})")
+    try:
+        sync(db, rows, report, now, section, args.max_delist_ratio)
+        if args.apply:
+            db.commit()
+        else:
+            db.rollback()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    return report
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Sync SAP materials into Postgres.")
+    # The run report quotes item names, and the ones recovered from FrgnName are in
+    # Khmer. Windows hands a bare console (and the scheduled task's redirected log)
+    # a cp1252 stdout, which cannot encode them - printing the report then raises
+    # UnicodeEncodeError *after* the catalogue has already been committed, so the
+    # write succeeds while the process exits non-zero and Task Scheduler reports a
+    # failure that did not happen. With two catalogues it is worse: the crash
+    # printing the first report means the second never runs at all. errors=replace
+    # rather than a narrower fix because a report is a thing to read, not to parse -
+    # a '?' in the terminal costs nothing, and the file on disk is UTF-8 regardless.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):  # already wrapped, or not a TextIO
+            pass
+
+    parser = argparse.ArgumentParser(description="Sync SAP catalogues into Postgres.")
     parser.add_argument(
         "--apply",
         action="store_true",
@@ -480,9 +570,21 @@ def main() -> None:
              "would do, but rolls back - which is how you check a run before trusting it.",
     )
     parser.add_argument(
+        "--catalogue",
+        choices=[*sorted(CATALOGUES), "all"],
+        default="all",
+        help="Which catalogue to sync (default: %(default)s). "
+             + "; ".join(
+                 f"{k}=groups {c['groups']} -> section '{c['section']}'"
+                 for k, c in sorted(CATALOGUES.items())
+             ),
+    )
+    parser.add_argument(
         "--from-file",
         help="Read a previously saved extract instead of querying SAP "
-             "(e.g. sap_extract/materials.json).",
+             "(e.g. sap_extract/spare_parts.json). Needs an explicit --catalogue: "
+             "a file on disk does not say which section its rows belong in, and "
+             "guessing would write a whole catalogue into the wrong one.",
     )
     parser.add_argument(
         "--transport",
@@ -496,60 +598,39 @@ def main() -> None:
         "--max-delist-ratio",
         type=float,
         default=DEFAULT_MAX_DELIST_RATIO,
-        help="Abort rather than delist more than this share of the materials "
-             "catalogue in one run (default %(default)s). Pass 1.0 to allow any.",
+        help="Abort rather than delist more than this share of a catalogue in one "
+             "run (default %(default)s). Pass 1.0 to allow any.",
     )
-    parser.add_argument("--out", default="sap_extract/sync_report.md")
+    parser.add_argument(
+        "--out-dir",
+        default="sap_extract",
+        help="Where the per-catalogue run reports are written (default: %(default)s).",
+    )
     args = parser.parse_args()
 
-    if args.from_file:
-        print(f"Reading {args.from_file}...", flush=True)
-        payload = Path(args.from_file).read_text(encoding="utf-8")
-    else:
-        groups = ", ".join(f"{c} {GROUP_NAMES.get(c, '?')}" for c in MATERIAL_GROUPS)
-        print(f"Reading SAP ({groups})...", flush=True)
-        payload = _run_sql(build_query(MATERIAL_GROUPS), args.transport)
+    if args.from_file and args.catalogue == "all":
+        parser.error(
+            "--from-file syncs exactly one catalogue - pass --catalogue "
+            f"{' or --catalogue '.join(sorted(CATALOGUES))} to say which."
+        )
 
-    # parse_float=Decimal: these are prices. Letting them become binary floats and
-    # converting to Decimal afterwards is how 15.00 turns into 14.999999999999998
-    # on a Numeric column.
-    rows = json.loads(payload, parse_float=Decimal)
-    for row in rows:
-        raw = row.get("stock")
-        if isinstance(raw, str):
-            row["stock"] = json.loads(raw, parse_float=Decimal)
-    if not rows:
-        print("Extract is empty - refusing to run.", file=sys.stderr)
-        sys.exit(1)
-    print(f"{len(rows)} SAP items.", flush=True)
+    names = sorted(CATALOGUES) if args.catalogue == "all" else [args.catalogue]
 
-    report = Report()
-    db = SessionLocal()
-    # Attribute the change log to the sync rather than to a person. set_actor()
-    # only takes a User or a Customer, and neither is true here - writing the
-    # underlying key directly keeps actor_type "system" (which is accurate) while
-    # still labelling every row, so a surprise price change is traceable to a run
-    # of this script instead of appearing to come from nowhere.
-    db.info["activity_actor"] = ("system", None, "SAP sync")
-    try:
-        sync(db, rows, report, datetime.now(timezone.utc), args.max_delist_ratio)
-        if args.apply:
-            db.commit()
-        else:
-            db.rollback()
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
+    # One timestamp for the whole invocation, so stock_synced_at and any delisted_at
+    # written tonight agree across catalogues instead of differing by the seconds
+    # the first query happened to take.
+    now = datetime.now(timezone.utc)
 
-    text = report.render(applied=args.apply)
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(text, encoding="utf-8")
-    print()
-    print(text)
-    print(f"Report: {out_path}")
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        report = run_catalogue(name, args, now)
+        text = report.render(applied=args.apply)
+        out_path = out_dir / f"{name.replace('-', '_')}_sync_report.md"
+        out_path.write_text(text, encoding="utf-8")
+        print()
+        print(text)
+        print(f"Report: {out_path}")
     if not args.apply:
         print("Dry run - re-run with --apply to write.")
 

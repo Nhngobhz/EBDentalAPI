@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-    Registers the nightly SAP -> Postgres materials sync as a Windows scheduled task.
+    Registers the nightly SAP -> Postgres catalogue sync as a Windows scheduled task.
+    Covers both catalogues: materials (SAP groups 101 + 106) and spare parts (103).
 
 .DESCRIPTION
     Run ON QPLUS365SERVER, elevated. Creates (or replaces) a task that runs
@@ -33,7 +34,7 @@
 param(
     [string]$At = "02:30",
     [string]$User = "Administrator",
-    [string]$TaskName = "EB Dental - SAP materials sync",
+    [string]$TaskName = "EB Dental - SAP catalogue sync",
     [string]$Script = "E:\Website\store-api\scripts\sap_sync_scheduled.cmd"
 )
 
@@ -68,7 +69,7 @@ Register-ScheduledTask `
     -User $credential.UserName `
     -Password $credential.GetNetworkCredential().Password `
     -RunLevel Highest `
-    -Description "Syncs the SAP Business One materials catalogue into the store Postgres. See store-api/scripts/sap_sync.py." `
+    -Description "Syncs the SAP Business One materials and spare-parts catalogues into the store Postgres. See store-api/scripts/sap_sync.py." `
     -Force | Out-Null
 
 Write-Host "Registered '$TaskName' - daily at $At as $($credential.UserName)."

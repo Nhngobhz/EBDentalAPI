@@ -1,6 +1,6 @@
 """
-Read-only extract of the materials catalogue from the SAP Business One company
-database, straight over SQL.
+Read-only extract of a catalogue - materials or spare parts - from the SAP
+Business One company database, straight over SQL.
 
 Why SQL and not Service Layer (scripts/sap_discover.py): Service Layer needs a B1
 user, burns a licence slot for the length of the run, and pages 6,800 items twenty
@@ -29,10 +29,10 @@ short version:
     mixed mode, so that needs no change to SQL Server itself.
 
 Usage:
-    python -m scripts.sap_db_pull                    # group 101 (Materials)
-    python -m scripts.sap_db_pull --groups 101,106   # + Lab Material
-    python -m scripts.sap_db_pull --groups all
-    python -m scripts.sap_db_pull --transport local  # on the server itself
+    python -m scripts.sap_db_pull                          # materials (101 + 106)
+    python -m scripts.sap_db_pull --catalogue spare-parts  # group 103
+    python -m scripts.sap_db_pull --groups all             # ad-hoc, -> items.json
+    python -m scripts.sap_db_pull --transport local        # on the server itself
 """
 from __future__ import annotations
 
@@ -60,7 +60,30 @@ GROUP_NAMES = {
     104: "Equipment",
     106: "Lab Material",
 }
-DEFAULT_GROUPS = "101"
+# The catalogues this integration pulls, each a set of SAP item groups and the
+# `products.section` they land in. Named here rather than in sap_sync.py because
+# this is the module that already knows what an item group is, and both scripts
+# have to agree: the sync's delisting hides everything in a section that is absent
+# from the extract, so a pull and a sync that disagreed about which groups make up
+# a catalogue would hide the difference between them.
+#
+# 100 Office supply / 102 Services / 104 Equipment are deliberately absent. Office
+# supply and Services are not things this company sells online (17 of the Services
+# rows have no price at all), and Equipment overlaps the hand-curated machinery
+# catalogue - importing it would create a second, SAP-shaped copy of products that
+# already exist here with photographs and descriptions.
+CATALOGUES = {
+    "materials": {
+        "groups": [101, 106],
+        "section": "materials",
+        "label": "Materials",
+    },
+    "spare-parts": {
+        "groups": [103],
+        "section": "spare_parts",
+        "label": "Spare parts",
+    },
+}
 
 # OPLN.ListNum of "Normal Sale Price". It is the only price list in this company
 # database with any rows in it - the other nine exist but are empty, so picking a
@@ -275,9 +298,9 @@ def case_collisions(values: list[str]) -> dict[str, list[str]]:
     return {fold: sorted(spellings) for fold, spellings in by_fold.items() if len(spellings) > 1}
 
 
-def summarise(rows: list[dict], group_codes: list[int]) -> str:
+def summarise(rows: list[dict], group_codes: list[int], label: str = "catalogue") -> str:
     labels = ", ".join("{} {}".format(c, GROUP_NAMES.get(c, "?")) for c in group_codes)
-    L: list[str] = ["# SAP materials extract", ""]
+    L: list[str] = [f"# SAP {label} extract", ""]
     L.append(f"- Generated: {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
     L.append(f"- Company DB: `{COMPANY_DB}` (read-only)")
     L.append(f"- Item groups: {labels}")
@@ -372,11 +395,19 @@ def summarise(rows: list[dict], group_codes: list[int]) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Read-only SAP materials extract.")
+    parser = argparse.ArgumentParser(description="Read-only SAP catalogue extract.")
+    parser.add_argument(
+        "--catalogue",
+        choices=sorted(CATALOGUES),
+        help="Pull a named catalogue - decides both the item groups and the output "
+             "filename. Default: materials. "
+             + "; ".join(f"{k}={c['groups']}" for k, c in sorted(CATALOGUES.items())),
+    )
     parser.add_argument(
         "--groups",
-        default=DEFAULT_GROUPS,
-        help="Comma-separated OITB group codes, or 'all'. "
+        help="Comma-separated OITB group codes, or 'all', for an ad-hoc pull that is "
+             "not one of the catalogues above - writes items.json rather than "
+             "overwriting a catalogue's extract. "
         + "; ".join(f"{c}={n}" for c, n in sorted(GROUP_NAMES.items())),
     )
     parser.add_argument(
@@ -389,17 +420,32 @@ def main() -> None:
     parser.add_argument("--out", default="sap_extract", help="Output directory")
     args = parser.parse_args()
 
-    if args.groups.strip().lower() == "all":
-        group_codes = sorted(GROUP_NAMES)
+    if args.catalogue and args.groups:
+        print("Pass --catalogue or --groups, not both.", file=sys.stderr)
+        sys.exit(1)
+
+    # The output basename tracks WHAT was pulled, so two catalogues can sit side by
+    # side in one extract directory instead of overwriting each other. Materials
+    # keeps the name it had when it was the only catalogue there is, which is what
+    # lets the saved extracts and sap_sync's --from-file examples keep resolving.
+    if args.groups:
+        basename, label = "items", "catalogue"
+        if args.groups.strip().lower() == "all":
+            group_codes = sorted(GROUP_NAMES)
+        else:
+            try:
+                group_codes = [int(c) for c in args.groups.split(",") if c.strip()]
+            except ValueError:
+                print(
+                    f"--groups must be comma-separated numbers or 'all', got {args.groups!r}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
     else:
-        try:
-            group_codes = [int(c) for c in args.groups.split(",") if c.strip()]
-        except ValueError:
-            print(
-                f"--groups must be comma-separated numbers or 'all', got {args.groups!r}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+        catalogue = CATALOGUES[args.catalogue or "materials"]
+        group_codes = catalogue["groups"]
+        basename = (args.catalogue or "materials").replace("-", "_")
+        label = catalogue["label"].lower()
     if not group_codes:
         print("No item groups selected.", file=sys.stderr)
         sys.exit(1)
@@ -426,7 +472,7 @@ def main() -> None:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    (out_dir / "materials.json").write_text(
+    (out_dir / f"{basename}.json").write_text(
         json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8"
     )
 
@@ -442,7 +488,7 @@ def main() -> None:
     for row in rows:
         fields.extend(f for f in row if f != "stock" and f not in fields)
     fields += [f"stock_{w}" for w in warehouses]
-    with (out_dir / "materials.csv").open("w", newline="", encoding="utf-8-sig") as fh:
+    with (out_dir / f"{basename}.csv").open("w", newline="", encoding="utf-8-sig") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields)
         writer.writeheader()
         for row in rows:
@@ -451,10 +497,14 @@ def main() -> None:
             flat.update({f"stock_{w}": by_whs.get(w) for w in warehouses})
             writer.writerow(flat)
 
-    (out_dir / "report.md").write_text(summarise(rows, group_codes), encoding="utf-8")
+    report_name = f"{basename}_report.md"
+    (out_dir / report_name).write_text(
+        summarise(rows, group_codes, label), encoding="utf-8"
+    )
 
-    print(f"\n{len(rows)} items -> {out_dir / 'materials.json'}, {out_dir / 'materials.csv'}")
-    print(f"Summary: {out_dir / 'report.md'}")
+    print(f"\n{len(rows)} items -> {out_dir / f'{basename}.json'}, "
+          f"{out_dir / f'{basename}.csv'}")
+    print(f"Summary: {out_dir / report_name}")
 
 
 if __name__ == "__main__":

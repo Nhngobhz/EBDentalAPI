@@ -1,6 +1,11 @@
 @echo off
 REM ---------------------------------------------------------------------------
-REM Unattended SAP -> Postgres materials sync, for Windows Task Scheduler.
+REM Unattended SAP -> Postgres catalogue sync, for Windows Task Scheduler.
+REM
+REM Syncs BOTH catalogues - materials (SAP groups 101+106) and spare parts
+REM (group 103) - because sap_sync defaults to --catalogue all. Each gets its own
+REM transaction and its own report in sap_extract\, so one failing does not roll
+REM back the other.
 REM
 REM Run BY the scheduler on QPLUS365SERVER, where store-api and SQL Server sit on
 REM the same machine - hence --transport local, which is sqlcmd against localhost
@@ -34,7 +39,8 @@ cd /d "%APP_DIR%" || (echo Cannot cd to %APP_DIR% >> "%LOG%" & exit /b 1)
 
 REM --apply, because a scheduled dry run would write a report nobody reads and
 REM change nothing. The safety rail inside sap_sync (--max-delist-ratio) is what
-REM keeps an unattended --apply from emptying the storefront on a partial read.
+REM keeps an unattended --apply from emptying the storefront on a partial read -
+REM and it is applied per catalogue, so a short read of one cannot hide the other.
 "%PYTHON%" -m scripts.sap_sync --transport local --apply >> "%LOG%" 2>&1
 set "RC=%ERRORLEVEL%"
 
