@@ -1,7 +1,7 @@
 ﻿from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
-from sqlalchemy import func
+from sqlalchemy import func, nullslast, or_
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.core.audit import stamp_updated_by
@@ -12,9 +12,12 @@ from app.core.query import Limit, OptionalInt, Skip
 from app.database import get_db
 from app.models import Brand, Category, Product, ProductFreeItem, ProductImage, User
 from app.schemas import (
+    ProductCount,
     ProductCreate,
+    ProductFacets,
     ProductOut,
     ProductPriceUpdate,
+    ProductSort,
     ProductUpdate,
     SectionFilter,
 )
@@ -30,6 +33,44 @@ _MASKED_PRICE = "XXXX"
 # is decoded and re-uploaded in-process, so an unbounded list is a slow request
 # and a lot of memory - not a limit on how many a product may have in total.
 MAX_GALLERY_IMAGES = 12
+
+# Where an uploaded product photo is filed. Machinery and materials are two
+# catalogues with two different lifecycles - machinery pictures are shot in-house and
+# live as long as the product does, while materials arrive from a SAP item master
+# that is re-imported nightly and can withdraw thousands of rows at a time - so their
+# images are kept apart rather than in one flat products/ folder. That makes it
+# possible to sync, back up, purge or hand off one shop's media without touching the
+# other's, which a single folder of 8,000 mixed files makes impossible.
+#
+# Existing images are NOT moved: `product_image` stores the full path/URL that was
+# written at upload time, so old files keep resolving from products/ and only new
+# uploads land in the new place. A rename pass would have to rewrite every stored
+# URL to gain nothing a reader can see.
+def _image_folder(product: Product) -> str:
+    return f"products/{product.section}"
+
+
+# What each `sort` value means, as an explicit ORDER BY. A closed map rather than
+# anything built from the caller's string - see schemas.ProductSort.
+#
+# Every entry ends in Product.id. Ties are the norm here (a whole category at one
+# price, 7,000 materials with a NULL stock figure), and without a deterministic last
+# key the database is free to order tied rows differently between requests - which,
+# on a paged endpoint, silently drops some rows and repeats others.
+#
+# nullslast() on the stock sorts for the same reason: stock_qty is NULL for every
+# machinery product (they never enter SAP), and Postgres sorts NULLs first on DESC,
+# so "most stock first" would otherwise open with every item whose stock is unknown.
+_SORTS = {
+    "name": lambda: (func.lower(Product.product_name).asc(), Product.id.asc()),
+    "name_desc": lambda: (func.lower(Product.product_name).desc(), Product.id.asc()),
+    "price_asc": lambda: (Product.price.asc(), Product.id.asc()),
+    "price_desc": lambda: (Product.price.desc(), Product.id.asc()),
+    "stock_asc": lambda: (nullslast(Product.stock_qty.asc()), Product.id.asc()),
+    "stock_desc": lambda: (nullslast(Product.stock_qty.desc()), Product.id.asc()),
+    "newest": lambda: (Product.created_at.desc(), Product.id.desc()),
+    "oldest": lambda: (Product.created_at.asc(), Product.id.asc()),
+}
 
 
 def _free_item_loader():
@@ -167,6 +208,50 @@ def _serialize_product(product: Product, can_view_price: bool) -> dict:
     return data
 
 
+def _catalog_query(
+    db: Session,
+    *,
+    brand_id: int | None,
+    category_id: int | None,
+    q: str | None,
+    section: str,
+    include_unpurchasable: bool,
+    include_delisted: bool = False,
+):
+    """The catalog's filter set, without ordering, paging or eager loads.
+
+    Shared by GET /products/ and GET /products/count so the two cannot disagree.
+    They must agree exactly: the count is what a paginated storefront divides into
+    page numbers, so a filter applied to one and not the other produces pages that
+    are empty at the end, or a last page nobody can reach.
+    """
+    query = db.query(Product)
+    if not include_unpurchasable:
+        query = query.filter(Product.is_purchasable.is_(True))
+    # Products SAP has withdrawn are hidden from every public read by default, and
+    # the default is what matters: a caller that forgets to ask gets the safe
+    # answer. The admin table passes include_delisted so staff can still find one -
+    # it is still a real row, still on past orders, and still editable.
+    if not include_delisted:
+        query = query.filter(Product.delisted_at.is_(None))
+    if section != "all":
+        query = query.filter(Product.section == section)
+    if brand_id is not None:
+        query = query.filter(Product.brand_id == brand_id)
+    if category_id is not None:
+        query = query.filter(Product.category_id == category_id)
+    if q:
+        # Name OR code. Code matters as much as name in the materials half, where
+        # the catalogue is 8,000 SAP items and staff know things by their item code
+        # ("(AL)28A1E2") far more reliably than by a name that starts with the same
+        # three words as forty others.
+        needle = f"%{q}%"
+        query = query.filter(
+            or_(Product.product_name.ilike(needle), Product.product_code.ilike(needle))
+        )
+    return query
+
+
 @router.get("/", response_model=list[ProductOut])
 def list_products(
     skip: Skip = 0,
@@ -175,7 +260,9 @@ def list_products(
     category_id: OptionalInt = None,
     q: str | None = None,
     section: SectionFilter = "machinery",
+    sort: ProductSort = "name",
     include_unpurchasable: bool = False,
+    include_delisted: bool = False,
     can_view_price: bool = Depends(get_price_visibility),
     db: Session = Depends(get_db),
 ):
@@ -194,42 +281,161 @@ def list_products(
     page, so a caller that forgets to ask gets the same rows it got before the
     column existed. Pass "all" from the screens that genuinely span both.
     """
-    query = db.query(Product).options(
+    query = _catalog_query(
+        db,
+        brand_id=brand_id,
+        category_id=category_id,
+        q=q,
+        section=section,
+        include_unpurchasable=include_unpurchasable,
+        include_delisted=include_delisted,
+    ).options(
         joinedload(Product.brand),
         joinedload(Product.category),
         _free_item_loader(),
         _image_loader(),
     )
-    if not include_unpurchasable:
-        query = query.filter(Product.is_purchasable.is_(True))
-    if section != "all":
-        query = query.filter(Product.section == section)
-    if brand_id is not None:
-        query = query.filter(Product.brand_id == brand_id)
-    if category_id is not None:
-        query = query.filter(Product.category_id == category_id)
-    if q:
-        query = query.filter(Product.product_name.ilike(f"%{q}%"))
-    # Alphabetical, not insertion order. This is a *catalog*: a shopper scanning it
-    # for "Curing Light" needs the C's together, and staff paging through the admin
-    # table need the same row to stay in the same place instead of drifting to the
-    # end every time a product is re-created. Brand/Category already sort by name.
+    # Alphabetical by default, not insertion order. This is a *catalog*: a shopper
+    # scanning it for "Curing Light" needs the C's together, and staff paging through
+    # the admin table need the same row to stay in the same place instead of drifting
+    # to the end every time a product is re-created. Brand/Category already sort by
+    # name.
     #
-    # It also has to be the DATABASE that sorts, not the page: `limit` slices the
-    # result, so sorting client-side would only ever alphabetize whichever 50 rows
-    # happened to come back first.
-    #
-    # NULLS LAST is not needed - product_name is NOT NULL - but the id tiebreaker is:
-    # two products can legitimately share a name (same model, different brand), and
-    # without a deterministic second key their relative order can change between
-    # requests, which makes pagination silently drop or repeat one of them.
+    # It has to be the DATABASE that sorts, not the page: `limit` slices the result,
+    # so sorting client-side would only ever order whichever 50 rows happened to come
+    # back first. That is exactly why `sort` is a parameter here rather than something
+    # the materials catalog does to the 24 cards it was handed - "cheapest first"
+    # across 8,125 items is a different query, not a different rendering.
     products = (
-        query.order_by(func.lower(Product.product_name), Product.id)
+        query.order_by(*_SORTS[sort]())
         .offset(skip)
         .limit(limit)
         .all()
     )
     return [_serialize_product(p, can_view_price) for p in products]
+
+
+# Declared BEFORE /{product_id}: FastAPI matches routes in declaration order, and
+# the other way round "count" is offered to that route as an int and 422s.
+@router.get("/count", response_model=ProductCount)
+def count_products(
+    brand_id: OptionalInt = None,
+    category_id: OptionalInt = None,
+    q: str | None = None,
+    section: SectionFilter = "machinery",
+    include_unpurchasable: bool = False,
+    include_delisted: bool = False,
+    db: Session = Depends(get_db),
+):
+    """How many products match, ignoring paging.
+
+    Exists for the materials catalog. Machinery is ~110 products and fits in one
+    `limit=500` fetch, so the page could count what it already had; materials is
+    8,000+ and has to be paged server-side, at which point the page holds 24 rows
+    and genuinely cannot know whether there are three more or three thousand.
+
+    Takes no price-visibility dependency: a count is not a price, and it is the
+    same number for every viewer.
+    """
+    total = _catalog_query(
+        db,
+        brand_id=brand_id,
+        category_id=category_id,
+        q=q,
+        section=section,
+        include_unpurchasable=include_unpurchasable,
+        include_delisted=include_delisted,
+    ).count()
+    return {"count": total}
+
+
+@router.get("/facets", response_model=ProductFacets)
+def product_facets(
+    brand_id: OptionalInt = None,
+    category_id: OptionalInt = None,
+    q: str | None = None,
+    section: SectionFilter = "machinery",
+    include_unpurchasable: bool = False,
+    include_delisted: bool = False,
+    db: Session = Depends(get_db),
+):
+    """Which categories and brands the matching products fall into, with counts.
+
+    Also for the materials catalog, and for the same reason /count exists: at 8,000
+    items over 824 categories the storefront has to lead with the groups rather
+    than the items, and a group is only worth offering if you can say how big it
+    is. GET /categories/ can't answer that - it lists every category in the
+    database, machinery's included, with no idea how many materials sit behind
+    each - so a dropdown built from it offers 854 options, thirty of which lead to
+    an empty grid.
+
+    Counted over the *filtered* set, so the numbers describe what clicking would
+    actually yield: pick a brand and the category list shrinks to that brand's
+    categories, with that brand's counts.
+
+    Like /count, this takes no price-visibility dependency - a count is not a
+    price.
+    """
+    def buckets(group_column, entity, name_column, extra_column=None, extra_key=None, **drop):
+        # `drop` blanks the grouped column's OWN filter. Counting categories with
+        # category_id still applied would return exactly one bucket - the category
+        # already chosen - leaving the page no way to offer the others without
+        # clearing the filter first. Every other filter stays, which is what makes
+        # the brand counts on a category page describe that category.
+        base = _catalog_query(
+            db,
+            **{
+                "brand_id": brand_id,
+                "category_id": category_id,
+                "q": q,
+                "section": section,
+                "include_unpurchasable": include_unpurchasable,
+                "include_delisted": include_delisted,
+                **drop,
+            },
+        )
+        # One optional column each side, under a different key: a brand bucket
+        # carries its logo, a category bucket the admin's icon override. Selected in
+        # the GROUP BY rather than fetched per bucket afterwards - 824 categories is
+        # 824 extra queries otherwise.
+        columns = [entity.id, name_column]
+        if extra_column is not None:
+            columns.append(extra_column)
+        rows = (
+            base.with_entities(*columns, func.count(Product.id).label("n"))
+            .join(entity, group_column == entity.id)
+            .group_by(*columns)
+            .order_by(func.count(Product.id).desc(), name_column)
+            .all()
+        )
+        return [
+            {
+                "id": row[0],
+                "name": row[1],
+                "count": row[-1],
+                **({extra_key: row[2]} if extra_column is not None else {}),
+            }
+            for row in rows
+        ]
+
+    return {
+        "categories": buckets(
+            Product.category_id,
+            Category,
+            Category.category_name,
+            Category.category_icon,
+            "icon",
+            category_id=None,
+        ),
+        "brands": buckets(
+            Product.brand_id,
+            Brand,
+            Brand.brand_name,
+            Brand.brand_image,
+            "image",
+            brand_id=None,
+        ),
+    }
 
 
 @router.get("/{product_id}", response_model=ProductOut)
@@ -361,7 +567,10 @@ async def upload_product_image(
     product = db.query(Product).filter(Product.id == product_id).first()
     if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
-    product.product_image = await save_named_image(file, "products", product.product_name)
+    # Filed under products/machinery or products/materials - see _image_folder.
+    product.product_image = await save_named_image(
+        file, _image_folder(product), product.product_name
+    )
     stamp_updated_by(product, current_user)
     db.commit()
     return _get_product_or_404(db, product_id)
@@ -397,7 +606,7 @@ async def upload_product_gallery_images(
 
     next_order = max((img.sort_order for img in product.images), default=-1) + 1
     for offset, file in enumerate(files):
-        url = await save_image(file, "products")
+        url = await save_image(file, _image_folder(product))
         db.add(ProductImage(product_id=product_id, image=url, sort_order=next_order + offset))
 
     stamp_updated_by(product, current_user)

@@ -1443,12 +1443,29 @@ def test_create_brand_with_image_in_one_request(client, db_session):
     assert resp.json()["brand_image"] is None
 
 
-def test_category_image_upload(client, db_session):
+def test_category_icon_replaces_the_dropped_image(client, db_session):
+    """A category carries a Font Awesome class now, not a picture.
+
+    The upload endpoint went with the column. That is asserted here rather than
+    left implicit, because a 404 on POST /categories/{id}/image is the only thing
+    that tells an older client the field really went away, instead of letting it
+    keep posting pictures into a 200 that stores nothing."""
     make_admin(db_session, email="catuploader@example.com", password="password123")
     headers = auth_header(client, "catuploader@example.com", "password123")
     category_id = client.post(
-        "/categories/", data={"category_name": "UploadCat"}, headers=headers
+        "/categories/",
+        data={"category_name": "UploadCat", "category_icon": "fa-teeth"},
+        headers=headers,
     ).json()["id"]
+
+    assert client.get(f"/categories/{category_id}").json()["category_icon"] == "fa-teeth"
+
+    # Clearing it puts the category back on the storefront's name-based guess.
+    resp = client.put(
+        f"/categories/{category_id}", json={"category_icon": None}, headers=headers
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["category_icon"] is None
 
     fake_png = b"\x89PNG\r\n\x1a\n" + b"0" * 100
     resp = client.post(
@@ -1456,15 +1473,7 @@ def test_category_image_upload(client, db_session):
         files={"file": ("logo.png", fake_png, "image/png")},
         headers=headers,
     )
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["category_image"].startswith("/static/uploads/categories/")
-
-    resp = client.post(
-        f"/categories/{category_id}/image",
-        files={"file": ("logo.txt", b"not an image", "text/plain")},
-        headers=headers,
-    )
-    assert resp.status_code == 400
+    assert resp.status_code == 404
 
 
 def test_product_gallery_upload_append_and_delete(client, db_session):
@@ -1601,24 +1610,22 @@ def test_product_gallery_upload_requires_product_management(client, db_session):
     assert "product_management" in resp.json()["detail"]
 
 
-def test_create_category_with_image_in_one_request(client, db_session):
+def test_create_category_icon_is_optional(client, db_session):
     make_admin(db_session, email="catuploader2@example.com", password="password123")
     headers = auth_header(client, "catuploader2@example.com", "password123")
 
-    fake_png = b"\x89PNG\r\n\x1a\n" + b"0" * 100
     resp = client.post(
         "/categories/",
-        data={"category_name": "OneShotCat"},
-        files={"file": ("logo.png", fake_png, "image/png")},
+        data={"category_name": "OneShotCat", "category_icon": "fa-syringe"},
         headers=headers,
     )
     assert resp.status_code == 201, resp.text
-    assert resp.json()["category_image"].startswith("/static/uploads/categories/")
+    assert resp.json()["category_icon"] == "fa-syringe"
 
-    # Image is optional: creating without one still works
-    resp = client.post("/categories/", data={"category_name": "NoImageCat"}, headers=headers)
+    # No icon is the normal case: the storefront guesses one from the name.
+    resp = client.post("/categories/", data={"category_name": "NoIconCat"}, headers=headers)
     assert resp.status_code == 201, resp.text
-    assert resp.json()["category_image"] is None
+    assert resp.json()["category_icon"] is None
 
 
 def test_a_product_can_carry_several_titled_manuals(client, db_session):
@@ -5581,3 +5588,426 @@ def test_entity_history_is_empty_rather_than_404_for_an_untouched_record(client,
 
     assert _entries_for(client, headers, "products", 999999) == []
     assert _entries_for(client, headers, "not_a_table", 1) == []
+
+
+def test_product_count_matches_listing_and_respects_filters(client, db_session):
+    """GET /products/count is what the materials catalog paginates on.
+
+    It has to agree with GET /products/ exactly - the count is divided into page
+    numbers, so a filter honoured by one and not the other produces pages that are
+    empty at the end, or a last page nobody can reach.
+    """
+    make_admin(db_session, email="counter@example.com", password="password123")
+    headers = auth_header(client, "counter@example.com", "password123")
+    brand_id = client.post(
+        "/brands/", data={"brand_name": "CountCo"}, headers=headers
+    ).json()["id"]
+
+    def make(name, section, code=None):
+        body = {
+            "product_name": name,
+            "price": "10.00",
+            "brand_id": brand_id,
+            "section": section,
+        }
+        if code:
+            body["product_code"] = code
+        resp = client.post("/products/", json=body, headers=headers)
+        assert resp.status_code == 201, resp.text
+        return resp.json()["id"]
+
+    make("Counted Machine", "machinery")
+    make("Counted Burr", "materials", code="CNT-BURR-1")
+    make("Counted Cement", "materials")
+
+    def count(**params):
+        resp = client.get("/products/count", params=params)
+        assert resp.status_code == 200, resp.text
+        return resp.json()["count"]
+
+    def listed(**params):
+        return len(client.get("/products/", params={**params, "limit": 500}).json())
+
+    # Section is the filter the two catalogs are built on.
+    assert count(section="materials") == listed(section="materials") == 2
+    assert count(section="machinery") == listed(section="machinery") >= 1
+    assert count(section="all") == listed(section="all")
+    assert count(section="all") == count(section="materials") + count(section="machinery")
+
+    # brand_id and q agree too.
+    assert count(section="materials", brand_id=brand_id) == 2
+    assert count(section="materials", q="Cement") == 1
+
+    # q matches the item code, not just the name - staff search the materials
+    # catalog by SAP item code far more than by name.
+    assert count(section="materials", q="CNT-BURR") == 1
+    assert listed(section="materials", q="CNT-BURR") == 1
+
+    # A filter matching nothing is 0, not an error.
+    assert count(section="materials", q="no-such-product-anywhere") == 0
+
+
+def test_product_facets_count_the_groups_a_filter_set_falls_into(client, db_session):
+    """GET /products/facets is what the materials storefront browses by.
+
+    8,000 items over 800+ categories can only be browsed group-first, and a group
+    is worth offering only when the page can say how big it is. GET /categories/
+    can't: it lists every category in the database - machinery's included - with
+    no idea how many materials sit behind each.
+    """
+    make_admin(db_session, email="facets@example.com", password="password123")
+    headers = auth_header(client, "facets@example.com", "password123")
+
+    def brand(name):
+        return client.post("/brands/", data={"brand_name": name}, headers=headers).json()["id"]
+
+    def category(name):
+        return client.post(
+            "/categories/", data={"category_name": name}, headers=headers
+        ).json()["id"]
+
+    komet, mani = brand("FacetKomet"), brand("FacetMani")
+    burs, files = category("FacetBurs"), category("FacetFiles")
+
+    def make(name, brand_id, category_id, section="materials"):
+        resp = client.post(
+            "/products/",
+            json={
+                "product_name": name,
+                "price": "10.00",
+                "brand_id": brand_id,
+                "category_id": category_id,
+                "section": section,
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 201, resp.text
+        return resp.json()["id"]
+
+    make("Facet Bur A", komet, burs)
+    make("Facet Bur B", komet, burs)
+    make("Facet Bur C", mani, burs)
+    make("Facet File A", mani, files)
+    # Machinery, and a different section: it must not be counted into either facet.
+    make("Facet Machine", komet, burs, section="machinery")
+
+    def facets(**params):
+        resp = client.get("/products/facets", params={"section": "materials", **params})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        return (
+            {c["name"]: c["count"] for c in body["categories"]},
+            {b["name"]: b["count"] for b in body["brands"]},
+        )
+
+    categories, brands = facets()
+    assert categories["FacetBurs"] == 3, "the machinery product must not be counted"
+    assert categories["FacetFiles"] == 1
+    assert brands["FacetKomet"] == 2
+    assert brands["FacetMani"] == 2
+
+    # Buckets are ordered biggest-first, so a page can take "the top N" without
+    # sorting anything itself.
+    counts = [c["count"] for c in client.get(
+        "/products/facets", params={"section": "materials"}
+    ).json()["categories"]]
+    assert counts == sorted(counts, reverse=True)
+
+    # A brand filter narrows the category counts to that brand's products...
+    categories, brands = facets(brand_id=komet)
+    assert categories["FacetBurs"] == 2
+    assert "FacetFiles" not in categories
+    # ...but the brand facet itself ignores brand_id, or picking a brand would
+    # leave the page listing only the brand already picked - with no way back to
+    # the others short of clearing the filter.
+    assert brands == {"FacetKomet": 2, "FacetMani": 2}
+
+    # The same rule the other way round: a chosen category narrows the brands.
+    categories, brands = facets(category_id=files)
+    assert brands == {"FacetMani": 1}
+    assert categories["FacetBurs"] == 3
+
+    # Search is a filter like any other.
+    categories, _ = facets(q="Facet Bur")
+    assert categories == {"FacetBurs": 3}
+
+
+def test_product_facets_route_is_not_shadowed_by_product_id(client):
+    """Same route-order trap /products/count has: declared after /{product_id},
+    "facets" is offered to it as an int and 422s."""
+    resp = client.get("/products/facets")
+    assert resp.status_code == 200
+    assert set(resp.json()) == {"categories", "brands"}
+
+
+def test_product_count_route_is_not_shadowed_by_product_id(client):
+    """/products/count must resolve to the count route, not be offered to
+    /products/{product_id} as an int (which 422s). Route order is the only thing
+    keeping this true, so it is worth a test of its own."""
+    resp = client.get("/products/count")
+    assert resp.status_code == 200
+    assert "count" in resp.json()
+
+
+def test_delisted_products_leave_the_catalog_but_keep_their_row(client, db_session):
+    """SAP withdrawing an item must take it off the storefront without deleting it.
+
+    Deleting is not an option: order_items.product_id is ON DELETE SET NULL, so a
+    delete would blank the link from every past order that bought it. Hence a
+    delisted_at stamp, hidden from public reads and visible with include_delisted.
+    """
+    from datetime import datetime, timezone
+
+    from app.models import Product
+
+    make_admin(db_session, email="delist@example.com", password="password123")
+    headers = auth_header(client, "delist@example.com", "password123")
+    brand_id = client.post(
+        "/brands/", data={"brand_name": "DelistCo"}, headers=headers
+    ).json()["id"]
+    product_id = client.post(
+        "/products/",
+        json={
+            "product_name": "Withdrawn Burr",
+            "price": "10.00",
+            "brand_id": brand_id,
+            "section": "materials",
+        },
+        headers=headers,
+    ).json()["id"]
+
+    def listed_ids(**params):
+        rows = client.get("/products/", params={"section": "materials", "limit": 500, **params})
+        return [p["id"] for p in rows.json()]
+
+    assert product_id in listed_ids()
+    before = client.get("/products/count", params={"section": "materials"}).json()["count"]
+
+    db_session.query(Product).filter(Product.id == product_id).update(
+        {"delisted_at": datetime.now(timezone.utc)}
+    )
+    db_session.commit()
+
+    # Gone from the public listing and the count...
+    assert product_id not in listed_ids()
+    after = client.get("/products/count", params={"section": "materials"}).json()["count"]
+    assert after == before - 1
+
+    # ...but still there for the admin table, and still a real row.
+    assert product_id in listed_ids(include_delisted="true")
+    assert (
+        client.get("/products/count", params={"section": "materials", "include_delisted": "true"})
+        .json()["count"]
+        == before
+    )
+    detail = client.get(f"/products/{product_id}").json()
+    assert detail["delisted_at"] is not None
+
+
+def test_sap_sync_delists_withdrawn_items_and_refuses_a_partial_extract():
+    """The delisting half of scripts/sap_sync, exercised without a database.
+
+    _apply_delisting is the piece with teeth: it is what an unattended nightly run
+    uses to decide that something should disappear, and the safety rail is what
+    stops a short read from emptying the storefront.
+    """
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from scripts.sap_sync import Report, _apply_delisting
+
+    now = datetime.now(timezone.utc)
+
+    def product(section="materials", delisted_at=None):
+        return SimpleNamespace(section=section, delisted_at=delisted_at)
+
+    # One withdrawn, one still offered, one machinery product that is not in SAP at
+    # all and must never be touched by any of this.
+    existing = {
+        "GONE": product(),
+        "KEPT": product(),
+        "MACHINE": product(section="machinery"),
+    }
+    report = Report()
+    _apply_delisting(existing, {"KEPT"}, {"GONE": "frozen in SAP"}, report, now, 1.0)
+
+    assert report.delisted == [("GONE", "frozen in SAP")]
+    assert existing["GONE"].delisted_at == now
+    assert existing["KEPT"].delisted_at is None
+    # Machinery never enters SAP, so its absence from the extract means nothing.
+    assert existing["MACHINE"].delisted_at is None
+
+    # An item that comes back is un-hidden without anyone intervening.
+    report = Report()
+    _apply_delisting(existing, {"KEPT", "GONE"}, {}, report, now, 1.0)
+    assert report.relisted == ["GONE"]
+    assert existing["GONE"].delisted_at is None
+
+    # The safety rail: a partial extract would delist everything, so it stops.
+    report = Report()
+    try:
+        _apply_delisting(existing, set(), {}, report, now, 0.10)
+    except SystemExit as exc:
+        assert "Refusing to delist" in str(exc)
+    else:
+        raise AssertionError("a 100% delist should have been refused")
+    # Nothing was stamped on the way out.
+    assert all(p.delisted_at is None for p in existing.values())
+def test_products_can_be_sorted_and_the_sort_is_done_by_the_database(client, db_session):
+    """GET /products/?sort=... orders the whole result set, not the page.
+
+    That distinction is the reason the parameter exists at all: the materials
+    catalog holds 24 cards out of 8,000+, so "cheapest first" sorted in the browser
+    would only ever reorder whichever 24 came back. Asserted here by paging with
+    limit=1 - if the sort were applied after the slice, the first page would be the
+    same row for every value of `sort`.
+    """
+    make_admin(db_session, email="sorter@example.com", password="password123")
+    headers = auth_header(client, "sorter@example.com", "password123")
+    brand_id = client.post(
+        "/brands/", data={"brand_name": "SortCo"}, headers=headers
+    ).json()["id"]
+
+    for name, price in (("Sort Zulu", "5.00"), ("Sort Alpha", "90.00"), ("Sort Mike", "40.00")):
+        resp = client.post(
+            "/products/",
+            json={
+                "product_name": name,
+                "price": price,
+                "brand_id": brand_id,
+                "section": "materials",
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 201, resp.text
+
+    def first(sort):
+        resp = client.get(
+            "/products/", params={"section": "materials", "sort": sort, "limit": 1}
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()[0]["product_name"]
+
+    assert first("name") == "Sort Alpha"
+    assert first("name_desc") == "Sort Zulu"
+    assert first("price_asc") == "Sort Zulu"
+    assert first("price_desc") == "Sort Alpha"
+    # Nothing here has been synced from SAP, so every stock_qty is NULL. A stock
+    # sort must still return rows rather than putting the unknowns on top.
+    assert first("stock_desc") in {"Sort Alpha", "Sort Mike", "Sort Zulu"}
+
+    # A sort value the endpoint doesn't define is rejected by validation rather
+    # than reaching an ORDER BY - see schemas.ProductSort.
+    assert client.get("/products/", params={"sort": "product_name; drop table"}).status_code == 422
+
+
+def test_hero_slides_are_filtered_by_section(client, db_session):
+    """Each storefront's carousel asks for its own slides.
+
+    Default is "all" (unlike GET /products/): the admin table is the caller that
+    wants everything, and every slide written before the column is machinery, so an
+    unfiltered call keeps returning what it always returned.
+    """
+    make_admin(db_session, email="heroSection@example.com", password="password123")
+    headers = auth_header(client, "heroSection@example.com", "password123")
+
+    for heading, section in (("Machinery Hero", "machinery"), ("Materials Hero", "materials")):
+        resp = client.post(
+            "/hero-slides/",
+            data={"heading": heading, "section": section},
+            headers=headers,
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["section"] == section
+
+    def headings(**params):
+        resp = client.get("/hero-slides/", params={"limit": 200, **params})
+        assert resp.status_code == 200, resp.text
+        return {row["heading"] for row in resp.json()}
+
+    assert "Materials Hero" in headings(section="materials")
+    assert "Machinery Hero" not in headings(section="materials")
+    assert {"Machinery Hero", "Materials Hero"} <= headings()
+
+    # A slide written before the column defaults to machinery.
+    resp = client.post("/hero-slides/", data={"heading": "Unstated Hero"}, headers=headers)
+    assert resp.json()["section"] == "machinery"
+
+    # And it can be moved between shops without touching anything else on the row.
+    slide_id = resp.json()["id"]
+    moved = client.put(f"/hero-slides/{slide_id}", json={"section": "materials"}, headers=headers)
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["section"] == "materials"
+    assert moved.json()["heading"] == "Unstated Hero"
+
+
+def test_promotions_are_filtered_by_section(client, db_session):
+    """The materials front page advertises materials deals, not machinery bundles."""
+    make_admin(db_session, email="promoSection@example.com", password="password123")
+    headers = auth_header(client, "promoSection@example.com", "password123")
+
+    def promo(name, **extra):
+        resp = client.post(
+            "/promotions/",
+            json={
+                "promotion_name": name,
+                "price": "99.00",
+                "start_date": "2020-01-01T00:00:00Z",
+                "end_date": "2999-01-01T00:00:00Z",
+                **extra,
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 201, resp.text
+        return resp.json()
+
+    assert promo("SectionlessPromo")["section"] == "machinery"
+    promo("MaterialsPromo", section="materials")
+
+    def names(**params):
+        resp = client.get("/promotions/", params={"limit": 200, **params})
+        assert resp.status_code == 200, resp.text
+        return {row["promotion_name"] for row in resp.json()}
+
+    assert "MaterialsPromo" in names(section="materials")
+    assert "SectionlessPromo" not in names(section="materials")
+    assert {"MaterialsPromo", "SectionlessPromo"} <= names()
+
+
+def test_product_images_are_filed_under_their_section(client, db_session):
+    """Machinery and materials photographs are kept in separate folders.
+
+    Not cosmetic: the materials catalogue is re-imported from SAP nightly and can
+    withdraw thousands of rows at once, while machinery pictures are shot in-house
+    and outlive the products. One flat products/ folder makes it impossible to sync,
+    purge or hand off one shop's media without touching the other's.
+    """
+    make_admin(db_session, email="imgfolder@example.com", password="password123")
+    headers = auth_header(client, "imgfolder@example.com", "password123")
+    brand_id = client.post(
+        "/brands/", data={"brand_name": "FolderCo"}, headers=headers
+    ).json()["id"]
+
+    def product(name, section):
+        return client.post(
+            "/products/",
+            json={
+                "product_name": name,
+                "price": "10.00",
+                "brand_id": brand_id,
+                "section": section,
+            },
+            headers=headers,
+        ).json()["id"]
+
+    for section in ("machinery", "materials"):
+        product_id = product(f"Folder {section}", section)
+        resp = client.post(
+            f"/products/{product_id}/image",
+            files={"file": ("photo.png", _png_bytes(), "image/png")},
+            headers=headers,
+        )
+        assert resp.status_code == 200, resp.text
+        # Local-disk storage in tests; with R2 configured the same key is the tail
+        # of the returned URL, so the assertion holds either way.
+        assert f"products/{section}/" in resp.json()["product_image"]

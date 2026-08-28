@@ -162,7 +162,7 @@ def export_brands(db) -> list[dict]:
 
 def export_categories(db) -> list[dict]:
     return [
-        {"category_name": c.category_name, "category_image": c.category_image}
+        {"category_name": c.category_name, "category_icon": c.category_icon}
         for c in db.query(Category).order_by(Category.id).all()
     ]
 

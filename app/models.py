@@ -233,7 +233,25 @@ class Category(AuditedMixin, Base):
 
     id = Column(Integer, primary_key=True, index=True)
     category_name = Column(String(150), unique=True, nullable=False, index=True)
-    category_image = Column(String(500), nullable=True)
+
+    # The Font Awesome class the storefront draws for this category, e.g. "fa-teeth".
+    #
+    # Replaces `category_image`, which was dropped. A photograph was never what a
+    # category tile wanted: 824 of the 855 categories arrived from SAP with no
+    # picture and no prospect of one, and the 31 machinery categories that could
+    # have had one never used it anywhere on the storefront - only the admin table
+    # rendered it, which meant maintaining an upload path for a thumbnail nobody
+    # outside the admin panel ever saw.
+    #
+    # Nullable, and the null case is the normal one: blueprints/materials.py has a
+    # keyword->glyph map (category_icon()) that guesses from the name, and this
+    # column only exists to override it where the guess is wrong. So an empty value
+    # means "keep guessing", not "draw nothing".
+    #
+    # Free text rather than a Literal of known glyphs: Font Awesome ships thousands
+    # and the set moves with their releases, so a fixed vocabulary would be a
+    # migration every time an admin wants an icon we didn't think of.
+    category_icon = Column(String(60), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     # passive_deletes=True: category_id is nullable (unlike brand_id), so
@@ -292,6 +310,47 @@ class Product(AuditedMixin, Base):
     # Unit of measure the product is sold/counted in (e.g. "pcs", "box",
     # "set"). Free text like badge - no fixed vocabulary requested.
     uom = Column(String(20), nullable=True)
+
+    # On-hand quantity as of the last SAP sync, summed across warehouses.
+    #
+    # NULL and 0 mean different things and the difference matters: NULL is "we have
+    # never been told" (every machinery product, which never enters SAP), 0 is "SAP
+    # says none left". Anything that eventually displays availability has to treat
+    # the two differently, so this stays nullable rather than defaulting to 0.
+    #
+    # Numeric, not Integer: OITM.OnHand is a decimal in SAP and some materials are
+    # counted in fractional boxes. Rounding at import would quietly disagree with
+    # the figure staff read off the SAP client.
+    #
+    # NOT in ProductCreate/ProductUpdate on purpose - see schemas.ProductOut. This
+    # column is owned by scripts/sap_sync.py; an admin editing it by hand would see
+    # the value silently reverted at the next sync, which is worse than not
+    # offering the field at all.
+    stock_qty = Column(Numeric(12, 2), nullable=True)
+
+    # When stock_qty was last refreshed. Kept because the figure is only as good as
+    # its age and nothing about the number itself reveals that: a storefront that
+    # shows availability needs to know whether it is reading yesterday's count or
+    # one from a sync that has been broken for a month.
+    stock_synced_at = Column(DateTime(timezone=True), nullable=True)
+
+    # When SAP stopped listing this item - it vanished from the item master, or was
+    # marked invalid/frozen there. NULL means currently listed, which is every
+    # machinery product forever (they never enter SAP).
+    #
+    # Delisted, not deleted, and that distinction is the whole reason this column
+    # exists. The row cannot be deleted: order_items.product_id is ON DELETE SET
+    # NULL, so removing it would blank the link from every past order that bought
+    # it, and product_images/manuals would CASCADE away with it. It also cannot
+    # just be left alone - without this, an item withdrawn in SAP keeps selling on
+    # the storefront indefinitely, which is the one failure a synced catalogue is
+    # actually prone to.
+    #
+    # A timestamp rather than a boolean: "since when" is the question anyone asks
+    # about a product that disappeared, and a bool cannot answer it. Cleared back
+    # to NULL if the item returns to SAP, so a temporary freeze un-hides itself on
+    # the next sync instead of needing someone to notice.
+    delisted_at = Column(DateTime(timezone=True), nullable=True)
 
     badge = Column(String(50), nullable=True)
 
@@ -459,6 +518,20 @@ class Promotion(AuditedMixin, Base):
     id = Column(Integer, primary_key=True, index=True)
     promotion_name = Column(String(200), nullable=False, index=True)
     description = Column(Text, nullable=True)
+
+    # Which half of the storefront advertises this deal: "machinery" or "materials".
+    #
+    # Same words and the same reasoning as Product.section. Before this column every
+    # promotion was a machinery bundle by definition, so the materials pages simply
+    # hid the promo banner rather than filtering it - a deal for a $9,000 scanner on
+    # a page selling burs by the box is not a deal, it is noise. Now that materials
+    # has its own front page with its own deals on it, "which shop is this for" is a
+    # property of the promotion, not of the page rendering it.
+    #
+    # NOT NULL with server_default "machinery": every promotion that existed before
+    # this column is a machinery bundle, which makes the backfill "all of them".
+    section = Column(String(20), nullable=False, server_default="machinery")
+
     price = Column(Numeric(10, 2), nullable=False)
     old_price = Column(Numeric(10, 2), nullable=True)  # fixed: old-price -> old_price
     start_date = Column(DateTime(timezone=True), nullable=False)
@@ -1014,6 +1087,19 @@ class HeroSlide(AuditedMixin, Base):
     heading_highlight = Column(String(120), nullable=True)
     # The paragraph under the heading. Nullable - a purely graphic slide needs none.
     subheading = Column(String(400), nullable=True)
+
+    # Which storefront carousel this slide belongs in: "machinery" or "materials".
+    #
+    # The carousel used to exist on the machinery side only, so a slide needed no
+    # opinion about where it went. Materials now has its own hero, and the two shops
+    # advertise different things to different buyers - a slide about implant motors
+    # has no business on the page a clinic buys gloves from. Rather than a second
+    # table, the same rows carry a section and each page asks for its own.
+    #
+    # NOT NULL with server_default "machinery", so every slide written before this
+    # column stays exactly where it was rendering. See Product.section for why this
+    # is a plain String rather than a DB enum.
+    section = Column(String(20), nullable=False, server_default="machinery")
 
     # Nullable so a slide can be written before its artwork is ready (and so a failed
     # upload doesn't lose the copy). Stored like every other image field: an R2 URL, a

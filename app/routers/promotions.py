@@ -10,7 +10,7 @@ from app.core.files import save_named_image
 from app.core.query import Limit, Skip
 from app.database import get_db
 from app.models import Promotion, PromotionItem, User
-from app.schemas import PromotionCreate, PromotionOut, PromotionUpdate
+from app.schemas import PromotionCreate, PromotionOut, PromotionUpdate, SectionFilter
 
 router = APIRouter(prefix="/promotions", tags=["Promotions"])
 
@@ -43,17 +43,25 @@ def list_promotions(
     skip: Skip = 0,
     limit: Limit = 50,
     active_only: bool = False,
+    section: SectionFilter = "all",
     can_view_price: bool = Depends(get_price_visibility),
     db: Session = Depends(get_db),
 ):
     """Public: promotions power the storefront and should be visible to
     anyone. Pass active_only=true to only get promotions currently
     running (start_date <= now <= end_date). Price/old_price are masked
-    unless the caller is staff or a customer with access_permission=True."""
+    unless the caller is staff or a customer with access_permission=True.
+
+    `section` narrows the list to one shop's deals. Defaults to "all" (unlike
+    GET /products/) for the same reason GET /hero-slides/ does: every promotion
+    predating the column is machinery, so an unfiltered call returns what it always
+    returned, and the storefront pages pass their own section explicitly."""
     query = db.query(Promotion)
     if active_only:
         now = datetime.now(timezone.utc)
         query = query.filter(Promotion.start_date <= now, Promotion.end_date >= now)
+    if section != "all":
+        query = query.filter(Promotion.section == section)
     promotions = query.order_by(Promotion.start_date.desc()).offset(skip).limit(limit).all()
     return [_serialize_promotion(p, can_view_price) for p in promotions]
 

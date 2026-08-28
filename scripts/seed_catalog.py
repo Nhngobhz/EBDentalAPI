@@ -90,7 +90,7 @@ def seed_categories(db) -> dict[str, Category]:
             print(f"Category '{name}' already exists (id={category.id}), skipping.")
         else:
             category = Category(
-                category_name=name, category_image=item.get("category_image")
+                category_name=name, category_icon=item.get("category_icon")
             )
             db.add(category)
             db.flush()

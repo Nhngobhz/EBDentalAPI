@@ -1,10 +1,9 @@
-﻿from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+﻿from fastapi import APIRouter, Depends, Form, HTTPException, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.audit import stamp_updated_by
 from app.core.deps import require_permission
-from app.core.files import save_image
 from app.core.query import Limit, Skip
 from app.database import get_db
 from app.models import Category, User
@@ -30,20 +29,22 @@ def get_category(category_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/", response_model=CategoryOut, status_code=status.HTTP_201_CREATED)
-async def create_category(
+def create_category(
     category_name: str = Form(..., min_length=1, max_length=150),
-    file: UploadFile | None = File(None),
+    category_icon: str | None = Form(None, max_length=60),
     current_user: User = _perm,
     db: Session = Depends(get_db),
 ):
-    """Accepts multipart/form-data so the category image can be attached in
-    the same request - no separate POST /{id}/image call needed. That
-    endpoint still exists for replacing the image later."""
+    """Still multipart/form-data, though there is no longer a file to attach: the
+    admin screen posts this as an ordinary HTML form, and changing the content type
+    here would only move that requirement somewhere else.
+
+    The category image is gone (see models.Category.category_icon). A category tile
+    on the storefront draws a glyph, never a photograph, so what an admin sets here
+    is the glyph."""
     if db.query(Category).filter(Category.category_name == category_name).first():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Category name already exists")
-    category = Category(category_name=category_name)
-    if file is not None:
-        category.category_image = await save_image(file, "categories")
+    category = Category(category_name=category_name, category_icon=(category_icon or "").strip() or None)
     stamp_updated_by(category, current_user)
     db.add(category)
     db.commit()
@@ -60,20 +61,6 @@ def update_category(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(category, field, value)
-    stamp_updated_by(category, current_user)
-    db.commit()
-    db.refresh(category)
-    return category
-
-
-@router.post("/{category_id}/image", response_model=CategoryOut)
-async def upload_category_image(
-    category_id: int, file: UploadFile, current_user: User = _perm, db: Session = Depends(get_db)
-):
-    category = db.query(Category).filter(Category.id == category_id).first()
-    if not category:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
-    category.category_image = await save_image(file, "categories")
     stamp_updated_by(category, current_user)
     db.commit()
     db.refresh(category)

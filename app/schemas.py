@@ -361,15 +361,21 @@ class BrandMini(BaseModel):
 # ---------------------------------------------------------------------------
 class CategoryBase(BaseModel):
     category_name: str = Field(..., min_length=1, max_length=150)
+    # A Font Awesome class ("fa-teeth"), overriding the storefront's name-based
+    # guess. Null means "guess" - see models.Category.category_icon. Replaces the
+    # dropped category_image.
+    category_icon: Optional[str] = Field(None, max_length=60)
 
 
 class CategoryUpdate(BaseModel):
     category_name: Optional[str] = Field(None, min_length=1, max_length=150)
+    # Sending null clears the override and puts the category back on the guess,
+    # which is how the admin form erases a chosen icon.
+    category_icon: Optional[str] = Field(None, max_length=60)
 
 
 class CategoryOut(CategoryBase):
     id: int
-    category_image: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     updated_by: Optional[UserMini] = None
@@ -382,7 +388,7 @@ class CategoryMini(BaseModel):
 
     id: int
     category_name: str
-    category_image: Optional[str] = None
+    category_icon: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -408,6 +414,29 @@ Section = Literal["machinery", "materials"]
 # column existed - and "all" is a deliberate opt-in for the screens that must see
 # every row, the same way include_unpurchasable already works on that endpoint.
 SectionFilter = Literal["machinery", "materials", "all"]
+
+# How GET /products/ orders what it returns.
+#
+# A closed vocabulary rather than a free-text "order_by" column name, because the
+# value arrives from a query string: anything that lets a caller name a column is a
+# way to sort by a column the endpoint never meant to expose, and (with the wrong
+# implementation) a way to inject SQL. The router maps each of these to an explicit
+# ORDER BY - see _SORTS there.
+#
+# "name" stays the default, which is what the endpoint did before this parameter
+# existed. "stock" is only meaningful for materials (machinery never enters SAP, so
+# its stock_qty is NULL throughout) but is accepted for either, and the router puts
+# the NULLs last so an unsynced product never occupies the top of a stock sort.
+ProductSort = Literal[
+    "name",
+    "name_desc",
+    "price_asc",
+    "price_desc",
+    "stock_asc",
+    "stock_desc",
+    "newest",
+    "oldest",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +567,51 @@ class ProductPriceUpdate(BaseModel):
         return discount
 
 
+class ProductCount(BaseModel):
+    """How many products match a filter. An object rather than a bare integer so
+    the endpoint can gain a sibling figure later without breaking its callers."""
+
+    count: int
+
+
+class FacetBucket(BaseModel):
+    """One row of a facet count: a brand or category, and how many products in the
+    current filter set belong to it."""
+
+    id: int
+    name: str
+    count: int
+    # Only ever set on a brand bucket, so the storefront can show a logo wall
+    # instead of a list of names. None on categories, which no longer have an image
+    # column at all - they carry a glyph instead, in `icon` below.
+    image: Optional[str] = None
+    # The mirror of `image` on the other side: only ever set on a category bucket,
+    # and usually null even there. It is the admin's OVERRIDE of the storefront's
+    # name-based guess (see models.Category.category_icon), so it has to travel with
+    # the bucket - the facet list is the only thing the categories index, the home
+    # page tiles and the filter rail are built from, and without it those three
+    # screens would keep guessing while the admin panel showed a chosen icon.
+    icon: Optional[str] = None
+
+
+class ProductFacets(BaseModel):
+    """Every category and brand present in a filter set, with counts.
+
+    Exists for the materials storefront's category-first browsing. Materials is
+    8,000+ SAP items spread over 824 categories and 173 brands, and the only way
+    to offer that as something a person can browse is to lead with the groups
+    rather than the items - which means knowing how many items each group holds.
+    Asking GET /products/count once per category would be 824 requests; this is
+    one GROUP BY.
+
+    Buckets are ordered by count descending, then name, so a caller that wants
+    "the twelve biggest categories" can take the first twelve without sorting.
+    """
+
+    categories: list[FacetBucket]
+    brands: list[FacetBucket]
+
+
 class ProductOut(ProductBase):
     id: int
     # Union[Decimal, str]: viewers without price access (see
@@ -552,6 +626,21 @@ class ProductOut(ProductBase):
     discount: Optional[Decimal] = None
     list_price: Optional[Decimal] = None
     product_image: Optional[str] = None
+    # On-hand quantity from the last SAP sync, and when that sync ran. Read-only:
+    # they appear here but deliberately NOT in ProductCreate/ProductUpdate, because
+    # scripts/sap_sync.py owns them. Letting the admin form send a stock figure
+    # would produce a value that edits cleanly, saves cleanly, and is overwritten
+    # without warning by the next sync - see models.Product.stock_qty.
+    #
+    # NULL means "never synced" (all machinery), not "none in stock".
+    stock_qty: Optional[Decimal] = None
+    stock_synced_at: Optional[datetime] = None
+    # Set when SAP stopped listing the item; NULL means currently listed. Read-only
+    # here for the same reason the stock fields are - scripts/sap_sync.py owns it,
+    # and a value an admin could set by hand would be reverted by the next sync.
+    # Public catalog reads never return a delisted product at all, so in practice
+    # this is only ever non-NULL for a caller that passed include_delisted.
+    delisted_at: Optional[datetime] = None
     # Additional photos for the storefront gallery. `product_image` above is
     # still the primary one and is NOT repeated here - see models.ProductImage.
     images: list[ProductImageOut] = []
@@ -605,6 +694,10 @@ class ManualOut(ManualBase):
 class PromotionBase(BaseModel):
     promotion_name: str = Field(..., min_length=1, max_length=200)
     description: Optional[str] = None
+    # Which storefront advertises the deal. Defaults to machinery, so every caller
+    # written before the column keeps creating machinery promotions - see
+    # models.Promotion.section.
+    section: Section = "machinery"
     start_date: datetime
     end_date: datetime
 
@@ -628,6 +721,7 @@ class PromotionCreate(PromotionBase):
 class PromotionUpdate(BaseModel):
     promotion_name: Optional[str] = Field(None, min_length=1, max_length=200)
     description: Optional[str] = None
+    section: Optional[Section] = None
     price: Optional[Decimal] = Field(None, gt=0)
     old_price: Optional[Decimal] = Field(None, gt=0)
     start_date: Optional[datetime] = None
@@ -1128,6 +1222,10 @@ class HeroSlideUpdate(BaseModel):
     heading: Optional[str] = Field(None, min_length=1, max_length=200)
     heading_highlight: Optional[str] = Field(None, max_length=120)
     subheading: Optional[str] = Field(None, max_length=400)
+    # Which carousel the slide belongs in. Not Optional-meaning-clear like the text
+    # fields around it: a slide is always in one shop or the other, so there is no
+    # "null" to clear it to.
+    section: Optional[Section] = None
     badge_label: Optional[str] = Field(None, max_length=60)
     badge_icon: Optional[str] = Field(None, max_length=60)
     button_label: Optional[str] = Field(None, max_length=60)
@@ -1141,6 +1239,7 @@ class HeroSlideOut(BaseModel):
     heading: str
     heading_highlight: Optional[str] = None
     subheading: Optional[str] = None
+    section: Section = "machinery"
     slide_image: Optional[str] = None
     badge_label: Optional[str] = None
     badge_icon: Optional[str] = None

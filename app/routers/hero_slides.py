@@ -18,7 +18,7 @@ from app.core.files import save_image
 from app.core.query import Limit, Skip
 from app.database import get_db
 from app.models import HeroSlide, User
-from app.schemas import HeroSlideOut, HeroSlideUpdate
+from app.schemas import HeroSlideOut, HeroSlideUpdate, Section, SectionFilter
 
 router = APIRouter(prefix="/hero-slides", tags=["Hero Slides"])
 
@@ -43,6 +43,7 @@ def _get(db: Session, slide_id: int) -> HeroSlide:
 @router.get("/", response_model=list[HeroSlideOut])
 def list_hero_slides(
     active_only: bool = False,
+    section: SectionFilter = "all",
     skip: Skip = 0,
     limit: Limit = 50,
     db: Session = Depends(get_db),
@@ -52,12 +53,21 @@ def list_hero_slides(
     `active_only` is what the storefront passes, so a parked slide disappears from the
     carousel; the admin list omits it and sees everything, switched on or not.
 
+    `section` defaults to "all" - the OPPOSITE of GET /products/, and deliberately so.
+    There the safe answer is machinery, because a materials row leaking onto a
+    machinery page is a correctness bug; here the only caller that wants everything is
+    the admin table, and a hero slide showing on the wrong carousel is a cosmetic
+    mistake an admin can see and fix. A default of "all" also keeps every pre-existing
+    caller returning exactly what it returned before the column existed.
+
     Ordered by sort_order then id, so slides added later without an explicit position
     land at the end instead of in an arbitrary spot.
     """
     query = db.query(HeroSlide)
     if active_only:
         query = query.filter(HeroSlide.is_active.is_(True))
+    if section != "all":
+        query = query.filter(HeroSlide.section == section)
     return query.order_by(HeroSlide.sort_order, HeroSlide.id).offset(skip).limit(limit).all()
 
 
@@ -71,6 +81,7 @@ async def create_hero_slide(
     heading: str = Form(..., min_length=1, max_length=200),
     heading_highlight: str | None = Form(None, max_length=120),
     subheading: str | None = Form(None, max_length=400),
+    section: Section = Form("machinery"),
     badge_label: str | None = Form(None, max_length=60),
     badge_icon: str | None = Form(None, max_length=60),
     button_label: str | None = Form(None, max_length=60),
@@ -85,6 +96,7 @@ async def create_hero_slide(
         heading=heading.strip(),
         heading_highlight=_blank_to_none(heading_highlight),
         subheading=_blank_to_none(subheading),
+        section=section,
         badge_label=_blank_to_none(badge_label),
         badge_icon=_blank_to_none(badge_icon),
         button_label=_blank_to_none(button_label),

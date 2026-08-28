@@ -47,7 +47,16 @@ from app.models import ActivityLog, Customer, User
 # Bookkeeping that changes on every write and describes no decision anyone made.
 # `last_login` is the important one: without it, every sign-in would file an
 # "updated user" entry, and the log's whole value is that scrolling it is useful.
-IGNORED_FIELDS = frozenset({"updated_at", "updated_by_user_id", "created_at", "last_login"})
+#
+# `stock_synced_at` is the same trap one size larger. scripts/sap_sync.py stamps it
+# on all ~8,000 materials every run to record that the figure was re-confirmed, so
+# without this a nightly sync would file 8,000 "updated product" entries a night -
+# each one saying only that a timestamp moved, and between them burying the handful
+# of rows that say a price changed. Note that `stock_qty` is NOT here: the quantity
+# moving IS worth recording, and only the confirmation of it is noise.
+IGNORED_FIELDS = frozenset(
+    {"updated_at", "updated_by_user_id", "created_at", "last_login", "stock_synced_at"}
+)
 
 # Matched as substrings against the column name, case-insensitively. The row still
 # records that the field changed - only the values are replaced. A log of who changed

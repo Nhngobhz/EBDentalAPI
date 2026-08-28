@@ -31,7 +31,8 @@ CRUD → file upload → error handling), not just written from memory - see
    and manuals by passing `brand_id` / `product_id`. The same reasoning
    was later applied to `Product.category` (free text) → `category_id`:
    categories are now a real `Category` table (`category_name`, optional
-   `category_image`), created/managed the same way as brands via
+   `category_icon` - a Font Awesome class; the `category_image` column was
+   dropped in 2026-08-28, see the migration), created/managed the same way as brands via
    `/categories`. Unlike `brand_id`, `category_id` is optional (`null`
    allowed) since not every product has been sorted into one.
 

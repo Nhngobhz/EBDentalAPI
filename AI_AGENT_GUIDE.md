@@ -491,15 +491,25 @@ lookup.
 |---|---|---|
 | `GET /categories/` | Public | query `skip`, `limit` |
 | `GET /categories/{id}` | Public | - |
-| `POST /categories/` | `product_management` | multipart: `category_name` (form field) + optional `file` |
-| `PUT /categories/{id}` | `product_management` | JSON `{"category_name": "..."}`; does not touch the image |
-| `POST /categories/{id}/image` | `product_management` | multipart `file` |
+| `POST /categories/` | `product_management` | multipart: `category_name` + optional `category_icon` (form fields) |
+| `PUT /categories/{id}` | `product_management` | JSON `{"category_name": "...", "category_icon": "fa-teeth"}`; send `category_icon: null` to clear the override |
 | `DELETE /categories/{id}` | `product_management` | `400` if any `Product` still references this category (FK restrict, not cascade) |
+
+**`category_image` was dropped (2026-08-28), replaced by `category_icon`** - a Font
+Awesome class such as `"fa-teeth"`, and `POST /categories/{id}/image` went with it. No
+storefront page ever rendered the picture: the machinery catalog shows category names,
+and the materials pages draw a glyph, because 824 of the 855 categories arrived from
+SAP with no photograph and no prospect of one. `category_icon` is nullable and usually
+null - it is an **override** of the storefront's name-based guess
+(`blueprints/materials.py::category_icon` in the Flask app), not the only source of an
+icon, so a null means "keep guessing" rather than "draw nothing".
 
 ### Products - `/products`
 | Method & path | Auth | Body / notes |
 |---|---|---|
-| `GET /products/` | Public | query `skip`, `limit`, `brand_id`, `category_id`, `q` (name substring); price masking applies, see section 4. **Ordered by `product_name` (case-insensitive), `id`** - alphabetical, not insertion order, since 2026-08-19. The `id` tiebreaker matters: two products can share a name, and without a deterministic second key paging would repeat or skip one. |
+| `GET /products/` | Public | query `skip`, `limit`, `brand_id`, `category_id`, `q` (matches `product_name` **or** `product_code`), `section` (`machinery` (default) / `materials` / `all`), `include_delisted` (default `false`; items SAP has withdrawn carry `delisted_at` and are hidden from public reads); price masking applies, see section 4. `sort` (one of `name` (default), `name_desc`, `price_asc`, `price_desc`, `stock_asc`, `stock_desc`, `newest`, `oldest`) - a **closed vocabulary**, not a column name, since the value arrives from a query string. Every ordering ends in `id`: ties are the norm (a whole category at one price, thousands of materials with a NULL stock figure) and without a deterministic last key a paged endpoint silently drops and repeats rows. The stock sorts put NULLs last - `stock_qty` is NULL for every machinery product, so "most stock first" would otherwise open with everything whose stock is unknown. |
+| `GET /products/count` | Public | same query filters as `GET /products/`; returns `{"count": n}`. What the materials storefront paginates on - it holds 24 of 8,000+ rows and cannot otherwise tell whether three more match or three thousand. No price dependency: a count is not a price. |
+| `GET /products/facets` | Public | same query filters; returns `{"categories": [...], "brands": [...]}`, each bucket `{id, name, count, image, icon}` ordered **count descending, then name**. Which groups a filter set falls into, for group-first browsing (see `/materials` in the Flask app). **A facet drops its own filter**: `category_id` narrows the brand counts but not the category list, so a chosen category still offers its siblings to switch to. `image` is set on brand buckets only; `icon` on category buckets only (the admin's `category_icon` override, usually null). |
 | `GET /products/{id}` | Public | same masking |
 | `POST /products/` | `product_management` | JSON `ProductCreate` (`product_name`, `description?`, `badge?`, `product_code?` (SKU, must be globally unique or `400`), `uom?` (unit of measure, free text e.g. `"pcs"`/`"box"`), `price` >0, `discount?` (integer percent, `0`-`100`, defaults `0`), `brand_id` - must reference an existing brand or `400`, `category_id?` - must reference an existing category or `400`, `free_items?` - products given away free with this one, see "Bundle contents" below, `is_purchasable?` - defaults `true`; `false` marks a gift-only product, see "Bundle contents") |
 | `PUT /products/{id}` | `product_management`, **+`price_listing` if the body includes `price` or `discount`** | JSON `ProductUpdate`, all fields optional |
@@ -534,9 +544,9 @@ overwrite. Not price-masked - a photo isn't a price.
 ### Promotions - `/promotions`
 | Method & path | Auth | Body / notes |
 |---|---|---|
-| `GET /promotions/` | Public | query `skip`, `limit`, `active_only` (bool - filters to `start_date <= now <= end_date`); price masking applies, see section 4 |
+| `GET /promotions/` | Public | query `skip`, `limit`, `active_only` (bool - filters to `start_date <= now <= end_date`), `section` (`machinery` / `materials` / `all` (default)); price masking applies, see section 4 |
 | `GET /promotions/{id}` | Public | price masking applies, see section 4 |
-| `POST /promotions/` | `product_management` | JSON `PromotionCreate` (`promotion_name`, `description?`, `price` >0, `old_price?` >0, `start_date`, `end_date` - must be after `start_date` or `422`, `items?` - see "Bundle contents" below) |
+| `POST /promotions/` | `product_management` | JSON `PromotionCreate` (`promotion_name`, `description?`, `section?` (`machinery` default / `materials` - which storefront advertises the deal), `price` >0, `old_price?` >0, `start_date`, `end_date` - must be after `start_date` or `422`, `items?` - see "Bundle contents" below) |
 | `PUT /promotions/{id}` | `product_management` | JSON `PromotionUpdate`, all optional; if you change only one of `start_date`/`end_date`, the other's current value is still validated against it |
 | `DELETE /promotions/{id}` | `product_management` | - |
 

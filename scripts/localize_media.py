@@ -63,7 +63,9 @@ from app.models import (
 # our own bucket and so have no key of their own).
 MEDIA_COLUMNS = [
     (Brand, "brand_image", "brands"),
-    (Category, "category_image", "categories"),
+    # products/ is the historical folder; new uploads land in products/machinery or
+    # products/materials (routers/products.py::_image_folder). The fallback here is
+    # only used for a file that has no key of its own, so the flat name still applies.
     (Product, "product_image", "products"),
     (ProductImage, "image", "products"),
     (Manual, "manual_image", "manuals"),
