@@ -24,6 +24,7 @@ os.environ["R2_PUBLIC_BASE_URL"] = ""
 import pytest
 from fastapi.testclient import TestClient
 
+from app.config import settings
 from app.core import ratelimit
 from app.database import Base, SessionLocal, engine
 from app.main import app
@@ -37,6 +38,43 @@ def _create_schema():
     Base.metadata.create_all(bind=engine)
     yield
     Base.metadata.drop_all(bind=engine)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _clean_uploads():
+    """Delete the files the upload tests write, once the run is over.
+
+    The five R2 lines at the top of this file keep test uploads off Cloudflare by
+    putting storage into local-disk mode - but local-disk mode is a real write, to
+    settings.UPLOAD_DIR, which is the developer's own static/uploads tree. Truncating
+    the tables between tests removes the ROWS that pointed at those files and nothing
+    else, so every full run left ~20 stub PNGs and PDFs behind, orphaned and
+    indistinguishable at a glance from real product photography.
+
+    Snapshot-then-remove-what-is-new, rather than emptying the directory: that tree
+    holds the actual uploaded images of a working dev database (124 of them here), and
+    a fixture that wiped it would destroy a day of someone's cataloguing work the first
+    time it ran. Anything already present when the session starts is left strictly
+    alone, so the worst case of a bug in here is that test files survive - which is
+    where we started.
+    """
+    upload_dir = settings.UPLOAD_DIR
+
+    def snapshot():
+        found = set()
+        for dirpath, _, files in os.walk(upload_dir):
+            found.update(os.path.join(dirpath, f) for f in files)
+        return found
+
+    before = snapshot()
+    yield
+    for path in snapshot() - before:
+        try:
+            os.remove(path)
+        except OSError:
+            # Never fail a passing run over cleanup - a locked file on Windows is
+            # worth a leftover stub, not a red suite.
+            pass
 
 
 @pytest.fixture(autouse=True)
