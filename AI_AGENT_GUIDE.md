@@ -886,6 +886,10 @@ Worth knowing:
 - **`SAP_SYNC_TRANSPORT` decides how it reaches SQL Server** (`local` on the server,
   `auto`→ssh from a dev box) and `SAP_SYNC_TIMEOUT_SECONDS` kills a hung run so a dead
   `sqlcmd` can't leave the endpoint permanently "busy".
+- **In Docker the button needs `docker-compose.sap-ssh.yml`**, the opt-in override that
+  mounts your `ebserver` key in; without it `scripts/sap_db_pull._require_tools` stops
+  the run on one line naming the fix, because the panel reports a failure by showing the
+  last line of its output and a `FileNotFoundError: 'scp'` traceback said nothing.
 - **`--max-delist-ratio` is deliberately not exposed.** Overriding the safety rail is a
   decision made at a command line with the extract in front of you.
 - Reports are read off disk (`sap_extract/*_sync_report.md`) on every status call, so the

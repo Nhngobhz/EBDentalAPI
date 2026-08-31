@@ -6033,6 +6033,53 @@ def test_sap_sync_delists_withdrawn_items_and_refuses_a_partial_extract():
     assert existing["MACHINE"].delisted_at is None
     assert existing["GONE"].delisted_at is None
     assert existing["KEPT"].delisted_at is None
+
+
+def test_sap_sync_names_the_fix_when_the_transport_has_no_tools(monkeypatch):
+    """A machine without ssh (or sqlcmd) fails on a sentence, not on an errno.
+
+    The admin panel reports a failed run by showing the last line of its output, so
+    this message is the entire explanation an admin gets. Before the preflight that
+    line was "FileNotFoundError: [Errno 2] No such file or directory: 'scp'", which
+    names neither the transport, the reason, nor anything to do about it - and it is
+    the routine outcome of pressing the button with store-api in local Docker.
+    """
+    import shutil
+
+    from scripts import sap_db_pull
+
+    NEWLINE = chr(10)  # spelled this way so the assertion below reads as one line
+
+    monkeypatch.setattr(sap_db_pull.shutil, "which", lambda name, *a, **k: None)
+
+    for transport, expected in (("ssh", "scp"), ("local", "sqlcmd")):
+        try:
+            sap_db_pull._run_sql("SELECT 1", transport)
+        except sap_db_pull.TransportUnavailable as exc:
+            message = str(exc)
+        else:
+            raise AssertionError(f"{transport} should have refused to run")
+        assert expected in message
+        # One line, or the panel shows the reader whichever fragment came last.
+        assert NEWLINE not in message
+        # And it says what to do, not merely what is missing.
+        assert "SAP_SYNC_TRANSPORT" in message or "--transport" in message
+
+    # With the tools present, the preflight is out of the way entirely - the failure
+    # below is sqlcmd's own, which is what should reach the report.
+    monkeypatch.setattr(sap_db_pull.shutil, "which", lambda name, *a, **k: "/usr/bin/" + name)
+    monkeypatch.setattr(
+        sap_db_pull.subprocess,
+        "run",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("reached sqlcmd")),
+    )
+    try:
+        sap_db_pull._run_sql("SELECT 1", "local")
+    except RuntimeError as exc:
+        assert str(exc) == "reached sqlcmd"
+    else:
+        raise AssertionError("the preflight should not have stopped this")
+    assert shutil.which  # the real one is untouched outside the patch
 def test_products_can_be_sorted_and_the_sort_is_done_by_the_database(client, db_session):
     """GET /products/?sort=... orders the whole result set, not the page.
 

@@ -1,0 +1,39 @@
+# Opt-in override: makes the admin Settings -> Catalogue Sync button work in local
+# Docker. Without it the button always fails, because the sync reaches the SAP company
+# database by running sqlcmd on the SAP server over SSH - Windows authentication is the
+# only login that database accepts - and the plain api container has no key to do it.
+#
+# Your key is mounted read-only and never copied into the image, so it exists only for
+# as long as the container runs; entrypoint.sh copies it to /root/.ssh with the
+# permissions OpenSSH insists on. Still: this puts a private server key inside a
+# container, so use it on your own machine only. It has no place on the server, where
+# the database is local and SAP_SYNC_TRANSPORT=local means no SSH at all.
+#
+# Setup - one line in store-api/.env, pointing at the folder holding the key:
+#   SAP_SSH_DIR=C:/Users/you/.ssh
+#
+# Usage, from store-api/ (both files, every time - an override is not remembered):
+#   docker compose -f docker-compose.yml -f docker-compose.sap-ssh.yml up -d --build
+#
+# To go back to a container with no credentials in it, bring the stack up the usual way
+# (`docker compose up -d`) - the mounts and the SSH config go with it.
+
+services:
+  api:
+    volumes:
+      # Only the two files, not the whole .ssh directory: the sync needs this one key
+      # and the host key that proves the server is the server, and nothing else in
+      # there is any of the container's business.
+      - ${SAP_SSH_DIR:?set SAP_SSH_DIR in store-api/.env to the folder holding your eb_server key, e.g. C:/Users/you/.ssh}/eb_server:/run/ssh/id:ro
+      - ${SAP_SSH_DIR}/known_hosts:/run/ssh/known_hosts:ro
+    environment:
+      # Read by entrypoint.sh, which turns them into /root/.ssh/config.
+      SAP_SSH_KEY: /run/ssh/id
+      SAP_SSH_KNOWN_HOSTS: /run/ssh/known_hosts
+      SAP_SSH_HOSTNAME: 192.168.0.113
+      SAP_SSH_USER: Administrator
+      # Read by scripts/sap_db_pull.py as the host to ssh to, and by app.config as the
+      # transport the sync button uses. `auto` would resolve to ssh anyway; naming it
+      # keeps this file the single description of how the container reaches SAP.
+      SAP_SSH_HOST: ebserver
+      SAP_SYNC_TRANSPORT: ssh

@@ -239,9 +239,23 @@ trips the rail writes nothing and says so in the panel.
 
 **Set `SAP_SYNC_TRANSPORT=local` in the server's `.env`.** The default, `auto`, resolves
 to `ssh` - on the server that means SSH-ing to itself. The Integrations tab shows which
-one is in effect. In local Docker development the button reaches SAP through neither: the
-container has no `ssh` or `sqlcmd`, so a run fails with `No such file or directory: 'scp'`
-- run the script on the host instead, as below.
+one is in effect.
+
+In local Docker the button reaches SAP through neither by default: the image carries no
+key, so a run stops on one line saying so. Two ways out - run the script on the host
+(below), where your own `ssh ebserver` already works, or bring the stack up with the
+opt-in override that lends the container your key:
+
+```bash
+# store-api/.env: SAP_SSH_DIR=C:/Users/you/.ssh
+docker compose -f docker-compose.yml -f docker-compose.sap-ssh.yml up -d --build
+```
+
+It mounts the key and `known_hosts` read-only and nothing else; `entrypoint.sh` copies
+them to `/root/.ssh` with the permissions OpenSSH insists on (a Windows bind mount
+arrives as 0777, which OpenSSH refuses). Both files must be named on the command line
+every time - Compose does not remember an override. Your own machine only: it is a
+private server key inside a container, and on the server there is nothing to reach.
 
 ### From the command line
 
@@ -345,7 +359,9 @@ a go-ahead.
 | Sync ran but the activity log is empty | the `import app.core.activity` line was dropped (9) |
 | An item vanished from the storefront | it was delisted. Check the report, then `validFor` / `frozenFor` in SAP |
 | Category dropdown in the admin form is missing options | `MAX_PAGE_SIZE = 500` is a hard server cap and there are 850+ categories - use `client.get_all()` (see `EB Web Project/store_api.py`) |
-| The Settings button fails with `No such file or directory: 'scp'` | store-api is running in Docker, which has no ssh client. Expected in local development; production is a native Windows service with `SAP_SYNC_TRANSPORT=local` |
+| `The ssh transport needs scp and ssh ... and cannot find` | the machine running the sync has no SSH client - normally store-api in local Docker. Run the script on the host, use `docker-compose.sap-ssh.yml` (10), or on the server set `SAP_SYNC_TRANSPORT=local` |
+| `The local transport needs sqlcmd ... and cannot find it` | `--transport local` off the server. It is for the machine SQL Server runs on; from anywhere else use `ssh` |
+| `Permissions ... are too open` / `bad permissions` | an SSH key used straight from a bind mount. `entrypoint.sh` copies it to `/root/.ssh` for exactly this reason - check `SAP_SSH_KEY` points at the mount, not at `/root/.ssh` |
 | "A catalogue sync is already running" and none is | a run is genuinely stuck and `SAP_SYNC_TIMEOUT_SECONDS` has not passed yet. Restarting `ebdental-api` clears it - the run state lives in the process |
 
 ## 13. If you change this

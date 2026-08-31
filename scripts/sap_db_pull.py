@@ -42,6 +42,7 @@ import csv
 import gzip
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -195,6 +196,41 @@ def _run_sql_odbc(sql: str) -> str:
                 return ""
 
 
+class TransportUnavailable(RuntimeError):
+    """The chosen transport's command-line tools are not on this machine.
+
+    Its own type because it is not a database error and there is nothing to retry:
+    the machine is simply the wrong one to run this from. The routine way to meet it
+    is the admin panel's sync button in local Docker - the API image carries neither
+    an SSH client nor sqlcmd - and the panel reports a failed run by showing its last
+    line of output, which without this is "FileNotFoundError: ... 'scp'".
+    """
+
+
+def _require_tools(names: tuple[str, ...], *, remote: bool) -> None:
+    """Fail with a sentence naming the fix, before subprocess fails with an errno.
+
+    One line, deliberately: the Settings panel shows the last non-empty line of the
+    run's output as the reason it failed, so a message split over several lines
+    arrives there as its least useful sentence.
+    """
+    missing = [name for name in names if shutil.which(name) is None]
+    if not missing:
+        return
+    if remote:
+        raise TransportUnavailable(
+            f"The ssh transport needs {' and '.join(names)} on the machine running the "
+            f"sync and cannot find {', '.join(missing)} - the store-api container has "
+            "no SSH client, so run `python -m scripts.sap_sync` on the host instead, or "
+            "set SAP_SYNC_TRANSPORT=local on the server, where SQL Server is local."
+        )
+    raise TransportUnavailable(
+        "The local transport needs sqlcmd on the machine running the sync and cannot "
+        "find it - that transport is for the server itself, where SQL Server is local; "
+        "from anywhere else use SAP_SYNC_TRANSPORT=ssh (or --transport ssh)."
+    )
+
+
 def _run_sql_sqlcmd(sql: str, *, remote: bool) -> str:
     """Run one query on the company database and return its JSON payload.
 
@@ -211,6 +247,7 @@ def _run_sql_sqlcmd(sql: str, *, remote: bool) -> str:
     the gzip step shrinks a ~6 MB UTF-16 document to something worth sending over
     an SSH pipe. -y 0 keeps sqlcmd from truncating the column at its default width.
     """
+    _require_tools(("scp", "ssh") if remote else ("sqlcmd",), remote=remote)
     with tempfile.NamedTemporaryFile("w", suffix=".sql", delete=False, encoding="utf-8") as fh:
         fh.write(sql)
         local_sql = fh.name
@@ -454,6 +491,8 @@ def main() -> None:
     print(f"Reading {COMPANY_DB} via {via} (groups {group_codes})...", flush=True)
     try:
         payload = _run_sql(build_query(group_codes), args.transport)
+    except TransportUnavailable as exc:
+        sys.exit(str(exc))  # one sentence, no traceback - it names its own fix
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or exc.stdout or "").strip()[:500]
         print(f"Query failed: {detail}", file=sys.stderr)

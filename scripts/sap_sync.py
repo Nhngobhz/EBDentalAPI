@@ -86,7 +86,14 @@ from app.models import Brand, Category, Product
 # is.
 import app.core.activity  # noqa: F401
 
-from scripts.sap_db_pull import CATALOGUES, GROUP_NAMES, TRANSPORTS, build_query, _run_sql
+from scripts.sap_db_pull import (
+    CATALOGUES,
+    GROUP_NAMES,
+    TRANSPORTS,
+    TransportUnavailable,
+    build_query,
+    _run_sql,
+)
 
 # products.brand_id is NOT NULL, and roughly a fifth of the SAP items have no
 # U_Brand at all. They need somewhere to go that is honest about what it means -
@@ -624,7 +631,14 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     for name in names:
-        report = run_catalogue(name, args, now)
+        try:
+            report = run_catalogue(name, args, now)
+        except TransportUnavailable as exc:
+            # The one failure that is about the machine rather than the data, and the
+            # only one worth catching here: exit on its sentence so the admin panel
+            # (which shows the last line of output) reports something actionable
+            # instead of the tail of a traceback.
+            sys.exit(str(exc))
         text = report.render(applied=args.apply)
         out_path = out_dir / f"{name.replace('-', '_')}_sync_report.md"
         out_path.write_text(text, encoding="utf-8")
