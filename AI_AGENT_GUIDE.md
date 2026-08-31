@@ -48,6 +48,13 @@ confusing (not obviously wrong) results.
   exception is `status`, which is final once a payment is on record.
   A paid row's printed document is an **Invoice** rather than a
   Quotation, whichever kind it is. See section 6's Orders table.
+- **The materials and spare-parts catalogues are synced from SAP**, not
+  maintained here: `products.section` says which catalogue a row belongs
+  to, `delisted_at` hides what SAP has withdrawn, and a nightly job
+  overwrites name, prices, brand, category and stock on those rows. Never
+  write a presentational field from an integration - see
+  [SAP_SYNC.md](SAP_SYNC.md) for what the sync owns and what it must not
+  touch.
 
 ---
 
