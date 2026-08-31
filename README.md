@@ -1,5 +1,9 @@
 # Store Management API
 
+> **Deploying to the server?** This file is the API's design and configuration
+> reference. The install/update/troubleshoot story for the whole system — this API,
+> the Flask storefront and PostgreSQL — is in [`../README.md`](../README.md).
+
 A FastAPI + PostgreSQL backend for managing staff accounts, customers, and a
 product catalog (brands, categories, products, manuals, promotions), with:
 
@@ -349,6 +353,7 @@ comments). The important ones:
 | `CORS_ORIGINS` | Comma-separated allowed origins, or `*` |
 | `UPLOAD_DIR` | Where uploaded files are written (`static/uploads`), served back at `/static/uploads/...` |
 | `R2_*` | **Disabled.** Cloudflare R2 object storage. Left commented out in `.env` since the move to self-hosting - see "File storage" below |
+| `SAP_SYNC_TRANSPORT` | How Settings → Catalogue Sync reaches SQL Server: `local` on the server (they share a machine), `auto`→ssh from a dev box. Also `SAP_SYNC_TIMEOUT_SECONDS`, which kills a hung run. See [SAP_SYNC.md](SAP_SYNC.md) |
 
 ### File storage
 

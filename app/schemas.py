@@ -1188,6 +1188,22 @@ class SettingsReset(BaseModel):
     keys: Optional[list[str]] = None
 
 
+class SapSyncRun(BaseModel):
+    """Start a SAP catalogue sync - see app/services/sap_sync_runner.py.
+
+    `apply` defaults to False, which is the script's own default and the safe half of
+    the pair: a request that forgets to say does the full run and rolls it back, rather
+    than repricing the catalogue. The Settings panel always sends it explicitly.
+
+    `catalogue` is checked against the runner's list rather than declared as a Literal
+    here, so the names live in one place (they have to match scripts/sap_db_pull's
+    CATALOGUES) instead of being spelled out again in this file.
+    """
+
+    catalogue: str = "all"
+    apply: bool = False
+
+
 # ---------------------------------------------------------------------------
 # Department QR codes (contact page)
 # ---------------------------------------------------------------------------

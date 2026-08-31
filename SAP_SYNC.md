@@ -215,6 +215,36 @@ catalogues instead of differing by however long the first query took.
 
 ## 10. Running it
 
+### From the admin panel
+
+**Settings → Catalogue Sync.** Pick a catalogue, then either *Preview changes* (a dry
+run) or *Run sync now*. The panel streams the script's console output while it works and
+shows the run reports afterwards - including the nightly scheduled run's, since those are
+read off disk rather than remembered.
+
+It is the same script, started as a child process:
+`python -m scripts.sap_sync --catalogue <c> --transport $SAP_SYNC_TRANSPORT [--apply]`.
+Nothing about the sync is reimplemented for the button, which is the point - one job, one
+code path, whichever way it starts. The plumbing is
+[app/services/sap_sync_runner.py](app/services/sap_sync_runner.py) and
+[app/routers/sap_sync.py](app/routers/sap_sync.py); it is `admin`-only, allows one run at
+a time (a second click gets a 409, not a second sync), and kills a run that passes
+`SAP_SYNC_TIMEOUT_SECONDS`.
+
+Two things it deliberately does not offer: `--from-file`, because the button syncs from
+SAP and a file on disk is a debugging tool; and `--max-delist-ratio`, because overriding
+the safety rail (6) means deciding that hiding most of the catalogue is correct, which is
+a judgement made with the extract in front of you and not from a web page. A run that
+trips the rail writes nothing and says so in the panel.
+
+**Set `SAP_SYNC_TRANSPORT=local` in the server's `.env`.** The default, `auto`, resolves
+to `ssh` - on the server that means SSH-ing to itself. The Integrations tab shows which
+one is in effect. In local Docker development the button reaches SAP through neither: the
+container has no `ssh` or `sqlcmd`, so a run fails with `No such file or directory: 'scp'`
+- run the script on the host instead, as below.
+
+### From the command line
+
 Dry run first - it does the entire run and rolls back, which is how you check a
 run before trusting it:
 
@@ -257,7 +287,9 @@ no domain and SQL Server answers "the login is from an untrusted domain". Port
 1433 being open is not the issue.
 
 Environment: `SAP_SSH_HOST` (default `ebserver`), `SAP_COMPANY_DB` (default
-`EBDS_PRO_DB_LIVE`), `SAP_DB_DSN` (unset by default).
+`EBDS_PRO_DB_LIVE`), `SAP_DB_DSN` (unset by default). The admin panel's button reads
+`SAP_SYNC_TRANSPORT` (default `auto`) instead of a flag, since nobody is there to pass
+one - see `app/config.py`.
 
 ### The transport trap worth knowing
 
@@ -293,6 +325,12 @@ it in a loop or sit "stopped" looking like a fault. Nightly rather than hourly
 because SAP's item master changes a handful of times a week, while every run
 rewrites ~8,000 rows and files change-log entries for whatever moved.
 
+The Settings button (10) does not replace it, and the two need no coordination between
+them: the sync is idempotent, so a second run against the same extract finds nothing left
+to change. The runner's one-at-a-time rule covers runs *it* started; a manual run at 02:30
+would overlap the scheduled one, and the worst of that is duplicated work - each has its
+own transaction, and Postgres serialises the writes.
+
 **Status: written, not installed.** Installing it is a production change and needs
 a go-ahead.
 
@@ -307,6 +345,8 @@ a go-ahead.
 | Sync ran but the activity log is empty | the `import app.core.activity` line was dropped (9) |
 | An item vanished from the storefront | it was delisted. Check the report, then `validFor` / `frozenFor` in SAP |
 | Category dropdown in the admin form is missing options | `MAX_PAGE_SIZE = 500` is a hard server cap and there are 850+ categories - use `client.get_all()` (see `EB Web Project/store_api.py`) |
+| The Settings button fails with `No such file or directory: 'scp'` | store-api is running in Docker, which has no ssh client. Expected in local development; production is a native Windows service with `SAP_SYNC_TRANSPORT=local` |
+| "A catalogue sync is already running" and none is | a run is genuinely stuck and `SAP_SYNC_TIMEOUT_SECONDS` has not passed yet. Restarting `ebdental-api` clears it - the run state lives in the process |
 
 ## 13. If you change this
 

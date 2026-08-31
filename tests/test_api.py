@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta, timezone
+import threading
+import time
 
 import pytest
 
@@ -4691,6 +4693,122 @@ def test_settings_record_who_changed_them(client, db_session):
     client.put("/settings/", json={"values": {"business_hours": "Daily"}}, headers=headers)
     row = db_session.query(AppSetting).filter_by(key="business_hours").one()
     assert row.updated_by_user_id == admin.id
+
+
+@pytest.fixture
+def _idle_sap_sync():
+    """Forget any run the previous test left behind.
+
+    The runner keeps the current run in a module global on purpose (one uvicorn
+    process, see its docstring), which means it also outlives a test - and a test that
+    left one "running" would make the next one's start() raise SapSyncBusy.
+    """
+    from app.services import sap_sync_runner
+
+    sap_sync_runner._run = None
+    yield sap_sync_runner
+    sap_sync_runner._run = None
+
+
+def test_sap_sync_button_runs_the_script_and_refuses_a_second_run(
+    client, db_session, monkeypatch, _idle_sap_sync
+):
+    """POST /sap-sync/run starts scripts/sap_sync, and only one at a time.
+
+    The subprocess is replaced here - the real one queries SAP over SSH and rewrites
+    8,000 rows - but the command it would have run is asserted, because that command is
+    the whole contract with the script: the wrong flag would silently make "Run sync
+    now" a dry run, or make "Preview" write.
+    """
+    runner = _idle_sap_sync
+    make_admin(db_session, email="sapadmin@example.com", password="password123")
+    headers = auth_header(client, "sapadmin@example.com", "password123")
+
+    started = []
+    release = threading.Event()
+
+    def fake_execute(command):
+        started.append(command)
+        release.wait(timeout=10)
+        runner._append("done.")
+        runner._finish(state="succeeded", exit_code=0)
+
+    monkeypatch.setattr(runner, "_execute", fake_execute)
+
+    resp = client.post(
+        "/sap-sync/run", json={"catalogue": "materials", "apply": True}, headers=headers
+    )
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert body["running"] is True
+    assert body["run"]["catalogue"] == "materials"
+    assert body["run"]["apply"] is True
+    # Whoever pressed it, so the log and the panel both name a person.
+    assert body["run"]["started_by"] == "Admin User"
+
+    # A second click while it runs is refused, not queued: two syncs writing the same
+    # rows at once is the one thing this must not do.
+    busy = client.post("/sap-sync/run", json={"catalogue": "all"}, headers=headers)
+    assert busy.status_code == 409
+    assert "already running" in busy.json()["detail"]
+
+    release.set()
+    for _ in range(100):
+        if not client.get("/sap-sync/status", headers=headers).json()["running"]:
+            break
+        time.sleep(0.05)
+
+    status = client.get("/sap-sync/status", headers=headers).json()
+    assert status["run"]["state"] == "succeeded"
+    assert status["run"]["output"] == ["done."]
+    assert status["run"]["duration_seconds"] is not None
+
+    assert started[0][1:] == [
+        "-m",
+        "scripts.sap_sync",
+        "--catalogue",
+        "materials",
+        "--transport",
+        settings.SAP_SYNC_TRANSPORT,
+        "--apply",
+    ]
+
+    # ...and without apply, the same command minus the one flag that writes.
+    resp = client.post("/sap-sync/run", json={"catalogue": "all"}, headers=headers)
+    assert resp.status_code == 202
+    for _ in range(100):
+        if not client.get("/sap-sync/status", headers=headers).json()["running"]:
+            break
+        time.sleep(0.05)
+    assert "--apply" not in started[1]
+    assert started[1][started[1].index("--catalogue") + 1] == "all"
+
+
+def test_sap_sync_is_admin_only_and_rejects_an_unknown_catalogue(
+    client, db_session, monkeypatch, _idle_sap_sync
+):
+    """The catalogue name is checked before anything is spawned.
+
+    argparse would reject an unknown one too, but as a failed *run* - a red panel and a
+    report of a sync that never happened, rather than "that isn't a catalogue".
+    """
+    runner = _idle_sap_sync
+    monkeypatch.setattr(runner, "_execute", lambda command: runner._finish(state="succeeded"))
+
+    make_admin(db_session, email="sapadmin2@example.com", password="password123")
+    headers = auth_header(client, "sapadmin2@example.com", "password123")
+
+    resp = client.post("/sap-sync/run", json={"catalogue": "machinery"}, headers=headers)
+    assert resp.status_code == 400
+    assert "machinery" in resp.json()["detail"]
+
+    # Repricing the catalogue is the owner's call, not a job permission - so a staff
+    # member holding every other flag still cannot start one, or watch one.
+    _staff_without_admin(db_session, "sapstaff@example.com")
+    staff = auth_header(client, "sapstaff@example.com", "password123")
+    assert client.post("/sap-sync/run", json={}, headers=staff).status_code == 403
+    assert client.get("/sap-sync/status", headers=staff).status_code == 403
+    assert client.get("/sap-sync/status").status_code == 401
 
 
 def test_admin_permission_round_trips_through_the_users_api(client, db_session):

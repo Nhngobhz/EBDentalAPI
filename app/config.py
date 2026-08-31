@@ -233,6 +233,21 @@ class Settings(BaseSettings):
     def r2_endpoint_url(self) -> str:
         return f"https://{self.R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
+    # --- SAP catalogue sync --------------------------------------------------
+    # How the Settings screen's "Run sync now" button reaches SQL Server - the same
+    # --transport values scripts/sap_db_pull.py accepts (auto | odbc | local | ssh).
+    # "local" on the server, where store-api and SQL Server share a machine; "auto"
+    # (which resolves to ssh) from a development box. Deployment topology rather than a
+    # preference, which is why it is an environment variable and not a Settings row:
+    # the value that is right here is wrong there, and the two must not be swapped by
+    # copying a database.
+    SAP_SYNC_TRANSPORT: str = "auto"
+    # How long a run may take before it is killed. A hung sqlcmd, or an SSH session
+    # waiting on a host that has gone away, would otherwise leave the run marked
+    # "running" for the life of the process and every later run refused as busy. A full
+    # two-catalogue sync of ~8,000 items takes a couple of minutes.
+    SAP_SYNC_TIMEOUT_SECONDS: int = 1800
+
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )

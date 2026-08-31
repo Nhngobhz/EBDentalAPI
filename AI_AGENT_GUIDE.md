@@ -235,7 +235,7 @@ row, checked directly:
 | `customer_management` | Full CRUD on `Customer` records, including toggling `access_permission` |
 | `product_management` | CRUD on `Brand`, `Category`, `Product` (non-price fields), `Manual`, and full CRUD on `Promotion` and `Set` |
 | `price_listing` | Set `price`/`discount` on `Product`, and manage `Order`s (list/read/place/edit/delete, mark paid, issue a KHQR) |
-| `admin` | Read and write site-wide settings (`/settings`, section 6) - store contact details, printed-quote wording, maintenance mode; the department QR cards (`/qr-codes`); and, since 2026-08-17, everything `price_listing` grants on `/orders` |
+| `admin` | Read and write site-wide settings (`/settings`, section 6) - store contact details, printed-quote wording, maintenance mode; the department QR cards (`/qr-codes`); starting a SAP catalogue sync (`/sap-sync`); and, since 2026-08-17, everything `price_listing` grants on `/orders` |
 
 Notes an agent should know before assuming a 403 is a bug:
 
@@ -859,6 +859,37 @@ order and never stored.
 only, matching the `.qr-badge` classes in the Flask app's CSS. Empty `badge_label`
 means no badge at all; a card with no `qr_image` still renders, as a "QR coming soon"
 placeholder.
+
+### SAP catalogue sync - `/sap-sync`
+
+Starts `scripts/sap_sync.py` - the item-master sync Task Scheduler also runs nightly -
+from the "Catalogue Sync" tab of the admin Settings screen, and reports on it. See
+[SAP_SYNC.md](SAP_SYNC.md) for what the sync itself does; the supervision is
+`app/services/sap_sync_runner.py`.
+
+| Method & path | Auth | Body / notes |
+|---|---|---|
+| `POST /sap-sync/run` | `admin` | `{"catalogue": "all"\|"materials"\|"spare-parts", "apply": bool}`. `202` with the same document `GET /status` returns. `apply` defaults to **false** - a dry run, which does everything and rolls back |
+| `GET /sap-sync/status` | `admin` | The run in flight or the last to finish, its console output, and the run reports on disk. `?include_reports=true` adds each report's full text |
+
+Worth knowing:
+
+- **Two verbs because the job outlives the request.** A full run takes minutes; the
+  endpoint answers immediately and the panel polls. It runs the script as a **child
+  process**, not an import - `sap_sync` calls `sys.exit()` on a refused delisting, holds
+  a transaction over ~8,000 rows, and reconfigures `sys.stdout`, none of which belongs
+  inside the API worker. It also means the button and the scheduled task run the same
+  code with the same argparse defaults.
+- **One run at a time**, process-wide - a second `POST` while one is going gets `409`,
+  never a queued run. State is a module global rather than a table because the API is a
+  single uvicorn process; if it ever gains `--workers`, this needs a row.
+- **`SAP_SYNC_TRANSPORT` decides how it reaches SQL Server** (`local` on the server,
+  `auto`→ssh from a dev box) and `SAP_SYNC_TIMEOUT_SECONDS` kills a hung run so a dead
+  `sqlcmd` can't leave the endpoint permanently "busy".
+- **`--max-delist-ratio` is deliberately not exposed.** Overriding the safety rail is a
+  decision made at a command line with the extract in front of you.
+- Reports are read off disk (`sap_extract/*_sync_report.md`) on every status call, so the
+  panel shows the nightly scheduled run's report as well as this process's own.
 
 ### Misc
 | Method & path | Auth | Notes |
