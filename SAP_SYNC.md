@@ -288,13 +288,31 @@ Three, because there are three real situations:
 
 | `--transport` | How | When |
 | --- | --- | --- |
-| `local` | `sqlcmd -S localhost -E` | **production** - store-api is deployed on the same server as SQL Server, so nothing crosses a network |
+| `local` | `sqlcmd -S localhost`, with `SAP_DB_USER` if set and `-E` otherwise | **production** - store-api is deployed on the same server as SQL Server, so nothing crosses a network |
 | `ssh` | `scp` the query over, then `sqlcmd` through `ssh ebserver` | **the default from a dev machine.** Needs no credential of its own and no change to the server |
 | `odbc` | `pyodbc` straight over the LAN, using `SAP_DB_DSN` | preferred once a read-only SQL login exists. The server is already in mixed mode, so this needs no change to SQL Server - just the login, which is a production security change and has not been made |
 
 `auto` picks `odbc` when `SAP_DB_DSN` is set and `ssh` otherwise - deliberately
 never `local`, since guessing wrong there means querying whatever SQL Server
 happens to be installed on the machine you are sitting at.
+
+### Which account the query runs as
+
+`sqlcmd -E` authenticates as **whoever started the run**, and that is not one
+identity but three: you at a command line, the Task Scheduler account overnight, and
+the `ebdental-api` service account when someone presses the button - LocalSystem
+unless it was changed. SAP's company database has a user for none of the last two, so
+a sync that has worked by hand for months fails the first time it is started any other
+way, on a message that never mentions accounts.
+
+Setting **`SAP_DB_USER`/`SAP_DB_PASSWORD`** in `store-api/.env` switches the `local`
+transport to a SQL login, which is the same however the run was started. The password
+reaches sqlcmd through `SQLCMDPASSWORD` in its environment, never on the command line,
+where any account on the machine could read it out of the process list. The `ssh`
+transport ignores both: it authenticates as the SSH account, which is an administrator.
+
+The sync only ever reads - one `SELECT`, by design (§2) - so the login needs `SELECT`
+on `OITM`, `ITM1`, `OITB` and `OITW`, and nothing else.
 
 Windows authentication does **not** cross from a dev machine: the two boxes share
 no domain and SQL Server answers "the login is from an untrusted domain". Port
@@ -354,6 +372,7 @@ a go-ahead.
 | --- | --- |
 | `Refusing to delist N of M products` | the safety rail (6). Check the extract is complete before overriding it |
 | `the login is from an untrusted domain` | Windows auth from a dev machine. Use `--transport ssh`, or set up `SAP_DB_DSN` |
+| `Login failed for user` / `not able to access the database` under `--transport local` | the account the run started as is not one SAP's database knows - the service account behind the panel button, or the scheduled task's. Set `SAP_DB_USER`/`SAP_DB_PASSWORD` |
 | `extract is empty - refusing to run` | the query returned no rows - wrong `--groups`, wrong database, or a failed connection |
 | A name reads `?????` in the report | SAP's `ItemName` really holds that and `FrgnName` could not save it. Fix it in SAP |
 | Sync ran but the activity log is empty | the `import app.core.activity` line was dropped (9) |

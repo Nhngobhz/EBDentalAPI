@@ -90,6 +90,7 @@ from scripts.sap_db_pull import (
     CATALOGUES,
     GROUP_NAMES,
     TRANSPORTS,
+    QueryFailed,
     TransportUnavailable,
     build_query,
     _run_sql,
@@ -633,11 +634,12 @@ def main() -> None:
     for name in names:
         try:
             report = run_catalogue(name, args, now)
-        except TransportUnavailable as exc:
-            # The one failure that is about the machine rather than the data, and the
-            # only one worth catching here: exit on its sentence so the admin panel
-            # (which shows the last line of output) reports something actionable
-            # instead of the tail of a traceback.
+        except (TransportUnavailable, QueryFailed) as exc:
+            # The two failures that are about the machine rather than the data: the
+            # wrong tools installed, or the database refusing the account the sync ran
+            # as. Exit on the sentence each carries, so the admin panel - which reports
+            # a failed run by showing the last line of output - says something
+            # actionable instead of the tail of a traceback.
             sys.exit(str(exc))
         text = report.render(applied=args.apply)
         out_path = out_dir / f"{name.replace('-', '_')}_sync_report.md"

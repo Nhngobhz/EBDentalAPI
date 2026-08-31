@@ -6035,7 +6035,7 @@ def test_sap_sync_delists_withdrawn_items_and_refuses_a_partial_extract():
     assert existing["KEPT"].delisted_at is None
 
 
-def test_sap_sync_names_the_fix_when_the_transport_has_no_tools(monkeypatch):
+def test_sap_sync_failures_explain_themselves_in_one_line(monkeypatch):
     """A machine without ssh (or sqlcmd) fails on a sentence, not on an errno.
 
     The admin panel reports a failed run by showing the last line of its output, so
@@ -6045,6 +6045,7 @@ def test_sap_sync_names_the_fix_when_the_transport_has_no_tools(monkeypatch):
     the routine outcome of pressing the button with store-api in local Docker.
     """
     import shutil
+    from types import SimpleNamespace
 
     from scripts import sap_db_pull
 
@@ -6065,20 +6066,32 @@ def test_sap_sync_names_the_fix_when_the_transport_has_no_tools(monkeypatch):
         # And it says what to do, not merely what is missing.
         assert "SAP_SYNC_TRANSPORT" in message or "--transport" in message
 
-    # With the tools present, the preflight is out of the way entirely - the failure
-    # below is sqlcmd's own, which is what should reach the report.
+    # With the tools present the preflight steps aside, and what reaches the reader is
+    # sqlcmd's own complaint - the case this half is about. A refused login is the
+    # likeliest one in production, because the sync started from the panel runs as the
+    # store-api service account and not as the administrator who tests it by hand.
     monkeypatch.setattr(sap_db_pull.shutil, "which", lambda name, *a, **k: "/usr/bin/" + name)
+    refusal = (
+        "Msg 916, Level 14, State 1, Server QPLUS365SERVER, Line 1" + chr(10)
+        + 'The server principal "sap_reader" is not able to access the database '
+        + '"EBDS_PRO_DB_LIVE" under the current security context.'
+    )
     monkeypatch.setattr(
         sap_db_pull.subprocess,
         "run",
-        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("reached sqlcmd")),
+        lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr=refusal),
     )
     try:
         sap_db_pull._run_sql("SELECT 1", "local")
-    except RuntimeError as exc:
-        assert str(exc) == "reached sqlcmd"
+    except sap_db_pull.QueryFailed as exc:
+        message = str(exc)
     else:
-        raise AssertionError("the preflight should not have stopped this")
+        raise AssertionError("a non-zero sqlcmd should have raised QueryFailed")
+    # The sentence that explains it, not just the "Msg 916" header above it - and not
+    # the command line and exit status that CalledProcessError used to render instead.
+    assert "not able to access the database" in message
+    assert "service account" in message  # the hint that names the likely cause
+    assert NEWLINE not in message
     assert shutil.which  # the real one is untouched outside the patch
 def test_products_can_be_sorted_and_the_sort_is_done_by_the_database(client, db_session):
     """GET /products/?sort=... orders the whole result set, not the page.

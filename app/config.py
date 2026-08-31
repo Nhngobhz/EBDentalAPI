@@ -247,6 +247,14 @@ class Settings(BaseSettings):
     # "running" for the life of the process and every later run refused as busy. A full
     # two-catalogue sync of ~8,000 items takes a couple of minutes.
     SAP_SYNC_TIMEOUT_SECONDS: int = 1800
+    # A SQL Server login for the sync to read SAP's company database with. Empty means
+    # Windows authentication (`sqlcmd -E`), which logs in as whoever started the run -
+    # fine at a command line, wrong for a service: a run started from the admin panel
+    # arrives as the ebdental-api service account (LocalSystem), which SAP's database
+    # has never heard of, and sqlcmd fails with nothing to say about accounts. Set
+    # these and the login is the same whoever presses the button.
+    SAP_DB_USER: str = ""
+    SAP_DB_PASSWORD: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"

@@ -207,6 +207,56 @@ class TransportUnavailable(RuntimeError):
     """
 
 
+def _sql_login() -> tuple[str, str] | None:
+    """The SQL Server login to authenticate with, or None for Windows authentication.
+
+    `sqlcmd -E` logs in as whoever ran it. At a command line that is an administrator
+    and everything works; from the admin panel's button it is the ebdental-api service
+    account - LocalSystem, which SAP's database has no user for - and the run fails on
+    a message that never mentions accounts. A SQL login is the same one whichever way
+    the sync was started, which is the point of it.
+
+    The environment wins, so a shell or a container can override; otherwise it comes
+    from the app's `.env`, which on the server is the only place it can live - NSSM
+    passes the service no environment of its own, so `os.getenv` there sees nothing.
+    Imported lazily and forgivingly because this module is also run from a checkout
+    where `app` may not import cleanly, and Windows authentication is a fine answer.
+    """
+    user = os.getenv("SAP_DB_USER", "")
+    password = os.getenv("SAP_DB_PASSWORD", "")
+    if not user:
+        try:
+            from app.config import settings
+        except Exception:
+            return None
+        user, password = settings.SAP_DB_USER, settings.SAP_DB_PASSWORD
+    return (user, password) if user else None
+
+
+class QueryFailed(RuntimeError):
+    """sqlcmd - or the scp carrying the query to it - refused, and said why.
+
+    Its own type so the mains can exit on what it said. subprocess.CalledProcessError
+    renders as the whole command line plus "returned non-zero exit status 1", which is
+    the one part of the failure nobody needs: the reason was on the stderr that
+    check=True captured and then threw away, and without it a refused login and a
+    syntax error read exactly alike.
+    """
+
+
+def _condense(*streams: str) -> str:
+    """The lines of an sqlcmd complaint, as one line.
+
+    Joined rather than taken one at a time because sqlcmd splits every error in two -
+    "Msg 916, Level 14, State 1, Server ..." on one line and the sentence that matters
+    on the next - so any single line is reliably the half that explains nothing. One
+    line rather than several because the admin panel reports a failed run by showing
+    the last line of its output.
+    """
+    lines = [line.strip() for stream in streams for line in (stream or "").splitlines()]
+    return " ".join(line for line in lines if line)[:400]
+
+
 def _require_tools(names: tuple[str, ...], *, remote: bool) -> None:
     """Fail with a sentence naming the fix, before subprocess fails with an errno.
 
@@ -254,27 +304,64 @@ def _run_sql_sqlcmd(sql: str, *, remote: bool) -> str:
     try:
         # -y 0 is mutually exclusive with both -W (trim) and -h -1 (suppress the
         # header), so this does its own trimming and drops the header below.
+        login = None  # the remote branch authenticates as the SSH account instead
         if remote:
             script_path = "C:\\Windows\\Temp\\eb_sap_pull.sql"
-            subprocess.run(
+            sent = subprocess.run(
                 ["scp", "-q", "-o", "BatchMode=yes", local_sql,
                  f"{SSH_HOST}:C:/Windows/Temp/eb_sap_pull.sql"],
-                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
             )
+            if sent.returncode != 0:
+                raise QueryFailed(
+                    f"Could not copy the query to {SSH_HOST}: "
+                    + (_condense(sent.stderr, sent.stdout) or f"scp exited {sent.returncode}")
+                )
             argv = [
                 "ssh", "-o", "BatchMode=yes", SSH_HOST,
                 f"sqlcmd -S localhost -E -d {COMPANY_DB} -I -y 0 -i {script_path}",
             ]
         else:
-            # On the server itself, where the database is local and Windows auth
-            # works because it never leaves the machine.
+            # On the server itself, where the database is local. A SQL login if one
+            # is configured, and otherwise Windows authentication - which works here
+            # because it never leaves the machine, as long as the account running the
+            # sync is one SAP's database knows.
+            login = _sql_login()
             argv = [
-                "sqlcmd", "-S", "localhost", "-E", "-d", COMPANY_DB,
-                "-I", "-y", "0", "-i", local_sql,
+                "sqlcmd", "-S", "localhost",
+                *(["-U", login[0]] if login else ["-E"]),
+                "-d", COMPANY_DB, "-I", "-y", "0", "-i", local_sql,
             ]
+        # SQLCMDPASSWORD rather than -P: everything on a command line is readable by
+        # every account on the machine for as long as the process lives, and this one
+        # runs against SAP's own company database.
+        env = None
+        if login:
+            env = {**os.environ, "SQLCMDPASSWORD": login[1]}
         proc = subprocess.run(
-            argv, check=True, capture_output=True, text=True, encoding="utf-8"
+            argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=env,
         )
+        if proc.returncode != 0:
+            detail = _condense(proc.stderr, proc.stdout) or f"exit status {proc.returncode}"
+            # The one hint worth hard-coding. `sqlcmd -E` authenticates as whoever ran
+            # it, so a sync started from the admin panel arrives as the store-api
+            # service account - LocalSystem unless someone changed it - and not as the
+            # administrator who has always run this by hand and seen it work. Nothing
+            # in SQL Server's own message says so, and every instinct sends the reader
+            # to look at the query instead.
+            if login is None and ("Login failed" in detail or "not able to access" in detail):
+                detail += (
+                    " - note that sqlcmd -E logs in as whoever runs it, so a sync "
+                    "started from the admin panel authenticates as the store-api "
+                    "service account, not as you"
+                )
+            raise QueryFailed(
+                f"sqlcmd on {SSH_HOST if remote else 'localhost'} refused the query: {detail}"
+            )
     finally:
         os.unlink(local_sql)
 
@@ -296,7 +383,10 @@ def _run_sql_sqlcmd(sql: str, *, remote: bool) -> str:
 #            one exists; the only one that works from a machine with neither SSH
 #            access nor the database on it.
 #   local  - sqlcmd against localhost. What production uses: store-api is deployed
-#            on the same server as SQL Server, so there is nothing to cross.
+#            on the same server as SQL Server, so there is nothing to cross. Set
+#            SAP_DB_USER/SAP_DB_PASSWORD unless every account that might start a run
+#            - including the service account behind the admin panel's button - is a
+#            login SAP's database recognises.
 #   ssh    - sqlcmd on the server, driven over SSH. Needs no credential of its own
 #            and no change to the server, which is why it is the default today.
 TRANSPORTS = ("auto", "odbc", "local", "ssh")
@@ -491,12 +581,8 @@ def main() -> None:
     print(f"Reading {COMPANY_DB} via {via} (groups {group_codes})...", flush=True)
     try:
         payload = _run_sql(build_query(group_codes), args.transport)
-    except TransportUnavailable as exc:
-        sys.exit(str(exc))  # one sentence, no traceback - it names its own fix
-    except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or exc.stdout or "").strip()[:500]
-        print(f"Query failed: {detail}", file=sys.stderr)
-        sys.exit(1)
+    except (TransportUnavailable, QueryFailed) as exc:
+        sys.exit(str(exc))  # one sentence, no traceback - each carries its own reason
     if not payload:
         print("Query returned nothing - no items in those groups?", file=sys.stderr)
         sys.exit(1)

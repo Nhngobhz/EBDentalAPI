@@ -886,6 +886,10 @@ Worth knowing:
 - **`SAP_SYNC_TRANSPORT` decides how it reaches SQL Server** (`local` on the server,
   `auto`→ssh from a dev box) and `SAP_SYNC_TIMEOUT_SECONDS` kills a hung run so a dead
   `sqlcmd` can't leave the endpoint permanently "busy".
+- **`SAP_DB_USER`/`SAP_DB_PASSWORD` decide which account SQL Server sees.** Without
+  them `sqlcmd -E` logs in as whoever started the run, which for this button is the
+  service account (LocalSystem) and not the administrator who tested it by hand; the
+  password travels in `SQLCMDPASSWORD`, never on the command line.
 - **In Docker the button needs `docker-compose.sap-ssh.yml`**, the opt-in override that
   mounts your `ebserver` key in; without it `scripts/sap_db_pull._require_tools` stops
   the run on one line naming the fix, because the panel reports a failure by showing the

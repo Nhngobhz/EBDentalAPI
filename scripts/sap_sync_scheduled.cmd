@@ -8,10 +8,11 @@ REM transaction and its own report in sap_extract\, so one failing does not roll
 REM back the other.
 REM
 REM Run BY the scheduler on QPLUS365SERVER, where store-api and SQL Server sit on
-REM the same machine - hence --transport local, which is sqlcmd against localhost
-REM with Windows authentication. There is no SSH and no SQL login in this path;
-REM the task's own account is the credential, so it must be one SQL Server knows
-REM (Administrator does).
+REM the same machine - hence --transport local, which is sqlcmd against localhost.
+REM Which account SQL Server sees depends on .env: SAP_DB_USER/SAP_DB_PASSWORD make
+REM it a SQL login, the same whether this runs at 02:30 or someone presses the button;
+REM with those empty it is Windows authentication, and the task's own account has to
+REM be one SQL Server knows (SYSTEM is not).
 REM
 REM Install it with scripts/install_sap_sync_task.ps1, which is where the schedule
 REM and the account live. This file is only "what one run does".

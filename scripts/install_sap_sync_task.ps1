@@ -23,9 +23,15 @@
     activity and well before anyone opens the storefront.
 
 .PARAMETER User
-    Account to run as. It needs two things: read access to the SAP company
-    database through Windows auth (the sync connects as this identity), and write
-    access to the store Postgres. Administrator has both.
+    Account to run as. Defaults to SYSTEM, which needs no password and already has
+    everything a run touches on this machine: E:\Website, and the store Postgres
+    (which authenticates by password over TCP, not by Windows identity).
+
+    SYSTEM is only enough because SAP_DB_USER/SAP_DB_PASSWORD in store-api\.env give
+    the sync a SQL login of its own. Without those, the sync reaches SAP through the
+    task account's Windows identity - and SYSTEM is not a user of the SAP company
+    database, so a run would fail on a login error. In that case pass an account SQL
+    Server knows (-User Administrator) and this will prompt for its password.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File install_sap_sync_task.ps1
@@ -33,7 +39,7 @@
 [CmdletBinding()]
 param(
     [string]$At = "02:30",
-    [string]$User = "Administrator",
+    [string]$User = "SYSTEM",
     [string]$TaskName = "EB Dental - SAP catalogue sync",
     [string]$Script = "E:\Website\store-api\scripts\sap_sync_scheduled.cmd"
 )
@@ -57,22 +63,40 @@ $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Hours 1) `
     -MultipleInstances IgnoreNew
 
-# Password prompt rather than a stored credential in this file. Highest run level
-# because the task reads the SAP database through the account's Windows identity.
-$credential = Get-Credential -UserName $User -Message "Password for $User (the account the sync runs as)"
+$description = "Syncs the SAP Business One materials and spare-parts catalogues into the store Postgres. See store-api/scripts/sap_sync.py."
 
-Register-ScheduledTask `
-    -TaskName $TaskName `
-    -Action $action `
-    -Trigger $trigger `
-    -Settings $settings `
-    -User $credential.UserName `
-    -Password $credential.GetNetworkCredential().Password `
-    -RunLevel Highest `
-    -Description "Syncs the SAP Business One materials and spare-parts catalogues into the store Postgres. See store-api/scripts/sap_sync.py." `
-    -Force | Out-Null
+# The built-in service accounts have no password to ask for - they are registered by
+# name with LogonType ServiceAccount. Anything else is a real user, whose password is
+# prompted for rather than stored in this file, and which is what you need if the sync
+# is still reaching SAP through Windows authentication (see .PARAMETER User).
+$builtin = @("SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE")
+if ($builtin -contains $User.ToUpper().Replace("NT AUTHORITY\", "")) {
+    $principal = New-ScheduledTaskPrincipal -UserId $User -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask `
+        -TaskName $TaskName `
+        -Action $action `
+        -Trigger $trigger `
+        -Settings $settings `
+        -Principal $principal `
+        -Description $description `
+        -Force | Out-Null
+    $ranAs = $User
+} else {
+    $credential = Get-Credential -UserName $User -Message "Password for $User (the account the sync runs as)"
+    Register-ScheduledTask `
+        -TaskName $TaskName `
+        -Action $action `
+        -Trigger $trigger `
+        -Settings $settings `
+        -User $credential.UserName `
+        -Password $credential.GetNetworkCredential().Password `
+        -RunLevel Highest `
+        -Description $description `
+        -Force | Out-Null
+    $ranAs = $credential.UserName
+}
 
-Write-Host "Registered '$TaskName' - daily at $At as $($credential.UserName)."
+Write-Host "Registered '$TaskName' - daily at $At as $ranAs."
 Write-Host ""
 Write-Host "Run it once now to check it works:"
 Write-Host "    Start-ScheduledTask -TaskName '$TaskName'"
