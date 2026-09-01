@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.core.logging_conf import get_logger, setup_logging
+from app.core.metrics import setup_metrics
 from app.database import Base, engine
 from app.routers import (
     activity,
@@ -107,6 +108,13 @@ async def add_static_cache_headers(request: Request, call_next):
     if request.url.path.startswith("/static/") and response.status_code == 200:
         response.headers.setdefault("Cache-Control", "public, max-age=3600")
     return response
+
+
+# Request counters + latency histogram on every route, and the token-gated /metrics
+# endpoint Prometheus scrapes. Registered here rather than inside a router because it
+# installs middleware, which Starlette only accepts before the app starts serving.
+# A no-op unless METRICS_TOKEN is set - see app/core/metrics.py.
+setup_metrics(app)
 
 app.include_router(activity.router)
 app.include_router(auth.router)

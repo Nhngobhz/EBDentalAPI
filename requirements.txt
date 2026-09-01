@@ -22,3 +22,7 @@ Pillow==11.3.0
 boto3==1.43.51
 fpdf2==2.8.4
 uharfbuzz==0.55.0
+# Monitoring: request counters + latency histogram exposed at /metrics for the
+# Prometheus service on the server to scrape (app/core/metrics.py).
+prometheus-client==0.26.0
+prometheus-fastapi-instrumentator==8.1.0

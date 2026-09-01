@@ -256,6 +256,16 @@ class Settings(BaseSettings):
     SAP_DB_USER: str = ""
     SAP_DB_PASSWORD: str = ""
 
+    # --- Monitoring ----------------------------------------------------------
+    # Shared secret Prometheus sends as `Authorization: Bearer <token>` when it
+    # scrapes GET /metrics; anyone without it gets a 404 (app/core/metrics.py).
+    # Empty - the default - disables instrumentation entirely rather than publishing
+    # an endpoint nobody can read, so a development box pays nothing for a feature it
+    # isn't using. Generate one with
+    # `python -c "import secrets; print(secrets.token_urlsafe(32))"` and put the same
+    # value in the storefront's .env and in monitoring\prometheus.yml.
+    METRICS_TOKEN: str = ""
+
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
