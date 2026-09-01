@@ -72,6 +72,18 @@ _SORTS = {
     "oldest": lambda: (Product.created_at.asc(), Product.id.asc()),
 }
 
+# Orderings that are the price list in another form. A caller whose prices are
+# masked (see get_price_visibility) is refused these: every figure is withheld
+# from the card, but "cheapest first" still ranks all 8,125 items by it, and a
+# ranking read together with any one known price brackets every neighbour.
+#
+# A silent fall back to the default rather than a 422, matching what the endpoint
+# already does with the rest of a request it cannot honour as asked - the caller
+# gets the catalogue, just not in that order. The storefront hides the Sort
+# control from these shoppers entirely (sap_catalog.can_sort); this is the half
+# that holds when the parameter is typed into the URL instead.
+_PRICE_SORTS = {"price_asc", "price_desc"}
+
 
 def _free_item_loader():
     """free_items -> the freebie Product itself, which BundleItemOut reads
@@ -268,7 +280,8 @@ def list_products(
 ):
     """Public: product catalog browsing needs no account. Price/discount
     are masked unless the caller is staff or a customer with
-    access_permission=True.
+    access_permission=True - and a masked caller asking for a price ordering gets
+    the default one instead (see _PRICE_SORTS).
 
     Gift-only products (is_purchasable=False) are left out by default - they
     can't be bought, so a storefront listing that offers them is a dead end.
@@ -306,6 +319,8 @@ def list_products(
     # back first. That is exactly why `sort` is a parameter here rather than something
     # the materials catalog does to the 24 cards it was handed - "cheapest first"
     # across 8,125 items is a different query, not a different rendering.
+    if sort in _PRICE_SORTS and not can_view_price:
+        sort = "name"
     products = (
         query.order_by(*_SORTS[sort]())
         .offset(skip)

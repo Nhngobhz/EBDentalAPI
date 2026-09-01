@@ -6121,9 +6121,14 @@ def test_products_can_be_sorted_and_the_sort_is_done_by_the_database(client, db_
         )
         assert resp.status_code == 201, resp.text
 
-    def first(sort):
+    def first(sort, as_headers=headers):
+        # Signed in as staff by default: the price orderings are refused to anyone
+        # whose prices are masked (see below), so an anonymous call could not tell
+        # a working price sort from a silently ignored one.
         resp = client.get(
-            "/products/", params={"section": "materials", "sort": sort, "limit": 1}
+            "/products/",
+            params={"section": "materials", "sort": sort, "limit": 1},
+            headers=as_headers,
         )
         assert resp.status_code == 200, resp.text
         return resp.json()[0]["product_name"]
@@ -6135,6 +6140,17 @@ def test_products_can_be_sorted_and_the_sort_is_done_by_the_database(client, db_
     # Nothing here has been synced from SAP, so every stock_qty is NULL. A stock
     # sort must still return rows rather than putting the unknowns on top.
     assert first("stock_desc") in {"Sort Alpha", "Sort Mike", "Sort Zulu"}
+
+    # A caller who cannot see prices cannot order by them either: the ordering IS
+    # the price list, one comparison at a time. It falls back to the default rather
+    # than erroring, and the masking itself is untouched.
+    assert first("price_asc", as_headers=None) == "Sort Alpha"  # i.e. name order
+    assert first("price_desc", as_headers=None) == "Sort Alpha"
+    assert first("name_desc", as_headers=None) == "Sort Zulu"  # other sorts still work
+    masked = client.get(
+        "/products/", params={"section": "materials", "sort": "price_asc", "limit": 1}
+    ).json()[0]
+    assert masked["price"] == "XXXX"
 
     # A sort value the endpoint doesn't define is rejected by validation rather
     # than reaching an ORDER BY - see schemas.ProductSort.
