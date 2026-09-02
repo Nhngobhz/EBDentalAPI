@@ -5999,6 +5999,92 @@ def test_product_facets_count_the_groups_a_filter_set_falls_into(client, db_sess
     assert categories == {"FacetBurs": 3}
 
 
+def test_category_filter_takes_more_than_one_category(client, db_session):
+    """`category_id` repeats: "?category_id=8&category_id=19" means "in either".
+
+    The materials catalog filters with a panel of checkboxes and is paged on the
+    server - it holds 24 rows of 8,000 - so it cannot do the OR itself the way the
+    machinery page does over a catalog it has fetched whole. Listing, count and
+    facets must all read the repeated parameter the same way, or the page numbers
+    stop matching the grid they are cut from.
+    """
+    make_admin(db_session, email="multicat@example.com", password="password123")
+    headers = auth_header(client, "multicat@example.com", "password123")
+
+    def category(name):
+        return client.post(
+            "/categories/", data={"category_name": name}, headers=headers
+        ).json()["id"]
+
+    burs, files, teeth = category("MultiBurs"), category("MultiFiles"), category("MultiTeeth")
+    brand_id = client.post(
+        "/brands/", data={"brand_name": "MultiCatCo"}, headers=headers
+    ).json()["id"]
+
+    def make(name, category_id):
+        resp = client.post(
+            "/products/",
+            json={
+                "product_name": name,
+                "price": "10.00",
+                "brand_id": brand_id,
+                "category_id": category_id,
+                "section": "materials",
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 201, resp.text
+
+    make("Multi Bur A", burs)
+    make("Multi Bur B", burs)
+    make("Multi File A", files)
+    make("Multi Tooth A", teeth)
+
+    def names(**params):
+        rows = client.get(
+            "/products/", params={"section": "materials", "limit": 500, **params}
+        ).json()
+        return sorted(p["product_name"] for p in rows if p["product_name"].startswith("Multi"))
+
+    def count(**params):
+        return client.get(
+            "/products/count", params={"section": "materials", **params}
+        ).json()["count"]
+
+    # One value still means one category - every caller that predates the list
+    # sends exactly this.
+    assert names(category_id=burs) == ["Multi Bur A", "Multi Bur B"]
+
+    # Two values mean either.
+    assert names(category_id=[burs, files]) == [
+        "Multi Bur A",
+        "Multi Bur B",
+        "Multi File A",
+    ]
+
+    # The count agrees with the listing, which is the whole point: it is what the
+    # storefront divides into page numbers.
+    assert count(category_id=[burs, files]) == count(category_id=burs) + count(
+        category_id=files
+    )
+    assert count(category_id=[burs, files, teeth]) == len(names(
+        category_id=[burs, files, teeth]
+    ))
+
+    # An empty value is "no filter", not "no categories" - a browser-built query
+    # string writes "?category_id=" for a control nobody touched, and reading that
+    # as `IN ()` would empty the grid.
+    assert count(category_id="") == count()
+
+    # The category facet still offers every category rather than only the ticked
+    # ones - on a multi-select panel, ticking a second box is the normal next move.
+    body = client.get(
+        "/products/facets", params={"section": "materials", "category_id": [burs, files]}
+    ).json()
+    offered = {c["name"] for c in body["categories"]}
+    assert {"MultiBurs", "MultiFiles", "MultiTeeth"} <= offered
+
+
 def test_product_facets_route_is_not_shadowed_by_product_id(client):
     """Same route-order trap /products/count has: declared after /{product_id},
     "facets" is offered to it as an int and 422s."""

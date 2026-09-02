@@ -22,6 +22,35 @@ def _empty_str_to_none(value: object) -> object:
 
 OptionalInt = Annotated[int | None, BeforeValidator(_empty_str_to_none)]
 
+
+def _empty_list_to_none(value: object) -> object:
+    """Same normalization as above, for a filter the browser may repeat.
+
+    A repeated parameter reaches FastAPI as a list, so the empty-string case
+    arrives as `[""]` (`?category_id=`) rather than as `""` - which `int | None`
+    rejects just as hard inside a list as outside one. An all-empty list becomes
+    None, i.e. "no filter", which is what an untouched form field means.
+    """
+    if value == "":
+        return None
+    if isinstance(value, (list, tuple)):
+        cleaned = [item for item in value if item != ""]
+        return cleaned or None
+    return value
+
+
+# A filter the caller may pass more than once: `?category_id=8&category_id=19`.
+# A single `?category_id=8` still arrives as [8], so every existing caller that
+# sends one value keeps working unchanged.
+#
+# Query() is not decoration here, it is the whole thing: FastAPI reads a scalar
+# parameter out of the query string but a *list* one out of the request BODY
+# unless told otherwise, so without it every endpoint below silently ignores the
+# filter and returns the unfiltered catalogue.
+OptionalIntList = Annotated[
+    list[int] | None, Query(), BeforeValidator(_empty_list_to_none)
+]
+
 # Same problem, same fix, for the date-range filters on the activity log: an admin
 # who clears the "from" box posts `?date_from=`, which is "no lower bound" and not a
 # malformed date.

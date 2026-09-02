@@ -8,7 +8,7 @@ from app.core.audit import stamp_updated_by
 from app.core.bundles import build_bundle_rows, replace_bundle_rows
 from app.core.deps import get_price_visibility, get_verified_user, require_permission
 from app.core.files import save_image, save_named_image
-from app.core.query import Limit, OptionalInt, Skip
+from app.core.query import Limit, OptionalInt, OptionalIntList, Skip
 from app.database import get_db
 from app.models import Brand, Category, Product, ProductFreeItem, ProductImage, User
 from app.schemas import (
@@ -224,7 +224,7 @@ def _catalog_query(
     db: Session,
     *,
     brand_id: int | None,
-    category_id: int | None,
+    category_id: int | list[int] | None,
     q: str | None,
     section: str,
     include_unpurchasable: bool,
@@ -251,7 +251,15 @@ def _catalog_query(
     if brand_id is not None:
         query = query.filter(Product.brand_id == brand_id)
     if category_id is not None:
-        query = query.filter(Product.category_id == category_id)
+        # One category or several. The materials catalog's filter panel is a list
+        # of checkboxes, so it asks for "Diamond Burs OR Endo Files" as a repeated
+        # parameter; every other caller passes a bare int and lands in the same
+        # place through a one-element list. An EMPTY list is not a filter - it is
+        # what an untouched panel sends - and must not be turned into
+        # `IN ()`, which matches nothing and would empty the grid.
+        wanted = category_id if isinstance(category_id, list) else [category_id]
+        if wanted:
+            query = query.filter(Product.category_id.in_(wanted))
     if q:
         # Name OR code. Code matters as much as name in the materials half, where
         # the catalogue is 8,000 SAP items and staff know things by their item code
@@ -269,7 +277,7 @@ def list_products(
     skip: Skip = 0,
     limit: Limit = 50,
     brand_id: OptionalInt = None,
-    category_id: OptionalInt = None,
+    category_id: OptionalIntList = None,
     q: str | None = None,
     section: SectionFilter = "machinery",
     sort: ProductSort = "name",
@@ -293,6 +301,11 @@ def list_products(
     is the point: materials come from SAP and must never turn up on a machinery
     page, so a caller that forgets to ask gets the same rows it got before the
     column existed. Pass "all" from the screens that genuinely span both.
+
+    `category_id` may be repeated - "?category_id=8&category_id=19" reads as "in
+    either" - because the materials catalog filters with a panel of checkboxes and
+    is paged on the server: with 8,000 items it holds 24 rows at a time and cannot
+    do the OR itself the way the machinery page does (see blueprints/catalog.py).
     """
     query = _catalog_query(
         db,
@@ -335,7 +348,7 @@ def list_products(
 @router.get("/count", response_model=ProductCount)
 def count_products(
     brand_id: OptionalInt = None,
-    category_id: OptionalInt = None,
+    category_id: OptionalIntList = None,
     q: str | None = None,
     section: SectionFilter = "machinery",
     include_unpurchasable: bool = False,
@@ -351,6 +364,9 @@ def count_products(
 
     Takes no price-visibility dependency: a count is not a price, and it is the
     same number for every viewer.
+
+    `category_id` repeats here exactly as it does on GET /products/ - it has to,
+    since this is the number that listing is divided into pages by.
     """
     total = _catalog_query(
         db,
@@ -367,7 +383,7 @@ def count_products(
 @router.get("/facets", response_model=ProductFacets)
 def product_facets(
     brand_id: OptionalInt = None,
-    category_id: OptionalInt = None,
+    category_id: OptionalIntList = None,
     q: str | None = None,
     section: SectionFilter = "machinery",
     include_unpurchasable: bool = False,
@@ -393,10 +409,12 @@ def product_facets(
     """
     def buckets(group_column, entity, name_column, extra_column=None, extra_key=None, **drop):
         # `drop` blanks the grouped column's OWN filter. Counting categories with
-        # category_id still applied would return exactly one bucket - the category
-        # already chosen - leaving the page no way to offer the others without
-        # clearing the filter first. Every other filter stays, which is what makes
-        # the brand counts on a category page describe that category.
+        # category_id still applied would return a bucket only for the categories
+        # already ticked, leaving the page no way to offer the others without
+        # clearing the filter first - and on a multi-select panel that is the one
+        # thing the counts are for, since ticking a second box is the normal next
+        # move. Every other filter stays, which is what makes the brand counts on a
+        # category page describe that category.
         base = _catalog_query(
             db,
             **{
