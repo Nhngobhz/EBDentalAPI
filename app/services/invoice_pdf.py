@@ -333,7 +333,7 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
         ("Salesperson", order.salesperson),
         ("User", order.quoted_by_name),
         ("Installation Term", order.install_term or site["default_install_term"]),
-        ("Contact Person", order.contact_person),
+        ("Contact Person", order.contact_person or site["default_contact_person"]),
     ])
     pdf.set_y(max(left_bottom, right_bottom) + 4)
 

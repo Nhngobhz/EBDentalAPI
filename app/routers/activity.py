@@ -15,7 +15,7 @@ else's work. The same rule covers the per-record History panel, deliberately: on
 is one thing to reason about, and a panel that showed what the list withheld would be
 the same leak through a smaller window.
 """
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import String, cast, func, or_
@@ -36,6 +36,11 @@ _admin = Depends(require_permission("admin"))
 # story follows the link into the filtered list.
 ENTITY_HISTORY_LIMIT = 25
 
+# The clock the screen prints and therefore the clock its date filters bound. Same
+# constant and same reasoning as app/services/telegram_format.py: Cambodia is UTC+7
+# all year, so a fixed offset is exact and needs no tzdata on the Windows server.
+ICT = timezone(timedelta(hours=7))
+
 
 def _apply_filters(query, actor_type, actor_user_id, action, entity_type, date_from, date_to, q):
     if actor_type:
@@ -47,17 +52,21 @@ def _apply_filters(query, actor_type, actor_user_id, action, entity_type, date_f
     if entity_type:
         query = query.filter(ActivityLog.entity_type == entity_type)
     if date_from:
-        # The admin picks a day, not an instant. Compared in UTC because that is what
-        # the column stores; a filter that silently used the server's local midnight
-        # would drop or duplicate entries either side of it depending on the host.
+        # The admin picks a day, not an instant - and they pick it while reading a
+        # screen that prints every timestamp on the Cambodia clock, so the day has to
+        # be bounded by Cambodian midnight or the filter disagrees with the column it
+        # is filtering. UTC midnight put the boundary at 7am local: "what happened on
+        # the 2nd" silently dropped everything before breakfast and pulled in the tail
+        # of the 1st. A fixed offset, not the host's local time, so the answer is still
+        # the same on any machine that runs this.
         query = query.filter(
-            ActivityLog.occurred_at >= datetime.combine(date_from, time.min, tzinfo=timezone.utc)
+            ActivityLog.occurred_at >= datetime.combine(date_from, time.min, tzinfo=ICT)
         )
     if date_to:
         # Inclusive of the chosen day, which is what picking the same date in both
         # boxes has to mean - `<= date_to` alone would match only its first instant.
         query = query.filter(
-            ActivityLog.occurred_at <= datetime.combine(date_to, time.max, tzinfo=timezone.utc)
+            ActivityLog.occurred_at <= datetime.combine(date_to, time.max, tzinfo=ICT)
         )
     if q:
         term = f"%{q.strip()}%"

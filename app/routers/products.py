@@ -536,7 +536,7 @@ def update_product(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="product_code already in use")
 
     # Free items are replaced wholesale when sent and left alone when omitted -
-    # see replace_bundle_rows for why this can't just be an assignment.
+    # see replace_bundle_rows, which reconciles rather than re-creating.
     if "free_items" in data:
         replace_bundle_rows(
             db, product, "free_items", payload.free_items or [], ProductFreeItem,

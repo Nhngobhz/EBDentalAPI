@@ -95,11 +95,19 @@ def build_option_groups(db: Session, groups, group_model, choice_model):
 def replace_option_groups(db: Session, set_, groups, group_model, choice_model) -> None:
     """Swap a set's option groups for a newly submitted list.
 
-    Same clear-flush-assign dance as replace_bundle_rows, and load-bearing for
-    the same reason: re-submitting a group that keeps one of its existing
+    The clear-flush-assign that replace_bundle_rows used to do, and load-bearing
+    for the same reason: re-submitting a group that keeps one of its existing
     products would otherwise re-insert a (group_id, product_id) pair that is
     still in the table and die on uq_set_option_choice. Rows are built and
     validated first, so a bad payload 400s without touching what's saved.
+
+    Not reconciled the way bundle rows now are, and the reason is that a group
+    has no stable identity to reconcile ON. A bundle member is identified by its
+    product_id; a group is a name and an ordered list of choices, either of which
+    the edit may have been about, so matching an incoming group to a saved one
+    would be a guess. The cost is that editing a set's option groups still fills
+    the activity log with the whole structure rather than the part that moved -
+    worth revisiting if that ever becomes the noisy screen.
     """
     rows = build_option_groups(db, groups, group_model, choice_model)
     set_.option_groups = []
@@ -292,20 +300,52 @@ def replace_bundle_rows(
     *,
     exclude_product_id: int | None = None,
 ) -> None:
-    """Swap a bundle's contents for a newly submitted list.
+    """Reconcile a bundle's contents with a newly submitted list.
 
-    The clear-flush-assign dance is load-bearing, not ceremony. Assigning
-    straight over the collection lets SQLAlchemy INSERT the incoming rows
-    BEFORE it DELETEs the ones that dropped out, so any edit that keeps an
-    existing member re-inserts a (owner, product_id) pair that's still in the
-    table and dies on the unique constraint (`uq_set_item` and friends) as a
-    500. Flushing the deletes first makes "add one product to a set that
-    already has two" - the most ordinary edit there is - actually work.
+    Only what actually differs is touched: a member that survives the edit keeps
+    its row (and its id), a member that dropped out is deleted, a new one is
+    inserted, and a member whose quantity changed is UPDATEd in place.
 
-    Rows are built (and validated) before anything is cleared, so a bad
-    product_id 400s without touching what's already saved.
+    That is a change of method, and the reason is the activity log. This used to
+    clear the collection, flush, and assign the whole list back - which meant
+    "add one product to a promotion that already has three" wrote four DELETEs
+    and four INSERTs, and the log dutifully filed seven "Removed/Added included
+    product" entries around the one thing anyone did. Worse, the one entry that
+    was true said nothing the other six didn't. A log is only worth scrolling if
+    an ordinary edit leaves an ordinary trace.
+
+    The clear-flush-assign it replaces existed to dodge a real 500: assigning
+    straight over the collection lets SQLAlchemy INSERT the incoming rows BEFORE
+    it DELETEs the ones that dropped out, so re-submitting a member that is
+    already saved re-inserts an (owner, product_id) pair still in the table and
+    trips the unique constraint (`uq_promotion_item` and friends). Reconciling
+    closes that at the source rather than working around it - a row is only ever
+    inserted for a product that is NOT currently a member, so an insert can never
+    collide with a pending delete and no intermediate flush is needed.
+
+    The one behaviour given up: these collections order by row id (see
+    Promotion.items), so re-submitting the same members in a different order no
+    longer re-numbers them into that order. Reordering a bundle's contents by
+    deleting and re-adding every member was never something the picker offered.
+
+    Rows are still built (and validated) before anything is touched, so a bad
+    product_id 400s without disturbing what's already saved.
     """
     rows = build_bundle_rows(db, items, model, exclude_product_id=exclude_product_id)
-    setattr(owner, attr, [])
-    db.flush()
-    setattr(owner, attr, rows)
+    current = {row.product_id: row for row in getattr(owner, attr)}
+
+    keep = []
+    for row in rows:
+        existing = current.pop(row.product_id, None)
+        if existing is None:
+            keep.append(row)
+            continue
+        if existing.qty != row.qty:
+            # An in-place UPDATE, which the activity log reads as "Edited included
+            # product, qty 1 -> 3". The old path could only say removed-then-added.
+            existing.qty = row.qty
+        keep.append(existing)
+
+    # Whatever is left in `current` was not resubmitted; assigning the merged list
+    # orphans exactly those rows and the delete-orphan cascade removes them.
+    setattr(owner, attr, keep)

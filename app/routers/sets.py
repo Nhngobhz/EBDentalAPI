@@ -146,7 +146,7 @@ def update_set(
     if "brand_id" in data:
         _check_brand(db, data["brand_id"])
     # Contents are replaced wholesale when sent and left alone when omitted -
-    # see replace_bundle_rows for why this can't just be an assignment.
+    # see replace_bundle_rows, which reconciles rather than re-creating.
     if "items" in data:
         replace_bundle_rows(db, set_, "items", payload.items or [], SetItem)
         del data["items"]

@@ -5652,6 +5652,111 @@ def test_activity_log_files_order_line_changes_under_the_order(client, db_sessio
     assert added["changes"]["qty"] == [None, 3]
 
 
+def test_editing_bundle_contents_logs_only_what_changed(client, db_session):
+    """Adding one product to a promotion that already has three must leave ONE entry.
+
+    It used to leave seven: the contents were cleared and re-created on every save, so
+    the activity log faithfully recorded three removals and four additions around the
+    single thing the admin actually did. See replace_bundle_rows.
+    """
+    make_admin(db_session, email="bundlelog@example.com", password="password123")
+    headers = auth_header(client, "bundlelog@example.com", "password123")
+    a = _make_order_product(client, headers, name="Bundle A", price="10.00")
+    b = _make_order_product(client, headers, name="Bundle B", price="20.00")
+    c = _make_order_product(client, headers, name="Bundle C", price="30.00")
+    d = _make_order_product(client, headers, name="Bundle D", price="40.00")
+
+    promo = _make_promotion(
+        client, headers, name="Growing Deal",
+        items=[
+            {"product_id": a["id"], "qty": 1},
+            {"product_id": b["id"], "qty": 1},
+            {"product_id": c["id"], "qty": 1},
+        ],
+    )
+    before = len(_entries_for(client, headers, "promotions", promo["id"]))
+
+    resp = client.put(
+        f"/promotions/{promo['id']}",
+        json={"items": [
+            {"product_id": a["id"], "qty": 1},
+            {"product_id": b["id"], "qty": 1},
+            {"product_id": c["id"], "qty": 1},
+            {"product_id": d["id"], "qty": 1},   # the one real change
+        ]},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+
+    # Newest first, so everything this PUT filed sits at the front.
+    entries = _entries_for(client, headers, "promotions", promo["id"])
+    new_entries = entries[: len(entries) - before]
+    assert [e["note"] for e in new_entries] == ["Added included product"]
+    assert new_entries[0]["changes"]["product_id"] == [None, d["id"]]
+
+
+def test_changing_a_bundle_member_quantity_is_an_edit_not_a_swap(client, db_session):
+    """A quantity change is one UPDATE on the row that has it. The clear-and-recreate
+    could only ever describe it as a removal followed by an addition."""
+    make_admin(db_session, email="bundleqty@example.com", password="password123")
+    headers = auth_header(client, "bundleqty@example.com", "password123")
+    kept = _make_order_product(client, headers, name="Qty Item", price="10.00")
+
+    promo = _make_promotion(
+        client, headers, name="Qty Deal", items=[{"product_id": kept["id"], "qty": 1}]
+    )
+    before = len(_entries_for(client, headers, "promotions", promo["id"]))
+
+    resp = client.put(
+        f"/promotions/{promo['id']}",
+        json={"items": [{"product_id": kept["id"], "qty": 5}]},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["items"][0]["qty"] == 5
+
+    entries = _entries_for(client, headers, "promotions", promo["id"])
+    new_entries = entries[: len(entries) - before]
+    assert [e["note"] for e in new_entries] == ["Edited included product"]
+    assert new_entries[0]["changes"]["qty"] == [1, 5]
+
+
+def test_resaving_a_promotion_unchanged_logs_nothing(client, db_session):
+    """A save that changes nothing must record nothing.
+
+    `start_date`/`end_date` are DateTime(timezone=True); a payload that sent them
+    without an offset arrived naive, which is never equal to the aware value already
+    in the column - so every save rewrote both and filed a start/end date entry for an
+    edit nobody had made. See _assume_utc in schemas.py.
+    """
+    make_admin(db_session, email="promoresave@example.com", password="password123")
+    headers = auth_header(client, "promoresave@example.com", "password123")
+    member = _make_order_product(client, headers, name="Stable Item", price="10.00")
+
+    promo = _make_promotion(
+        client, headers, name="Stable Deal",
+        items=[{"product_id": member["id"], "qty": 1}],
+    )
+    before = len(_entries_for(client, headers, "promotions", promo["id"]))
+
+    # Exactly what the admin form posts for a promotion whose dates were not touched:
+    # the same calendar day, spelled without an offset.
+    resp = client.put(
+        f"/promotions/{promo['id']}",
+        json={
+            "promotion_name": promo["promotion_name"],
+            "price": promo["price"],
+            "start_date": promo["start_date"].replace("+00:00", ""),
+            "end_date": promo["end_date"].replace("+00:00", ""),
+            "items": [{"product_id": member["id"], "qty": 1}],
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+
+    assert len(_entries_for(client, headers, "promotions", promo["id"])) == before
+
+
 def test_activity_log_attributes_a_customer_editing_their_own_profile(client, db_session):
     """The case `updated_by_user_id` structurally cannot record: there is no `User`
     involved, so that column correctly stays NULL and says nothing at all."""

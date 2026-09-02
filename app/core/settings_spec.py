@@ -201,6 +201,15 @@ _DOCUMENT = (
             "their own per quote - they are negotiating them."),
     Setting("default_install_term", "document", "Default installation term", "text",
             "Free within Phnom Penh"),
+    # EB's own contact - it prints in the right-hand column of the quotation, beside
+    # Salesperson and User, not in the customer's column. So it is ours to state, the
+    # same way the two terms above are: a customer's cart shows it read-only and
+    # blueprints/quote.py substitutes it onto their order rather than trusting the
+    # request. Staff still type a per-quote one when a deal has its own contact.
+    Setting("default_contact_person", "document", "Default contact person", "text",
+            "098 882 953",
+            "Printed as “Contact Person” on every customer order, and shown "
+            "read-only in their cart. Staff can still type their own per quote."),
 )
 
 # ---------------------------------------------------------------------------

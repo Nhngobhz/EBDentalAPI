@@ -67,6 +67,28 @@ def _validate_date_of_birth(value: Optional[date]) -> Optional[date]:
 DateOfBirth = Annotated[Optional[date], AfterValidator(_validate_date_of_birth)]
 
 
+def _assume_utc(value: datetime) -> datetime:
+    """Stamp UTC on a datetime that arrived without an offset.
+
+    Every datetime column these feed is DateTime(timezone=True), so the value already
+    in the column always carries one - and in Python an aware datetime is never equal
+    to a naive one, whatever instants they name. A payload sending "2026-08-19T00:00:00"
+    for a start_date that was already 2026-08-19T00:00:00+00:00 therefore looked like a
+    change: SQLAlchemy rewrote the column and the activity log filed a start/end date
+    entry, on every save, for an edit nobody had made.
+
+    UTC rather than ICT because that is what an offset-less timestamp has always meant
+    on the way into Postgres here; this only makes the assumption explicit early enough
+    for the comparison to be honest. Callers that mean a Cambodian day say so - see
+    _date_to_iso in the admin's promotions blueprint.
+    """
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+# Same Annotated treatment as DateOfBirth, for the same reason.
+AwareDatetime = Annotated[datetime, AfterValidator(_assume_utc)]
+
+
 # --- Optional map location, shared by Customer and Order -------------------
 # A delivery point, stored three ways because the customer can supply it two
 # ways (drop a pin, or paste a Google Maps link) and neither always yields the
@@ -715,8 +737,8 @@ class PromotionBase(BaseModel):
     # written before the column keeps creating machinery promotions - see
     # models.Promotion.section.
     section: Section = "machinery"
-    start_date: datetime
-    end_date: datetime
+    start_date: AwareDatetime
+    end_date: AwareDatetime
 
     @field_validator("end_date")
     @classmethod
@@ -741,8 +763,8 @@ class PromotionUpdate(BaseModel):
     section: Optional[Section] = None
     price: Optional[Decimal] = Field(None, gt=0)
     old_price: Optional[Decimal] = Field(None, gt=0)
-    start_date: Optional[datetime] = None
-    end_date: Optional[datetime] = None
+    start_date: Optional[AwareDatetime] = None
+    end_date: Optional[AwareDatetime] = None
     # Omitted -> contents left alone; sent (even as []) -> replaced wholesale.
     items: Optional[list[BundleItemIn]] = None
 

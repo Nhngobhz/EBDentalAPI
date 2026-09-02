@@ -110,7 +110,7 @@ def update_promotion(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="end_date must be after start_date")
 
     # Contents are replaced wholesale when sent and left alone when omitted -
-    # see replace_bundle_rows for why this can't just be an assignment.
+    # see replace_bundle_rows, which reconciles rather than re-creating.
     if "items" in data:
         replace_bundle_rows(db, promotion, "items", payload.items or [], PromotionItem)
         del data["items"]
