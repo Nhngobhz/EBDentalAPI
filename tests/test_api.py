@@ -4247,6 +4247,180 @@ def test_a_paid_orders_status_is_final(client, db_session, monkeypatch):
     ).status_code == 200
 
 
+def test_only_an_admin_can_refund_a_paid_order(client, db_session, monkeypatch):
+    """Refunding undoes a completed sale, so it sits behind the same second door as
+    deleting one: `admin`, not merely price_listing. paid_at survives the refund - the
+    payment really happened, and its date is what a bank statement gets reconciled
+    against - while refunded_at records the reversal beside it."""
+    _fast_alert_wait(monkeypatch)
+    monkeypatch.setattr("app.routers.orders.send_refund_alert", _async_return(None))
+    make_admin(db_session, email="refundadmin@example.com", password="password123")
+    admin_headers = auth_header(client, "refundadmin@example.com", "password123")
+    _staff_without_admin(db_session, "refundstaff@example.com")
+    staff_headers = auth_header(client, "refundstaff@example.com", "password123")
+    product = _make_order_product(client, admin_headers, name="RefundWidget", price="100.00")
+
+    order = client.post(
+        "/orders/", json=_order_payload(product["id"]), headers=admin_headers
+    ).json()
+    client.put(f"/orders/{order['id']}", json={"payment_status": "paid"}, headers=admin_headers)
+    paid_at = client.get(f"/orders/{order['id']}", headers=admin_headers).json()["paid_at"]
+    assert paid_at is not None
+
+    refused = client.post(
+        f"/orders/{order['id']}/refund", json={"reason": "nope"}, headers=staff_headers
+    )
+    assert refused.status_code == 403, refused.text
+    assert "admin" in refused.json()["detail"]
+    # Refused, not half-done.
+    assert client.get(
+        f"/orders/{order['id']}", headers=admin_headers
+    ).json()["payment_status"] == "paid"
+
+    resp = client.post(
+        f"/orders/{order['id']}/refund",
+        json={"reason": "Wrong item supplied"},
+        headers=admin_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["payment_status"] == "refunded"
+    assert body["refunded_at"] is not None
+    assert body["refund_reason"] == "Wrong item supplied"
+    assert body["paid_at"] == paid_at
+    # The reversal is attributed, exactly like any other amendment to a settled sale.
+    assert body["updated_by"]["user_name"] == "Admin User"
+
+    # Refunding twice is a mistake, not a second refund.
+    assert client.post(
+        f"/orders/{order['id']}/refund", json={}, headers=admin_headers
+    ).status_code == 409
+
+    # And a refunded row counts as settled for the delete gate too - still admin-only.
+    assert client.delete(f"/orders/{order['id']}", headers=staff_headers).status_code == 403
+    assert client.delete(f"/orders/{order['id']}", headers=admin_headers).status_code == 204
+
+
+def test_only_a_paid_order_can_be_refunded(client, db_session, monkeypatch):
+    """There is nothing to give back on an order nobody has paid for - staff cancel that
+    instead. A CANCELLED but paid order, on the other hand, is the main thing this exists
+    for: that is money owed back, and until now the only trace of it was a note on the
+    admin screen."""
+    _fast_alert_wait(monkeypatch)
+    monkeypatch.setattr("app.routers.orders.send_refund_alert", _async_return(None))
+    make_admin(db_session, email="refundonlypaid@example.com", password="password123")
+    headers = auth_header(client, "refundonlypaid@example.com", "password123")
+    product = _make_order_product(client, headers, name="RefundGateWidget", price="40.00")
+
+    unpaid = client.post("/orders/", json=_order_payload(product["id"]), headers=headers).json()
+    resp = client.post(f"/orders/{unpaid['id']}/refund", json={}, headers=headers)
+    assert resp.status_code == 409, resp.text
+    assert "nothing to refund" in resp.json()["detail"]
+
+    # Cancelled AND paid. update_order refuses to set those two from the admin screen in
+    # either order (deliberately - see the two 409 tests above), but a payment confirmed
+    # by the bank against an already-cancelled order still lands here, and it is exactly
+    # the row a refund is owed on. Written straight to the table for that reason.
+    cancelled = client.post("/orders/", json=_order_payload(product["id"]), headers=headers).json()
+    client.put(f"/orders/{cancelled['id']}", json={"status": "cancelled"}, headers=headers)
+    from app.models import Order
+
+    row = db_session.query(Order).filter(Order.id == cancelled["id"]).first()
+    row.payment_status = "paid"
+    db_session.commit()
+    resp = client.post(
+        f"/orders/{cancelled['id']}/refund",
+        json={"reason": "Cancelled after payment"},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["payment_status"] == "refunded"
+
+
+def test_undoing_a_refund_clears_the_reversal(client, db_session, monkeypatch):
+    """The way back from a mis-clicked refund: re-record the payment. The date and the
+    reason have to go with it - a row reading "paid" while still carrying "refunded, wrong
+    item supplied" contradicts itself everywhere it is printed."""
+    _fast_alert_wait(monkeypatch)
+    monkeypatch.setattr("app.routers.orders.send_refund_alert", _async_return(None))
+    make_admin(db_session, email="undorefund@example.com", password="password123")
+    headers = auth_header(client, "undorefund@example.com", "password123")
+    product = _make_order_product(client, headers, name="UndoRefundWidget", price="60.00")
+
+    order = client.post("/orders/", json=_order_payload(product["id"]), headers=headers).json()
+    client.put(f"/orders/{order['id']}", json={"payment_status": "paid"}, headers=headers)
+    client.post(f"/orders/{order['id']}/refund", json={"reason": "Mis-click"}, headers=headers)
+
+    resp = client.put(f"/orders/{order['id']}", json={"payment_status": "paid"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["payment_status"] == "paid"
+    assert body["refunded_at"] is None
+    assert body["refund_reason"] is None
+
+    # "refunded" is not settable through the generic update - the endpoint is the only
+    # door, because that is where the admin gate and the paid-only rule live.
+    assert client.put(
+        f"/orders/{order['id']}", json={"payment_status": "refunded"}, headers=headers
+    ).status_code == 422
+
+
+def test_a_refunded_orders_status_can_still_move(client, db_session, monkeypatch):
+    """The opposite of the paid rule. A completed sale's status is final; a REVERSED one
+    is exactly the row whose status still has somewhere to go - usually Cancelled, once
+    the goods are back on the shelf."""
+    _fast_alert_wait(monkeypatch)
+    monkeypatch.setattr("app.routers.orders.send_refund_alert", _async_return(None))
+    make_admin(db_session, email="refundstatus@example.com", password="password123")
+    headers = auth_header(client, "refundstatus@example.com", "password123")
+    product = _make_order_product(client, headers, name="RefundStatusWidget", price="20.00")
+
+    order = client.post("/orders/", json=_order_payload(product["id"]), headers=headers).json()
+    client.put(f"/orders/{order['id']}", json={"payment_status": "paid"}, headers=headers)
+    # Paid: frozen.
+    assert client.put(
+        f"/orders/{order['id']}", json={"status": "cancelled"}, headers=headers
+    ).status_code == 409
+
+    client.post(f"/orders/{order['id']}/refund", json={}, headers=headers)
+    resp = client.put(f"/orders/{order['id']}", json={"status": "cancelled"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "cancelled"
+
+
+def test_a_refunded_order_is_not_resurrected_by_the_payment_poll(client, db_session, monkeypatch):
+    """The subtle one. The QR that was paid stays good at the bank forever, so Bakong
+    goes on answering "yes, that transaction succeeded" long after the money went back.
+    Without the refunded guard in check_payment_status, the next poll would flip the
+    order to paid again and silently erase the refund."""
+    _fast_alert_wait(monkeypatch)
+    _configure_bakong(monkeypatch)
+    monkeypatch.setattr("app.routers.orders.send_refund_alert", _async_return(None))
+    make_admin(db_session, email="refundpoll@example.com", password="password123")
+    headers = auth_header(client, "refundpoll@example.com", "password123")
+    product = _make_order_product(client, headers, name="RefundPollWidget", price="30.00")
+
+    order = client.post("/orders/", json=_order_payload(product["id"]), headers=headers).json()
+    order = client.post(f"/orders/{order['id']}/khqr", headers=headers).json()
+
+    monkeypatch.setattr("app.routers.orders.check_bakong_payment", _async_return(True))
+    assert client.get(
+        f"/orders/{order['id']}/payment-status", headers=headers
+    ).json() == {"payment_status": "paid"}
+
+    client.post(f"/orders/{order['id']}/refund", json={}, headers=headers)
+    # Bakong still says the transaction went through - and the order stays refunded.
+    resp = client.get(f"/orders/{order['id']}/payment-status", headers=headers)
+    assert resp.json() == {"payment_status": "refunded"}
+    assert client.get(
+        f"/orders/{order['id']}", headers=headers
+    ).json()["refunded_at"] is not None
+    # Nor can a fresh QR be issued against it: paying again would be a new sale.
+    refused = client.post(f"/orders/{order['id']}/khqr", headers=headers)
+    assert refused.status_code == 400
+    assert "refunded" in refused.json()["detail"]
+
+
 def test_staff_can_issue_a_khqr_for_an_existing_order(client, db_session, monkeypatch):
     """The counter/phone-order case: a quote that already exists gets a QR the customer
     can scan. Idempotent, and invalidated by an edit that moves the total."""
@@ -5291,10 +5465,30 @@ def test_a_paid_order_prints_as_an_invoice(client, db_session):
     # A paid *order* (customer KHQR purchase), not just a paid quote, prints the same.
     assert document_title(OrderOut(**{**base, "order_type": "order", "payment_status": "paid"})) == "Invoice"
 
+    # A refunded row keeps the Invoice title: that invoice really was issued and is what
+    # the refund was made against, so re-titling it a Quotation would deny it existed.
+    # The reversal is stated in the terms box instead (REFUNDED_NOTE), which is also why
+    # this must not be reached through `payment_status == "paid"` alone.
+    refunded = OrderOut(
+        **{
+            **base,
+            "payment_status": "refunded",
+            "refunded_at": "2026-09-02T00:00:00Z",
+            "refund_reason": "Wrong item supplied",
+        }
+    )
+    assert document_title(refunded) == "Invoice"
+    assert _document_word(refunded) == "Invoice"
+    # Cancelled still wins over both.
+    assert document_title(
+        OrderOut(**{**base, "status": "cancelled", "payment_status": "refunded"})
+    ) == "Cancelled Order"
+
     assert _document_word(paid) == document_title(paid)
     # Both still build - the title change didn't break the layout either way.
     assert build_invoice_pdf(unpaid)[:4] == b"%PDF"
     assert build_invoice_pdf(paid)[:4] == b"%PDF"
+    assert build_invoice_pdf(refunded)[:4] == b"%PDF"
 
 
 # ---------------------------------------------------------------------------

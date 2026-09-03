@@ -148,6 +148,7 @@ def _payment_qr_image(url: str):
 
 
 CANCELLED_NOTE = "This order was cancelled. It is not an invoice and is not payable."
+REFUNDED_NOTE = "This invoice has been refunded. The payment was returned to the customer."
 
 
 def document_title(order) -> str:
@@ -162,7 +163,10 @@ def document_title(order) -> str:
        staff had already cancelled.
     2. Anything the system has recorded a payment for is an **Invoice** - a confirmed
        KHQR payment, or a quote staff marked paid after taking cash at the counter. Keyed
-       on payment_status, NOT on order_type: a paid quote IS the sale.
+       on payment_status, NOT on order_type: a paid quote IS the sale. A **refunded**
+       row keeps that title: the invoice was really issued and is what the refund was
+       made against, so re-printing it as a "Quotation" would deny it ever existed. The
+       reversal is stated in the terms box instead (REFUNDED_NOTE below).
     3. Everything else is a **Quotation**.
 
     (2) was called "Receipt" until 2026-08-17, renamed on the owner's instruction - a paid
@@ -177,7 +181,8 @@ def document_title(order) -> str:
     """
     if getattr(order, "status", None) == "cancelled":
         return "Cancelled Order"
-    return "Invoice" if getattr(order, "payment_status", None) == "paid" else "Quotation"
+    settled = getattr(order, "payment_status", None) in ("paid", "refunded")
+    return "Invoice" if settled else "Quotation"
 
 
 class _QuotePDF(FPDF):
@@ -216,6 +221,9 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
     # setting: it states a fact about the row rather than wording the shop chooses, and
     # a settings page full of knobs nobody turns is its own problem (settings_spec.py).
     is_paid_document = order.payment_status == "paid" and not is_cancelled
+    # A refunded invoice is neither payable nor a completed sale, so it gets neither the
+    # thank-you note nor the bank QR - it says what happened to it instead.
+    is_refunded = order.payment_status == "refunded" and not is_cancelled
     paid_note = (
         site["receipt_note_khqr"]
         if order.payment_method == "khqr"
@@ -228,6 +236,11 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
     # validityNote/termsLines block in buildPrintTemplate() in the website's main.js.
     if is_paid_document:
         terms_lines = [paid_note]
+    elif is_refunded:
+        refunded_on = order.refunded_at.strftime("%d %b %Y") if order.refunded_at else ""
+        terms_lines = [REFUNDED_NOTE + (f" ({refunded_on})" if refunded_on else "")]
+        if order.refund_reason:
+            terms_lines.append(f"Reason: {order.refund_reason}")
     elif is_cancelled:
         terms_lines = [CANCELLED_NOTE]
     else:
@@ -238,7 +251,7 @@ def build_invoice_pdf(order: OrderOut) -> bytes:
                 site["quote_payment_note"],
             ) if line
         ]
-    qr_image = None if (is_paid_document or is_cancelled) else _payment_qr_image(
+    qr_image = None if (is_paid_document or is_refunded or is_cancelled) else _payment_qr_image(
         site["quote_payment_qr"]
     )
     qr_caption = site["quote_payment_qr_caption"] if qr_image is not None else ""

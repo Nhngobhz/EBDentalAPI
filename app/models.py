@@ -824,10 +824,33 @@ class Order(AuditedMixin, Base):
     # NULL for staff quotes (no payment concept there); "cash" or "khqr" for
     # customer-placed rows. payment_status/paid_at only ever apply to KHQR orders:
     # "unpaid" until the Bakong transaction is confirmed (GET /orders/{id}/payment-status
-    # polling) or staff mark it paid, then "paid".
+    # polling) or staff mark it paid, then "paid" - and "refunded" once an admin sends
+    # the money back (see refunded_at below).
     payment_method = Column(String(10), nullable=True)
     payment_status = Column(String(20), nullable=True)
     paid_at = Column(DateTime(timezone=True), nullable=True)
+
+    # When an admin refunded this sale (POST /orders/{id}/refund).
+    #
+    # The reversal itself lives in payment_status ("refunded"), not in a separate
+    # boolean, precisely so every screen that already branches on that one field keeps
+    # telling the truth for free: a refunded row is neither money taken nor money still
+    # owed, so it drops out of both halves of the takings without any of them having to
+    # learn a second column.
+    #
+    # `paid_at` is deliberately LEFT IN PLACE when this is set - the payment really did
+    # happen, and its date is what a bank statement gets reconciled against. This column
+    # records the reversal beside it rather than erasing it.
+    #
+    # The amount returned is always the order's grand_total: refunds here are all or
+    # nothing (no partial-refund workflow was asked for), so storing the figure a second
+    # time would only create something that can disagree with the order.
+    refunded_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Why the money went back - free text, and optional: it goes on the printed invoice
+    # and into the Telegram alert, but a refund at the counter shouldn't be blocked on
+    # someone typing a sentence first. NULL on every row that was never refunded.
+    refund_reason = Column(String(255), nullable=True)
 
     # The generated KHQR (EMV) payload string shown to the customer as a QR code, and
     # its MD5 - the MD5 is what Bakong's check_transaction_by_md5 API keys on, so both

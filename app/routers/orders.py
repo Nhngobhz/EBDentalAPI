@@ -21,6 +21,12 @@ no edits and no deletion, see _reject_if_paid. Edits re-price every line from sc
 through the same _build_order_lines the original purchase used, so "trusted only from
 the server" holds for an edited order exactly as it does for a new one.
 
+payment_status runs "unpaid" -> "paid" -> "refunded" (refund_order below, admin only).
+"refunded" is a settled row like "paid" - it keeps its Invoice title and its admin-only
+delete gate - but it is NOT money: nothing that totals takings may count it, and the
+payment poll must never flip it back, since the bank goes on reporting that transaction
+as successful forever.
+
 Creating an order accepts either a staff (User) or Customer bearer token, mirroring how
 POST /auth/login tries both - see _get_ordering_principal. Whichever kind of account is
 calling must also meet the same "can place an order" bar the frontend enforces before
@@ -57,6 +63,7 @@ from app.schemas import (
     CheckoutStatusOut,
     OrderCreate,
     OrderOut,
+    OrderRefund,
     OrderUpdate,
     PendingCheckoutLineOut,
     PendingCheckoutOut,
@@ -67,6 +74,7 @@ from app.services.telegram import (
     deliver_order_alert,
     resolve_pending_quotation_pdf,
     send_khqr_pending_alert_for_checkout,
+    send_refund_alert,
 )
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
@@ -1043,7 +1051,11 @@ async def check_payment_status(
             status_code=status.HTTP_400_BAD_REQUEST, detail="This order has no QR payment to check"
         )
 
-    if order.payment_status != "paid":
+    # "refunded" is checked alongside "paid" so the poll leaves a reversed sale alone:
+    # the QR for it is still out there and Bakong/PayWay will go on reporting that
+    # transaction as successful forever, so without this a refunded order would flip
+    # itself back to "paid" on the next poll and silently erase the refund.
+    if order.payment_status not in ("paid", "refunded"):
         # A stored khqr_md5 marks a Bakong-direct order (the md5 is what Bakong's
         # check API keys on); a PayWay order has none and is checked by
         # tran_id = order_number instead. Branching on the order's own artifact (not
@@ -1102,6 +1114,14 @@ def generate_order_khqr(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This order has already been paid.",
+        )
+    # A refunded sale is finished in the other direction. Re-issuing a QR against it
+    # would let the customer pay a second time for something they were just refunded
+    # for; if they really are buying again, that is a new order.
+    if order.payment_status == "refunded":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This order has been refunded - raise a new order to take payment.",
         )
     if not settings.khqr_configured:
         raise HTTPException(
@@ -1275,6 +1295,10 @@ def update_order(
     # "cancelled" only ever misrepresents it against the receipt the customer holds.
     # Re-sending the value it already has is allowed, so a full-object edit that
     # simply carries the current status through doesn't trip this.
+    #
+    # A REFUNDED order is deliberately not covered: the sale it describes has been
+    # undone, so its status is exactly what still needs to move - usually to
+    # "cancelled" once the goods are back on the shelf.
     if order.payment_status == "paid" and "status" in fields and fields["status"] != order.status:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -1331,6 +1355,15 @@ def update_order(
             detail="A percent discount cannot exceed 100",
         )
 
+    # Undoing a refund - staff re-record the payment, or drop the row back to unpaid -
+    # has to clear the reversal with it. Without this the order would read as paid while
+    # still carrying the date and reason the money went back, and every screen that
+    # prints "Refunded on ..." would be contradicting the row it sits on. Read before
+    # the loop below applies `fields`, so order.payment_status is still the old value.
+    if order.payment_status == "refunded" and "payment_status" in fields:
+        order.refunded_at = None
+        order.refund_reason = None
+
     for field, value in fields.items():
         setattr(order, field, value)
 
@@ -1371,6 +1404,71 @@ def update_order(
     return order
 
 
+@router.post("/{order_id}/refund", response_model=OrderOut)
+def refund_order(
+    order_id: int,
+    payload: OrderRefund,
+    background_tasks: BackgroundTasks,
+    current_user: User = _perm,
+    db: Session = Depends(get_db),
+):
+    """Record that the money for a settled sale has been given back.
+
+    **Admin only**, on top of this router's own price_listing-or-admin gate - the same
+    second door delete_order asks for, and for the same reason: a refund undoes a
+    completed sale, and that is the owner's call rather than something any salesperson
+    who can raise a quote should be able to do to a row the Orders page has locked.
+
+    It does NOT move money by itself. Nothing here can - the payment came in through
+    Bakong/PayWay or over the counter, and it goes back the same way. This endpoint is
+    where staff write down that it happened, so the books, the printed invoice and the
+    takings totals all stop claiming a sale that no longer stands.
+
+    Only a "paid" order can be refunded: there is nothing to give back on an unpaid one
+    (staff cancel that instead), and refunding twice is a mistake worth a 409 rather
+    than a second Telegram alert. A CANCELLED order can be refunded, and is in fact the
+    main case - a cancelled sale that had already been paid is precisely money owed
+    back, and until now the only trace of it was a note in the admin modal.
+
+    payment_status becomes "refunded" and refunded_at is stamped; paid_at is left alone
+    on purpose (see Order.refunded_at). The reversal is undone from the ordinary
+    update - PUT payment_status back to "paid"/"unpaid" - which clears both columns.
+    """
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    if not current_user.admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only an admin can refund an order",
+        )
+    if order.payment_status == "refunded":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This order has already been refunded",
+        )
+    if order.payment_status != "paid":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This order has no payment on record - there is nothing to refund",
+        )
+
+    order.payment_status = "refunded"
+    order.refunded_at = datetime.now(timezone.utc)
+    order.refund_reason = (payload.reason or "").strip() or None
+    # Same trail as any other amendment to a completed sale. The activity log's flush
+    # listener files the paid -> refunded diff on its own, so there is no record_event
+    # here: the diff says the whole story by itself.
+    stamp_updated_by(order, current_user)
+    db.commit()
+    db.refresh(order)
+    # Text-only, unlike the paid alert: there is no document to attach - the invoice
+    # still exists, it has simply been reversed - and money leaving is worth its own
+    # line in the chat rather than a re-send of the order.
+    background_tasks.add_task(send_refund_alert, OrderOut.model_validate(order))
+    return order
+
+
 @router.delete("/{order_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_order(order_id: int, current_user: User = _perm, db: Session = Depends(get_db)):
     order = db.query(Order).filter(Order.id == order_id).first()
@@ -1383,10 +1481,16 @@ def delete_order(order_id: int, current_user: User = _perm, db: Session = Depend
     # to a row the Orders page has already locked. Note this is narrower than the
     # endpoint's own gate: `admin` here is a second door on top of _perm, exactly as the
     # discount checks in create_order/update_order ask for product_management.
-    if order.payment_status == "paid" and not current_user.admin:
+    # "refunded" counts as settled here for the same reason "paid" does: money moved
+    # both ways against this row, and the log of that is the row itself.
+    if order.payment_status in ("paid", "refunded") and not current_user.admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="This order has been paid - only an admin can delete it",
+            detail=(
+                "This order has been refunded - only an admin can delete it"
+                if order.payment_status == "refunded"
+                else "This order has been paid - only an admin can delete it"
+            ),
         )
     _reject_if_paid(order)
     db.delete(order)

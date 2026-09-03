@@ -1011,6 +1011,9 @@ class OrderUpdate(BaseModel):
 
     payment_status is how staff record that payment landed - the automatic Bakong/PayWay
     check for a KHQR order, or "Mark as Paid" for cash/bank transfer on any other row.
+    Sending it "unpaid" on a refunded order is how a refund is undone; "refunded" itself
+    is deliberately NOT accepted here (see OrderRefund) - giving money back is an admin
+    action with its own rules, not a field anyone with price_listing can set in passing.
     """
 
     status: Optional[str] = Field(None, max_length=30)
@@ -1048,6 +1051,24 @@ class OrderUpdate(BaseModel):
         ):
             raise ValueError("A percent discount cannot exceed 100")
         return discount_value
+
+
+class OrderRefund(BaseModel):
+    """Giving the money back on a settled sale - POST /orders/{id}/refund.
+
+    A body of its own rather than a payment_status value on OrderUpdate: a refund is
+    admin-only, only ever applies to an order with a payment on record, and stamps two
+    columns that must move together (see Order.refunded_at). One endpoint keeps those
+    three rules in one place instead of scattering them through the generic update.
+
+    There is no amount: the refund is the whole grand_total. Nothing in this business
+    asked for partial refunds, and a field that can hold a number smaller than the order
+    invites every screen downstream to decide for itself what "partly refunded" means.
+    """
+
+    # Optional on purpose - it is recorded and printed when given, but staff standing at
+    # the counter with a customer shouldn't have to compose a sentence to hand money back.
+    reason: Optional[str] = Field(None, max_length=255)
 
 
 class OrderItemOut(BaseModel):
@@ -1113,6 +1134,10 @@ class OrderOut(BaseModel):
     payment_method: Optional[str] = None
     payment_status: Optional[str] = None
     paid_at: Optional[datetime] = None
+    # Set only on a refunded row - paid_at stays put beside them, because the payment
+    # did happen and its date is what the bank statement is reconciled against.
+    refunded_at: Optional[datetime] = None
+    refund_reason: Optional[str] = None
     khqr_string: Optional[str] = None
     khqr_md5: Optional[str] = None
     # Which pending checkout this order was materialized from, for a customer KHQR sale

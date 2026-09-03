@@ -20,6 +20,7 @@ from app.services.telegram_format import (
     render_error,
     render_login,
     render_order_alert,
+    render_refund,
     render_status_change,
     split_for_messages,
     visible_length,
@@ -183,6 +184,51 @@ def test_a_paid_quote_with_no_timestamp_still_reads_as_paid():
     assert "QUOTE PAID" in text
     assert "no payment received yet" not in text
     assert "Cash to collect" not in text
+
+
+def test_a_refunded_order_is_never_announced_as_paid():
+    """A refunded row still carries paid_at and a payment_method, so a headline picked
+    on those would call money that went back a completed sale. Both dates are kept -
+    the payment is what a bank statement still shows, the refund is what undid it."""
+    order = make_order(
+        order_type="order",
+        payment_status="refunded",
+        payment_method="khqr",
+        paid_at=datetime(2026, 8, 22, 8, 0, tzinfo=UTC),
+        refunded_at=datetime(2026, 9, 2, 3, 0, tzinfo=UTC),
+        refund_reason="Wrong item supplied",
+    )
+    text = render_order_alert(order).full
+    assert "REFUNDED" in text
+    assert "PAID" not in text
+    assert "no payment received yet" not in text
+    assert "Paid 22 Aug 3:00 PM" in text
+    assert "Refunded 2 Sep 10:00 AM" in text
+    assert "Wrong item supplied" in text
+
+
+def test_render_refund_names_the_order_and_the_amount():
+    """The standalone alert fired when the money goes back. Short on purpose: the
+    invoice already went to this chat when the payment landed."""
+    order = make_order(
+        payment_status="refunded",
+        refunded_at=datetime(2026, 9, 2, 3, 0, tzinfo=UTC),
+        refund_reason="Customer returned it",
+    )
+    text = render_refund(order)
+    assert "REFUNDED" in text
+    assert "$980.00" in text
+    assert "25-0813" in text
+    assert "Sunrise Dental Clinic" in text
+    assert "Reason: Customer returned it" in text
+
+
+def test_render_refund_escapes_a_reason_somebody_typed():
+    """refund_reason is free text off an admin form and this string is sent with
+    parse_mode=HTML - unescaped, a stray "<" breaks the message Telegram rejects."""
+    order = make_order(payment_status="refunded", refund_reason="<b>oops</b>")
+    text = render_refund(order)
+    assert "&lt;b&gt;oops&lt;/b&gt;" in text
 
 
 def test_plain_order_headline():

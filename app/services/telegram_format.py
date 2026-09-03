@@ -187,6 +187,11 @@ class OrderAlert:
 
 def _headline(order) -> str:
     total = money(order.grand_total)
+    # Checked before "paid" because a refunded row still carries paid_at and a
+    # payment_method - announcing it as a completed sale would be the one thing about
+    # it that is no longer true.
+    if order.payment_status == "refunded":
+        return f"↩️ <b>REFUNDED</b> · <b>{esc(total)}</b>"
     if order.payment_status == "paid":
         via = " via KHQR" if order.payment_method == "khqr" else ""
         kind = "QUOTE" if order.order_type == "quote" else "ORDER"
@@ -265,7 +270,19 @@ def _footer(order) -> list[str]:
     # Gated on payment_status, never on paid_at: an order marked paid by hand at the
     # counter may carry no timestamp, and falling through to the unpaid notice because
     # of that would announce a completed sale as "no payment received".
-    if order.payment_status == "paid":
+    if order.payment_status == "refunded":
+        # Both dates, in the order they happened: the payment is what a bank statement
+        # still shows, and the refund is what undid it.
+        if order.paid_at:
+            lines.append(f"💵 Paid {esc(when(order.paid_at))}")
+        if order.refunded_at:
+            refunded = f"↩️ Refunded {esc(when(order.refunded_at))}"
+        else:
+            refunded = "↩️ Refunded"
+        if order.refund_reason:
+            refunded += f" — {esc(order.refund_reason)}"
+        lines.append(refunded)
+    elif order.payment_status == "paid":
         if order.paid_at:
             lines.append(f"💵 Paid {esc(when(order.paid_at))}")
     elif order.order_type == "quote":
@@ -361,6 +378,27 @@ def render_khqr_pending(reference: str, grand_total, customer_name: str) -> str:
         f"ℹ️ <i>No order exists yet — one is created, with its invoice, "
         f"once the payment lands.</i>"
     )
+
+
+def render_refund(order: "OrderOut") -> str:
+    """Money handed back on a sale that had been settled.
+
+    Text-only and short on purpose. The invoice already went to this chat when the
+    payment landed, and the point of this message is the one fact that alert can no
+    longer be trusted on - not a second copy of the order.
+    """
+    who = f"<b>{esc(order.clinic_name)}</b>"
+    label = "Quote" if order.order_type == "quote" else "Order"
+    lines = [
+        f"↩️ <b>REFUNDED</b> · <b>{esc(money(order.grand_total))}</b>",
+        RULE,
+        who,
+        f"{label} {esc(order.order_number)} · Code {esc(order.quote_code)}",
+    ]
+    if order.refund_reason:
+        lines.append(f"Reason: {esc(order.refund_reason)}")
+    lines.append(f"<i>{esc(when(order.refunded_at or datetime.now(timezone.utc)))}</i>")
+    return "\n".join(lines)
 
 
 def render_pdf_missing_notice() -> str:

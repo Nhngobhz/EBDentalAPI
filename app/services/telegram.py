@@ -49,6 +49,7 @@ from app.services.telegram_format import (
     render_login,
     render_order_alert,
     render_pdf_missing_notice,
+    render_refund,
     split_for_messages,
     visible_length,
 )
@@ -207,8 +208,12 @@ def _document_word(order: "OrderOut") -> str:
     in Telegram has to match the title inside the document they open. That word became
     "Invoice" (from "Receipt") on 2026-08-17. Imported inside the function like
     build_invoice_pdf below - invoice_pdf pulls in fpdf2 and both bundled fonts, which
-    nothing needs until an alert actually carries a document."""
-    if order.payment_status == "paid":
+    nothing needs until an alert actually carries a document.
+
+    "refunded" counts as settled here for the same reason document_title() treats it
+    that way: the invoice was genuinely issued, and the refund is a fact about it
+    rather than a reason to re-title it a quotation."""
+    if order.payment_status in ("paid", "refunded"):
         from app.services.invoice_pdf import document_title
 
         return document_title(order)
@@ -229,6 +234,18 @@ async def send_khqr_pending_alert_for_checkout(
     await send_telegram_message(
         render_khqr_pending(reference, grand_total, customer_name),
         topic_id=settings.TELEGRAM_ORDER_TOPIC_ID,
+    )
+
+
+async def send_refund_alert(order: "OrderOut") -> None:
+    """Money handed back, announced on its own line in the orders topic.
+
+    Text-only and deliberately without the Delivered/Cancelled buttons: the invoice
+    already went to this chat when the payment landed, and re-sending the document
+    would only put a second copy of it in front of staff. What they need is the one
+    fact that earlier alert can no longer be trusted on."""
+    await send_telegram_message(
+        render_refund(order), topic_id=settings.TELEGRAM_ORDER_TOPIC_ID
     )
 
 
