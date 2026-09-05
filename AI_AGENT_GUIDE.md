@@ -639,7 +639,7 @@ server-side and never trusted from the request body.
 | `GET /orders/{id}` | `price_listing` **or** `admin` | - |
 | `GET /orders/{id}/payment-status` | The principal who placed the order, **or any `price_listing` staff** | KHQR orders only (`400` otherwise). Returns `{"payment_status": "unpaid"\|"paid"}`; while unpaid, each call asks the order's own provider about the transaction (PayWay by `tran_id`, or Bakong by `khqr_md5` when `BAKONG_API_TOKEN` is configured) and the first confirmed one flips the order to paid (stamping `paid_at`, firing the paid-order Telegram alert). Polled by the paying customer's browser, and by the admin Orders page's QR dialog. |
 | `POST /orders/{id}/khqr` | `price_listing` | No body. Issues a scannable KHQR against an **existing** order (counter/phone sale) for its current `grand_total`, setting `payment_method: "khqr"`, `payment_status: "unpaid"`; returns the whole `OrderOut`. Idempotent - returns the stored payload if one exists. `400` if already paid or KHQR isn't configured. `order_type` is deliberately **not** changed. |
-| `PUT /orders/{id}` | `price_listing` **or** `admin` | JSON `OrderUpdate` - `status`, `payment_status`, `clinic_name`, `contact_person`, `phone`, `address`, `payment_term`, `install_term`, `discount_type`, `discount_value`, `items`. `items` REPLACES the line list and is re-priced server-side; a discount needs `product_management`; `payment_status: "paid"` stamps `paid_at` and fires the paid-order alert. **Two `409`s guard the paid/cancelled pair**: the `status` of a paid order can't be changed, and `payment_status: "paid"` is refused on a cancelled one (send the reopening `status` in the same request to do both at once). A confirmed KHQR payment is exempt - see `GET /{id}/payment-status`. |
+| `PUT /orders/{id}` | `price_listing` **or** `admin` | JSON `OrderUpdate` - `status`, `payment_status`, `clinic_name`, `contact_person`, `phone`, `address`, `payment_term`, `install_term`, `discount_type`, `discount_value`, `items`. `items` REPLACES the line list and is re-priced server-side; a discount needs `product_management`; `payment_status: "paid"` stamps `paid_at` and fires the paid-order alert. **Two `409`s guard the paid/cancelled pair**: the `status` of a paid order may only move forward along `pending → confirmed → delivered` (never backwards, never to `"cancelled"`; a refunded row is exempt), and `payment_status: "paid"` is refused on a cancelled one (send the reopening `status` in the same request to do both at once). A confirmed KHQR payment is exempt - see `GET /{id}/payment-status`. |
 | `DELETE /orders/{id}` | `price_listing` **or** `admin` | hard delete, cascades to `OrderItem` rows. A paid order can be deleted too (since 2026-08-11) - that destroys the record of a completed sale, with no archive to recover it from. |
 | `POST /orders/{id}/quotation-pdf` | Same principal who placed the order | `multipart/form-data`, field `file` (a PDF) - see notes below |
 
@@ -700,7 +700,7 @@ Notes an agent should know before calling this:
   has to be confirmed by hand. Dynamic QRs must carry an expiry (tag 99 sub-01,
   `KHQR_EXPIRY_MINUTES`); an expired one is refused by the payer's app and staff
   re-issue with `POST /orders/{id}/khqr`.
-- **A paid order is still editable - its `status` is not.** `PUT /orders/{id}`
+- **A paid order is still editable - its `status` only moves forward.** `PUT /orders/{id}`
   accepts the clinic details, terms, order-level discount and the line list
   itself (`items` REPLACES the lines and is re-priced through the same code
   path a new order goes through - only ids and quantities are ever accepted),
@@ -709,9 +709,14 @@ Notes an agent should know before calling this:
   write was lifted on 2026-08-11 (`_reject_if_paid`, now a no-op). Know what
   that means - the customer holds an Invoice printed from the pre-edit figures
   and nothing reissues it, so `updated_by`/`updated_at` are the only record
-  that an amendment happened. Two `409`s remain, and they are a pair:
-  `status` can't move once `payment_status` is `"paid"` (that field says how
-  the sale ended), and `payment_status: "paid"` is refused while `status` is
+  that an amendment happened. Two `409`s remain, and they are a pair: once
+  `payment_status` is `"paid"`, `status` may only advance along
+  `_STATUS_LADDER` (`pending → confirmed → delivered`) and never backwards or
+  off it to `"cancelled"` - payment is taken at the counter *before* the goods
+  go out, so a settled sale still has its fulfilment ahead of it, but it must
+  not end up describing itself as something the customer's receipt contradicts
+  (relaxed from a flat freeze on 2026-09-03; a refunded row is exempt
+  entirely); and `payment_status: "paid"` is refused while `status` is
   `"cancelled"` (reopen it in the same `PUT` if that is what you mean). An
   edit that moves `grand_total` clears any `khqr_string`/`khqr_md5` on the
   row, since the old QR would collect the wrong amount.

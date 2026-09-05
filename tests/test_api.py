@@ -4206,25 +4206,36 @@ def test_only_an_admin_can_delete_a_paid_order(client, db_session, monkeypatch):
     assert client.get(f"/orders/{paid['id']}", headers=admin_headers).status_code == 404
 
 
-def test_a_paid_orders_status_is_final(client, db_session, monkeypatch):
-    """The one thing a completed sale won't accept. Everything else about a paid order
-    can still be corrected (see the test above), but its workflow status describes how
-    the sale ended, and moving a settled order back to "pending" or on to "cancelled"
-    contradicts the receipt the customer is holding."""
+def test_a_paid_orders_status_only_moves_forward(client, db_session, monkeypatch):
+    """A settled sale is not finished work. Payment is taken at the counter before the
+    goods are picked and handed over, so a paid order still has to be confirmable and
+    completable - the status used to be frozen the moment money landed, which left every
+    counter sale stuck on "pending" for good.
+
+    What it must never do is walk backwards, or off the ladder to "cancelled": either
+    contradicts the receipt the customer is already holding."""
     _fast_alert_wait(monkeypatch)
     make_admin(db_session, email="finalstatus@example.com", password="password123")
     headers = auth_header(client, "finalstatus@example.com", "password123")
     product = _make_order_product(client, headers, name="FinalWidget", price="100.00")
 
     order = client.post("/orders/", json=_order_payload(product["id"]), headers=headers).json()
-    # Free to move while there is no payment on record.
+    # Free to move anywhere at all while there is no payment on record.
     assert client.put(
-        f"/orders/{order['id']}", json={"status": "delivered"}, headers=headers
+        f"/orders/{order['id']}", json={"status": "cancelled"}, headers=headers
     ).status_code == 200
+    client.put(f"/orders/{order['id']}", json={"status": "pending"}, headers=headers)
 
     client.put(f"/orders/{order['id']}", json={"payment_status": "paid"}, headers=headers)
 
-    for new_status in ("pending", "cancelled", "confirmed"):
+    # Forward along the ladder, with the payment on record - this is the whole point.
+    for new_status in ("confirmed", "delivered"):
+        resp = client.put(f"/orders/{order['id']}", json={"status": new_status}, headers=headers)
+        assert resp.status_code == 200, f"{new_status} -> {resp.status_code} {resp.text}"
+    assert client.get(f"/orders/{order['id']}", headers=headers).json()["status"] == "delivered"
+
+    # ...and nowhere else: back down the ladder, or off it entirely.
+    for new_status in ("pending", "confirmed", "cancelled"):
         resp = client.put(f"/orders/{order['id']}", json={"status": new_status}, headers=headers)
         assert resp.status_code == 409, f"{new_status} -> {resp.status_code} {resp.text}"
 
@@ -4240,7 +4251,7 @@ def test_a_paid_orders_status_is_final(client, db_session, monkeypatch):
     assert body["status"] == "delivered"
     assert body["clinic_name"] == "Still Editable"
 
-    # Reversing the payment unlocks it again - the sale is no longer complete.
+    # Reversing the payment lifts the ladder entirely - the sale is no longer complete.
     client.put(f"/orders/{order['id']}", json={"payment_status": "unpaid"}, headers=headers)
     assert client.put(
         f"/orders/{order['id']}", json={"status": "cancelled"}, headers=headers
@@ -4366,9 +4377,9 @@ def test_undoing_a_refund_clears_the_reversal(client, db_session, monkeypatch):
 
 
 def test_a_refunded_orders_status_can_still_move(client, db_session, monkeypatch):
-    """The opposite of the paid rule. A completed sale's status is final; a REVERSED one
-    is exactly the row whose status still has somewhere to go - usually Cancelled, once
-    the goods are back on the shelf."""
+    """The opposite of the paid rule. A completed sale's status only goes forwards, and
+    Cancelled is not forwards; a REVERSED one is exactly the row that needs to get
+    there, once the goods are back on the shelf."""
     _fast_alert_wait(monkeypatch)
     monkeypatch.setattr("app.routers.orders.send_refund_alert", _async_return(None))
     make_admin(db_session, email="refundstatus@example.com", password="password123")
@@ -4377,7 +4388,7 @@ def test_a_refunded_orders_status_can_still_move(client, db_session, monkeypatch
 
     order = client.post("/orders/", json=_order_payload(product["id"]), headers=headers).json()
     client.put(f"/orders/{order['id']}", json={"payment_status": "paid"}, headers=headers)
-    # Paid: frozen.
+    # Paid: Cancelled is off the ladder, so it is refused.
     assert client.put(
         f"/orders/{order['id']}", json={"status": "cancelled"}, headers=headers
     ).status_code == 409

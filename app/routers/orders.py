@@ -16,10 +16,12 @@ and OrderItem.parent_item_id). Components are priced at zero by construction, so
 can never be used to shift a total - the "free" flag is not something a client can set.
 
 An order stays editable by staff (PUT /{id}: clinic details, terms, discount, and the
-line list itself) right up until payment is recorded, at which point the row freezes -
-no edits and no deletion, see _reject_if_paid. Edits re-price every line from scratch
-through the same _build_order_lines the original purchase used, so "trusted only from
-the server" holds for an edited order exactly as it does for a new one.
+line list itself) even after payment is recorded - see _reject_if_paid, kept as a named
+seam but a no-op since 2026-08-11. The one thing a paid order restricts is its workflow
+`status`, which may only move forward along pending -> confirmed -> delivered (see
+update_order). Edits re-price every line from scratch through the same
+_build_order_lines the original purchase used, so "trusted only from the server" holds
+for an edited order exactly as it does for a new one.
 
 payment_status runs "unpaid" -> "paid" -> "refunded" (refund_order below, admin only).
 "refunded" is a settled row like "paid" - it keeps its Invoice title and its admin-only
@@ -405,6 +407,20 @@ def _compute_discount(
     if discount_type == "percent":
         return discountable_subtotal * discount_value / Decimal("100")
     return min(discount_value, discountable_subtotal)
+
+
+# The fulfilment workflow, in the order it runs. A status that isn't on this ladder
+# (today only "cancelled") has no position on it, which is exactly what keeps it
+# unreachable from a paid order - see the forward-only rule in update_order.
+_STATUS_LADDER = ("pending", "confirmed", "delivered")
+
+
+def _status_rank(value: str | None) -> int | None:
+    """Where `value` sits on _STATUS_LADDER, or None if it isn't on it at all."""
+    try:
+        return _STATUS_LADDER.index(value)
+    except ValueError:
+        return None
 
 
 def _reject_if_paid(order: Order) -> None:
@@ -1288,22 +1304,36 @@ def update_order(
                 detail=f"{field} cannot be empty",
             )
 
-    # A completed sale's workflow status is final. The rest of a paid order stays
-    # editable (see _reject_if_paid) because staff genuinely need to correct a real
-    # order after taking payment - but the status is the one field that describes how
-    # the sale ended, and moving a settled order back to "pending" or on to
-    # "cancelled" only ever misrepresents it against the receipt the customer holds.
-    # Re-sending the value it already has is allowed, so a full-object edit that
-    # simply carries the current status through doesn't trip this.
+    # A completed sale's workflow status may move FORWARD, and only forward
+    # (2026-09-03). It used to be final outright, which was wrong in the ordinary case
+    # this shop actually runs: payment is taken at the counter *before* the goods are
+    # picked and handed over, so a paid order still has its whole fulfilment ahead of
+    # it. Freezing the status the moment money landed left every counter sale stuck on
+    # "pending" for good, and staff had no way to record that it was confirmed or
+    # delivered.
     #
-    # A REFUNDED order is deliberately not covered: the sale it describes has been
-    # undone, so its status is exactly what still needs to move - usually to
-    # "cancelled" once the goods are back on the shelf.
+    # What the old rule was protecting is kept: moving a settled order BACKWARDS
+    # ("delivered" -> "pending") or off the ladder entirely ("cancelled") still
+    # misrepresents it against the receipt the customer is holding, so both are still
+    # refused. Only progress along pending -> confirmed -> delivered is allowed, and a
+    # paid order that has reached the end of the ladder is final again by construction.
+    # Re-sending the value it already has is not a change, so a full-object edit that
+    # simply carries the current status through doesn't trip this either.
+    #
+    # A REFUNDED order is deliberately not covered at all: the sale it describes has
+    # been undone, so its status is free to go anywhere - usually to "cancelled" once
+    # the goods are back on the shelf.
     if order.payment_status == "paid" and "status" in fields and fields["status"] != order.status:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This order is complete - its status can no longer be changed",
-        )
+        current_rank = _status_rank(order.status)
+        new_rank = _status_rank(fields["status"])
+        if current_rank is None or new_rank is None or new_rank < current_rank:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "This order is paid - its status can only move forward "
+                    "(pending, then confirmed, then delivered)"
+                ),
+            )
 
     # ...and the mirror image of that rule: money can't be recorded against a
     # cancelled sale. Without this, "Mark as Paid" on a cancelled row produced a

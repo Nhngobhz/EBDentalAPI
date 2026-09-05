@@ -1003,8 +1003,10 @@ class OrderUpdate(BaseModel):
     and the item list itself are all editable from the admin Orders page.
 
     Two hard rules live in the router, not here:
-      * **A paid order is frozen.** Once payment_status is "paid" every field below is
-        refused (and so is DELETE) - a receipt has been issued against those numbers.
+      * **A paid order's status only moves forward.** Everything else about a settled
+        sale stays correctable (staff genuinely need that), but `status` may only
+        advance along pending -> confirmed -> delivered: going backwards, or off to
+        "cancelled", contradicts the receipt the customer is holding.
       * **Prices are never accepted from the client.** `items` carries only
         product/promotion/set ids + qty, exactly like OrderCreate; the router re-looks-up
         and re-snapshots every price and recomputes subtotal/discount/grand_total.
