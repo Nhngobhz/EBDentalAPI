@@ -81,6 +81,7 @@ def _integration_status() -> dict:
             "mode": "Cloudflare R2" if env_settings.r2_configured else "Local disk",
             "max_image_mb": env_settings.MAX_IMAGE_SIZE_MB,
             "max_pdf_mb": env_settings.MAX_PDF_SIZE_MB,
+            "max_video_mb": env_settings.MAX_VIDEO_SIZE_MB,
         },
         "google_signin": {"configured": env_settings.google_auth_configured},
         "session": {

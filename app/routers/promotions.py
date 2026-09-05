@@ -127,10 +127,55 @@ def update_promotion(
 async def upload_promotion_image(
     promotion_id: int, file: UploadFile, _: User = _perm, db: Session = Depends(get_db)
 ):
+    """The deal's CARD artwork - the square tiles, the promotions page, the admin
+    thumbnail. The wide hero banner is the separate endpoint below."""
     promotion = db.query(Promotion).filter(Promotion.id == promotion_id).first()
     if not promotion:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Promotion not found")
     promotion.promotion_image = await save_named_image(file, "promotions", promotion.promotion_name)
+    db.commit()
+    db.refresh(promotion)
+    return _serialize_promotion(promotion, True)
+
+
+@router.post("/{promotion_id}/banner", response_model=PromotionOut)
+async def upload_promotion_banner(
+    promotion_id: int, file: UploadFile, _: User = _perm, db: Session = Depends(get_db)
+):
+    """The deal's WIDE artwork, for the storefront's hero slide only - see
+    models.Promotion.banner_image for why that is a different picture rather than a
+    different crop of the card one.
+
+    Named " banner" (with the trailing suffix save_named_image appends) so the two
+    pictures for one promotion can't overwrite each other: both are keyed off the
+    promotion's name, and without the distinct suffix uploading a banner would replace
+    the card image on disk while both columns went on pointing at the same file."""
+    promotion = db.query(Promotion).filter(Promotion.id == promotion_id).first()
+    if not promotion:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Promotion not found")
+    promotion.banner_image = await save_named_image(
+        file, "promotions", f"{promotion.promotion_name} banner"
+    )
+    db.commit()
+    db.refresh(promotion)
+    return _serialize_promotion(promotion, True)
+
+
+@router.delete("/{promotion_id}/banner", response_model=PromotionOut)
+def delete_promotion_banner(
+    promotion_id: int, _: User = _perm, db: Session = Depends(get_db)
+):
+    """Drop the hero banner and go back to the card image up top.
+
+    Uploads elsewhere have no counterpart to this because a primary image has no
+    "unset" that leaves anything behind - clearing one just leaves a placeholder. This
+    one has a real fallback (promotion_image), so removing a banner is a meaningful
+    thing to want, and there is otherwise no way back: the file input can replace a
+    banner but never clear one."""
+    promotion = db.query(Promotion).filter(Promotion.id == promotion_id).first()
+    if not promotion:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Promotion not found")
+    promotion.banner_image = None
     db.commit()
     db.refresh(promotion)
     return _serialize_promotion(promotion, True)

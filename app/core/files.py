@@ -1,5 +1,5 @@
 """
-Shared helper for handling image/PDF uploads.
+Shared helper for handling image / video / PDF uploads.
 
 Every *_image / pdf field in the schema is stored as a plain string - a
 Cloudflare R2 URL such as https://pub-xxxx.r2.dev/products/<uuid>.jpg (or a
@@ -24,6 +24,19 @@ from app.core.storage import save_object
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 ALLOWED_PDF_TYPES = {"application/pdf"}
 
+# Product-gallery videos. Deliberately just the two containers every browser can play
+# from a plain <video> tag with no plugin and no transcoding step: nothing in this
+# stack can re-encode, so anything accepted here is served back byte-for-byte and
+# either plays or doesn't.
+#
+# QuickTime (.mov, what an iPhone records) is NOT in the list even though it usually
+# holds ordinary H.264. Its playability depends on the codecs inside the container
+# rather than on the container, so accepting it would mean storing files that upload
+# cleanly, cost 60 MB and then show a black box on half the machines in the clinic.
+# Rejecting it produces an explicit "Unsupported file type" the admin can act on -
+# export/convert to MP4 - which is the better of the two failures.
+ALLOWED_VIDEO_TYPES = {"video/mp4", "video/webm"}
+
 # The extension a stored file gets, chosen from the content type we already
 # validated rather than from the client-supplied filename.
 #
@@ -40,6 +53,8 @@ _EXTENSION_BY_CONTENT_TYPE = {
     "image/webp": ".webp",
     "image/gif": ".gif",
     "application/pdf": ".pdf",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
 }
 
 # Longest side an uploaded image is downscaled to before saving, to keep
@@ -123,6 +138,23 @@ async def save_named_image(file: UploadFile, category: str, name: str) -> str:
     image.save(buffer, "JPEG", quality=IMAGE_JPEG_QUALITY, optimize=True)
 
     return save_object(key, buffer.getvalue(), "image/jpeg")
+
+
+async def save_video(file: UploadFile, category: str) -> str:
+    """A gallery video, stored exactly as uploaded under a uuid filename.
+
+    No `save_named_video` counterpart on purpose. The named variant exists so that
+    re-uploading a picture for an item overwrites the old one instead of orphaning it,
+    which only works because one item has exactly one primary image; a product can
+    carry several clips, so a name-derived key would make the second upload silently
+    replace the first. Same reasoning as the gallery photos - see save_image's use in
+    upload_product_gallery_images.
+
+    Nothing re-encodes or even inspects the contents: `save_named_image` can lean on
+    Pillow to prove a JPEG is really a JPEG, and there is no equivalent here without
+    pulling in ffmpeg. The content-type check plus the extension mapping in
+    save_upload is what keeps an upload from being served back as active content."""
+    return await save_upload(file, category, ALLOWED_VIDEO_TYPES, settings.MAX_VIDEO_SIZE_MB)
 
 
 async def save_pdf(file: UploadFile, category: str) -> str:

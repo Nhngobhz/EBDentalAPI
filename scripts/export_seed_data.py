@@ -210,7 +210,15 @@ def export_products(db) -> list[dict]:
                 "section": p.section,
                 "is_purchasable": p.is_purchasable,
                 "product_image": p.product_image,
-                "images": [img.image for img in images],
+                # Gallery rows, photos and videos alike - each one carries its
+                # own media_type so a re-seed cannot turn a clip into a photo
+                # nothing can render. seed_catalog also accepts the older
+                # bare-string form, so seed files exported before videos
+                # existed still load.
+                "images": [
+                    {"image": img.image, "media_type": img.media_type}
+                    for img in images
+                ],
                 "free_items": [
                     {"product": fi.product.product_name, "qty": fi.qty}
                     for fi in free_items
@@ -253,6 +261,7 @@ def export_promotions(db) -> list[dict]:
                 "start_date": promo.start_date,
                 "end_date": promo.end_date,
                 "promotion_image": promo.promotion_image,
+                "banner_image": promo.banner_image,
                 "items": [
                     {"product": it.product.product_name, "qty": it.qty}
                     for it in items
@@ -431,8 +440,9 @@ def main() -> None:
             "PRODUCTS",
             products,
             '"brand" / "category" are names resolved against BRANDS / CATEGORIES above.\n'
-            '"images" are the EXTRA gallery photos only - the primary one is\n'
-            'product_image. "free_items" name other products in this same list, so\n'
+            '"images" are the EXTRA gallery items only - photos AND videos, each\n'
+            'tagged with its media_type. The primary picture is product_image.\n'
+            '"free_items" name other products in this same list, so\n'
             "they are linked in a second pass once every product exists.",
         ),
         _block("MANUALS", manuals),

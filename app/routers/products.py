@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session, joinedload, selectinload
 from app.core.audit import stamp_updated_by
 from app.core.bundles import build_bundle_rows, replace_bundle_rows
 from app.core.deps import get_price_visibility, get_verified_user, require_permission
-from app.core.files import save_image, save_named_image
+from app.core.files import save_image, save_named_image, save_video
 from app.core.query import Limit, OptionalInt, OptionalIntList, Skip
 from app.database import get_db
 from app.models import Brand, Category, Product, ProductFreeItem, ProductImage, User
@@ -33,6 +33,12 @@ _MASKED_PRICE = "XXXX"
 # is decoded and re-uploaded in-process, so an unbounded list is a slow request
 # and a lot of memory - not a limit on how many a product may have in total.
 MAX_GALLERY_IMAGES = 12
+
+# The same cap for videos, and much lower for the same reason expressed in bytes: each
+# one is read whole into memory before it is stored, and at MAX_VIDEO_SIZE_MB apiece
+# twelve of them is over a gigabyte held at once. Three clips is already more than any
+# product page here shows. Again a per-request limit, not a per-product total.
+MAX_GALLERY_VIDEOS = 3
 
 # Where an uploaded product photo is filed. Machinery and materials are two
 # catalogues with two different lifecycles - machinery pictures are shot in-house and
@@ -647,6 +653,58 @@ async def upload_product_gallery_images(
     return _get_product_or_404(db, product_id)
 
 
+@router.post("/{product_id}/gallery/videos", response_model=ProductOut)
+async def upload_product_gallery_videos(
+    product_id: int,
+    files: list[UploadFile],
+    current_user: User = _product_perm,
+    db: Session = Depends(get_db),
+):
+    """Append one or more videos to the product's gallery - the same rail the photos
+    are in, so a clip sits between two stills wherever it was uploaded.
+
+    A separate endpoint from POST /gallery rather than one that sniffs each file's
+    type, because the two differ in every way that matters to the request: allowed
+    content types, size ceiling (MAX_VIDEO_SIZE_MB vs MAX_IMAGE_SIZE_MB), how many may
+    arrive at once, and whether the bytes are re-encoded on the way in. One endpoint
+    would have to answer "how large may this be?" differently per item in the list and
+    report a limit in an error message it picked halfway through.
+
+    Rows land in the same table as the photos, marked media_type="video" - see
+    models.ProductImage. Removal is the SAME endpoint the photos use
+    (DELETE /products/{id}/gallery/{image_id}); there is nothing video-specific about
+    deleting a row.
+
+    Videos keep uuid filenames and are stored byte-for-byte: nothing here transcodes,
+    so whatever plays in the admin's browser is exactly what a customer receives."""
+    product = _get_product_or_404(db, product_id)
+    if not files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="No files were uploaded"
+        )
+    if len(files) > MAX_GALLERY_VIDEOS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"At most {MAX_GALLERY_VIDEOS} videos can be uploaded at once",
+        )
+
+    next_order = max((img.sort_order for img in product.images), default=-1) + 1
+    for offset, file in enumerate(files):
+        url = await save_video(file, _image_folder(product))
+        db.add(
+            ProductImage(
+                product_id=product_id,
+                image=url,
+                media_type="video",
+                sort_order=next_order + offset,
+            )
+        )
+
+    stamp_updated_by(product, current_user)
+    db.commit()
+    return _get_product_or_404(db, product_id)
+
+
 @router.delete("/{product_id}/gallery/{image_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_product_gallery_image(
     product_id: int,
@@ -654,8 +712,9 @@ def delete_product_gallery_image(
     _: User = _product_perm,
     db: Session = Depends(get_db),
 ):
-    """Remove a single gallery photo. Scoped by product_id as well as image_id so
-    an id from another product can't be deleted through this path."""
+    """Remove a single gallery item - photo or video, they are rows in one table.
+    Scoped by product_id as well as image_id so an id from another product can't be
+    deleted through this path."""
     image = (
         db.query(ProductImage)
         .filter(ProductImage.id == image_id, ProductImage.product_id == product_id)

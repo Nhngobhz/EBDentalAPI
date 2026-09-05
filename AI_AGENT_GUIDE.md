@@ -37,7 +37,10 @@ confusing (not obviously wrong) results.
   directly (they're edited as a field of their owner - see "Bundle
   contents" in section 6): `PromotionItem`, `SetItem`, `ProductFreeItem`.
   A fourth child table, `ProductImage`, holds a product's extra gallery
-  photos and is addressed only via `/products/{id}/gallery` (section 6).
+  photos **and videos** (one table, one ordered rail, distinguished by
+  `media_type`) and is addressed only via `/products/{id}/gallery`,
+  `/products/{id}/gallery/videos` and the shared
+  `DELETE /products/{id}/gallery/{image_id}` (section 6).
   An `Order` row is either a **quote** or a real **order**
   (`order_type`): staff-placed rows and customer "cash" checkouts are
   quotes (server-priced snapshots, payment happens offline later);
@@ -288,6 +291,7 @@ sending JSON to them will fail:
 | `POST /manuals/` | `multipart/form-data` (`product_id`, optional `description`, optional `file`) | Same reasoning, for the manual's PDF |
 | `POST .../{id}/image`, `POST .../{id}/pdf` (on users, customers, brands, categories, products, manuals) | `multipart/form-data` (single `file` field) | Direct file upload |
 | `POST /products/{id}/gallery` | `multipart/form-data` (**`files`** - repeat the field once per file) | Several extra product photos in one request |
+| `POST /products/{id}/gallery/videos` | `multipart/form-data` (**`files`** - repeat the field once per file) | Gallery videos. Its own endpoint because the limits differ, not because the rows do - see the Products table |
 
 Everything else - including `PUT /brands/{id}` / `PUT /categories/{id}`
 (metadata-only update, image unchanged) - is plain JSON.
@@ -523,19 +527,35 @@ icon, so a null means "keep guessing" rather than "draw nothing".
 | `PATCH /products/{id}/price` | `price_listing` only | JSON `{"price"?, "discount"?}` - use this instead of `PUT` if the caller only has `price_listing` (it can't touch `free_items` - use `PUT` for that) |
 | `POST /products/{id}/image` | `product_management` | multipart `file` - the **primary** picture (`product_image`) |
 | `POST /products/{id}/gallery` | `product_management` | multipart `files` (repeat the field for each file, ≤12 per request) - **appends** extra photos, see below |
-| `DELETE /products/{id}/gallery/{image_id}` | `product_management` | removes one gallery photo; `404` if that image id isn't on that product |
+| `POST /products/{id}/gallery/videos` | `product_management` | multipart `files` (≤3 per request, MP4/WebM, ≤`MAX_VIDEO_SIZE_MB`) - **appends** videos to the same gallery, see below |
+| `DELETE /products/{id}/gallery/{image_id}` | `product_management` | removes one gallery item, photo or video; `404` if that id isn't on that product |
 | `DELETE /products/{id}` | `product_management` | cascades: deletes the product's `Manual`s and gallery images too, and drops it from any bundle/free-item list it appears in |
 
 **Product photos come in two kinds.** `product_image` is the single primary
 picture - it's what the catalog card, the cart, the printed quote and the
 Telegram alert show, and it's the first frame of the storefront gallery.
-`images` (read-only on `ProductOut`, `[{"id", "image", "sort_order"}, ...]`) are
-the *additional* photos shown on the product detail page, and the primary one is
-**not** repeated in that list. Gallery uploads append (posting 3 files to a
-product that has 2 leaves it with 5) and are ordered by `sort_order`, assigned
-`max(existing) + 1` at upload; deleting one never renumbers the rest. Unlike
-`product_image`, gallery files keep uuid names, so re-uploading doesn't
-overwrite. Not price-masked - a photo isn't a price.
+`images` (read-only on `ProductOut`,
+`[{"id", "image", "media_type", "sort_order"}, ...]`) are the *additional* photos
+shown on the product detail page, and the primary one is **not** repeated in that
+list. Gallery uploads append (posting 3 files to a product that has 2 leaves it
+with 5) and are ordered by `sort_order`, assigned `max(existing) + 1` at upload;
+deleting one never renumbers the rest. Unlike `product_image`, gallery files keep
+uuid names, so re-uploading doesn't overwrite. Not price-masked - a photo isn't a
+price.
+
+**The gallery holds videos too**, as rows of the same list with
+`media_type: "video"` (photos are `"image"`). Always branch on it: an MP4 handed
+to an `<img>` is a broken-image icon. They share the photos' `sort_order`
+sequence, so the two interleave in upload order rather than being grouped, and
+they share the one `DELETE`. What they do *not* share is the upload endpoint -
+`POST .../gallery/videos` exists because the two differ in allowed content types
+(MP4 and WebM only; QuickTime `.mov` is refused on purpose, since its playability
+depends on the codecs inside the container rather than the container), size
+ceiling (`MAX_VIDEO_SIZE_MB`, default 100, vs `MAX_IMAGE_SIZE_MB`), how many may
+arrive at once (3 vs 12), and whether the bytes are re-encoded. Nothing here
+transcodes or decodes video - there is no ffmpeg - so a stored clip is served back
+byte-for-byte, and the content-type check plus `save_upload`'s extension mapping
+is the whole of the validation.
 
 ### Manuals - `/manuals`
 | Method & path | Auth | Body / notes |
@@ -555,7 +575,24 @@ overwrite. Not price-masked - a photo isn't a price.
 | `GET /promotions/{id}` | Public | price masking applies, see section 4 |
 | `POST /promotions/` | `product_management` | JSON `PromotionCreate` (`promotion_name`, `description?`, `section?` (`machinery` default / `materials` - which storefront advertises the deal), `price` >0, `old_price?` >0, `start_date`, `end_date` - must be after `start_date` or `422`, `items?` - see "Bundle contents" below) |
 | `PUT /promotions/{id}` | `product_management` | JSON `PromotionUpdate`, all optional; if you change only one of `start_date`/`end_date`, the other's current value is still validated against it |
+| `POST /promotions/{id}/image` | `product_management` | multipart `file` - the **card** artwork (`promotion_image`), see below |
+| `POST /promotions/{id}/banner` | `product_management` | multipart `file` - the **hero banner** (`banner_image`), see below |
+| `DELETE /promotions/{id}/banner` | `product_management` | clears `banner_image` back to `null`, so the hero falls back to the card image |
 | `DELETE /promotions/{id}` | `product_management` | - |
+
+**A promotion has two pictures, one per placement.** `promotion_image` is the
+card art - the square "Special Offers" tiles, the Promotions page cards, the
+materials deal grid, the admin thumbnail, the deal page's gallery.
+`banner_image` is the wide artwork for the storefront's hero slide, and nothing
+else. They are separate columns rather than two crops of one file because a
+~200px square scaled into a ~16:6 band keeps about a third of itself, centred on
+whatever happens to be in the middle. `banner_image` is nullable and **the
+storefront falls back to `promotion_image` when it is null**, which is why no
+backfill was needed and why the `DELETE` above is worth having - unlike a primary
+image, an unset banner means something. The two are stored under different names
+(`"<name>"` and `"<name> banner"`); both go through `save_named_image`, so a
+shared name would have one overwrite the other on disk while both columns went on
+pointing at the survivor.
 
 **Note**: `Promotion.price`/`old_price` are masked the same way as
 `Product` prices - unauthenticated/unentitled callers get `price` as the

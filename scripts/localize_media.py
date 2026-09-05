@@ -71,6 +71,7 @@ MEDIA_COLUMNS = [
     (Manual, "manual_image", "manuals"),
     (Manual, "pdf", "manuals"),
     (Promotion, "promotion_image", "promotions"),
+    (Promotion, "banner_image", "promotions"),
     (Set, "set_image", "sets"),
     (Set, "detail_image", "sets"),
     (User, "user_image", "users"),

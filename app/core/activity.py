@@ -88,9 +88,17 @@ MAX_VALUE_CHARS = 300
 #
 # set_option_choices reaches its Set through its group, which is why these are
 # callables rather than column names.
+#
+# The third element is what the child is CALLED in the resulting note ("Added photo").
+# A callable there when one table holds more than one kind of thing - product_images
+# carries both, and "Removed photo" against a deleted video is simply wrong.
 CHILD_ROLLUP = {
     "order_items": ("orders", lambda o: getattr(o, "order_id", None), "line item"),
-    "product_images": ("products", lambda o: getattr(o, "product_id", None), "photo"),
+    "product_images": (
+        "products",
+        lambda o: getattr(o, "product_id", None),
+        lambda o: "video" if getattr(o, "media_type", "image") == "video" else "photo",
+    ),
     "product_free_items": (
         "products",
         lambda o: getattr(o, "parent_product_id", None),
@@ -527,6 +535,8 @@ def _row_for(session: Session, entry: dict, structural: set) -> Optional[dict]:
         }
 
     parent_table, parent_id_of, child_name = rollup
+    if callable(child_name):
+        child_name = child_name(obj)
     parent_id = parent_id_of(obj)
     if parent_id is None or (parent_table, parent_id) in structural:
         return None

@@ -1540,6 +1540,153 @@ def test_product_gallery_upload_append_and_delete(client, db_session):
     assert [i["sort_order"] for i in remaining] == [0, 2]
 
 
+def test_product_gallery_videos_share_the_rail_with_photos(client, db_session):
+    """A gallery video is a row of the same table as the photos: it takes the next
+    sort_order, comes back from the public read tagged media_type="video", and is
+    removed through the same DELETE the photos use.
+
+    The bytes are not a real MP4 and don't need to be - unlike save_named_image,
+    nothing decodes a video on the way in (there is no ffmpeg here), so the
+    content-type is the whole of the validation."""
+    make_admin(db_session, email="galleryvideo@example.com", password="password123")
+    headers = auth_header(client, "galleryvideo@example.com", "password123")
+    brand_id = client.post(
+        "/brands/", data={"brand_name": "VideoCo"}, headers=headers
+    ).json()["id"]
+    product_id = client.post(
+        "/products/",
+        json={"product_name": "Filmed Widget", "price": "10.00", "brand_id": brand_id},
+        headers=headers,
+    ).json()["id"]
+
+    fake_png = b"\x89PNG\r\n\x1a\n" + b"0" * 100
+    fake_mp4 = b"\x00\x00\x00\x18ftypmp42" + b"0" * 100
+
+    # A photo first, so the video has to be appended after it rather than at 0.
+    client.post(
+        f"/products/{product_id}/gallery",
+        files=[("files", ("one.png", fake_png, "image/png"))],
+        headers=headers,
+    )
+    resp = client.post(
+        f"/products/{product_id}/gallery/videos",
+        files=[("files", ("clip.mp4", fake_mp4, "video/mp4"))],
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    images = resp.json()["images"]
+    assert [i["media_type"] for i in images] == ["image", "video"]
+    assert [i["sort_order"] for i in images] == [0, 1]
+    # Neither upload path touches the primary picture.
+    assert resp.json()["product_image"] is None
+
+    # A photo uploaded afterwards continues the same sequence, so the two interleave
+    # in upload order rather than being grouped by kind.
+    resp = client.post(
+        f"/products/{product_id}/gallery",
+        files=[("files", ("two.png", fake_png, "image/png"))],
+        headers=headers,
+    )
+    assert [i["media_type"] for i in resp.json()["images"]] == ["image", "video", "image"]
+
+    # Public reads carry media_type - a client that can't tell them apart would put
+    # an MP4 in an <img>.
+    listed = client.get(f"/products/{product_id}").json()["images"]
+    assert [i["media_type"] for i in listed] == ["image", "video", "image"]
+
+    # One DELETE for either kind.
+    video_id = next(i["id"] for i in listed if i["media_type"] == "video")
+    assert client.delete(
+        f"/products/{product_id}/gallery/{video_id}", headers=headers
+    ).status_code == 204
+    assert [i["media_type"] for i in client.get(f"/products/{product_id}").json()["images"]] == [
+        "image",
+        "image",
+    ]
+
+
+def test_product_gallery_video_rejects_wrong_types_and_wrong_endpoint(client, db_session):
+    """The two upload endpoints don't accept each other's files. That is the point of
+    their being separate: they carry different size ceilings, and one content-type
+    check per endpoint is what keeps a 100MB allowance from applying to a PNG."""
+    make_admin(db_session, email="galleryvideo2@example.com", password="password123")
+    headers = auth_header(client, "galleryvideo2@example.com", "password123")
+    brand_id = client.post(
+        "/brands/", data={"brand_name": "VideoCo2"}, headers=headers
+    ).json()["id"]
+    product_id = client.post(
+        "/products/",
+        json={"product_name": "Picky Widget", "price": "10.00", "brand_id": brand_id},
+        headers=headers,
+    ).json()["id"]
+
+    fake_png = b"\x89PNG\r\n\x1a\n" + b"0" * 100
+    fake_mp4 = b"\x00\x00\x00\x18ftypmp42" + b"0" * 100
+
+    resp = client.post(
+        f"/products/{product_id}/gallery/videos",
+        files=[("files", ("one.png", fake_png, "image/png"))],
+        headers=headers,
+    )
+    assert resp.status_code == 400
+
+    resp = client.post(
+        f"/products/{product_id}/gallery",
+        files=[("files", ("clip.mp4", fake_mp4, "video/mp4"))],
+        headers=headers,
+    )
+    assert resp.status_code == 400
+
+    # QuickTime is refused on purpose - see ALLOWED_VIDEO_TYPES.
+    resp = client.post(
+        f"/products/{product_id}/gallery/videos",
+        files=[("files", ("clip.mov", fake_mp4, "video/quicktime"))],
+        headers=headers,
+    )
+    assert resp.status_code == 400
+
+    assert client.get(f"/products/{product_id}").json()["images"] == []
+
+
+def test_product_gallery_video_upload_requires_product_management(client, db_session):
+    """Same gate as the photo endpoint - a price_listing-only staffer can't add media."""
+    make_admin(db_session, email="videoowner@example.com", password="password123")
+    owner_headers = auth_header(client, "videoowner@example.com", "password123")
+    brand_id = client.post(
+        "/brands/", data={"brand_name": "VideoCo3"}, headers=owner_headers
+    ).json()["id"]
+    product_id = client.post(
+        "/products/",
+        json={"product_name": "Guarded Film", "price": "10.00", "brand_id": brand_id},
+        headers=owner_headers,
+    ).json()["id"]
+
+    from app.core.security import hash_password
+    from app.models import User
+
+    db_session.add(
+        User(
+            user_name="Pricing Only Video",
+            email="videoPricer@example.com",
+            hashed_password=hash_password("password123"),
+            is_active=True,
+            is_verified=True,
+            price_listing=True,
+        )
+    )
+    db_session.commit()
+    headers = auth_header(client, "videoPricer@example.com", "password123")
+
+    fake_mp4 = b"\x00\x00\x00\x18ftypmp42" + b"0" * 100
+    resp = client.post(
+        f"/products/{product_id}/gallery/videos",
+        files=[("files", ("clip.mp4", fake_mp4, "video/mp4"))],
+        headers=headers,
+    )
+    assert resp.status_code == 403
+    assert "product_management" in resp.json()["detail"]
+
+
 def test_product_gallery_delete_is_scoped_to_its_product(client, db_session):
     """An image id belonging to another product can't be deleted through this
     product's path."""
@@ -1856,6 +2003,97 @@ def _make_promotion(client, headers, name="Order Promo", price="50.00", old_pric
     resp = client.post("/promotions/", json=payload, headers=headers)
     assert resp.status_code == 201, resp.text
     return resp.json()
+
+
+def test_promotion_banner_is_separate_from_the_card_image(client, db_session):
+    """A promotion carries two pictures, one per placement: the square card art and
+    the wide hero banner. Uploading either must leave the other alone - they are the
+    same deal drawn twice, not two sizes of one file."""
+    make_admin(db_session, email="promobanner@example.com", password="password123")
+    headers = auth_header(client, "promobanner@example.com", "password123")
+    promo = _make_promotion(client, headers, name="Two-Picture Deal")
+
+    # Both start empty, and banner_image is what the storefront checks before falling
+    # back to the card image.
+    assert promo["promotion_image"] is None
+    assert promo["banner_image"] is None
+
+    # A real (tiny) PNG, not the byte-prefix stand-in the gallery tests use: these
+    # endpoints go through save_named_image, which re-encodes with Pillow.
+    fake_png = _png_bytes()
+    card = client.post(
+        f"/promotions/{promo['id']}/image",
+        files={"file": ("card.png", fake_png, "image/png")},
+        headers=headers,
+    )
+    assert card.status_code == 200, card.text
+    assert card.json()["promotion_image"]
+    assert card.json()["banner_image"] is None
+
+    banner = client.post(
+        f"/promotions/{promo['id']}/banner",
+        files={"file": ("wide.png", fake_png, "image/png")},
+        headers=headers,
+    )
+    assert banner.status_code == 200, banner.text
+    assert banner.json()["banner_image"]
+    # The card image survives the banner upload, and the two are different files -
+    # both are named after the promotion, so a shared name would have one overwrite
+    # the other on disk while both columns went on pointing at it.
+    assert banner.json()["promotion_image"] == card.json()["promotion_image"]
+    assert banner.json()["banner_image"] != banner.json()["promotion_image"]
+
+    # Public reads carry both.
+    fetched = client.get(f"/promotions/{promo['id']}").json()
+    assert fetched["banner_image"] == banner.json()["banner_image"]
+
+    # Clearing the banner goes back to "no banner", not to a blank string - the
+    # storefront's fallback keys off NULL.
+    cleared = client.delete(f"/promotions/{promo['id']}/banner", headers=headers)
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["banner_image"] is None
+    assert cleared.json()["promotion_image"] == card.json()["promotion_image"]
+
+
+def test_promotion_banner_requires_product_management(client, db_session):
+    """Authoring artwork is a catalogue change, same gate as the rest of the
+    promotion endpoints."""
+    make_admin(db_session, email="promobanner2@example.com", password="password123")
+    owner_headers = auth_header(client, "promobanner2@example.com", "password123")
+    promo = _make_promotion(client, owner_headers, name="Guarded Banner Deal")
+
+    from app.core.security import hash_password
+    from app.models import User
+
+    db_session.add(
+        User(
+            user_name="Pricing Only Banner",
+            email="bannerPricer@example.com",
+            hashed_password=hash_password("password123"),
+            is_active=True,
+            is_verified=True,
+            price_listing=True,
+        )
+    )
+    db_session.commit()
+    headers = auth_header(client, "bannerPricer@example.com", "password123")
+
+    fake_png = _png_bytes()
+    resp = client.post(
+        f"/promotions/{promo['id']}/banner",
+        files={"file": ("wide.png", fake_png, "image/png")},
+        headers=headers,
+    )
+    assert resp.status_code == 403
+    assert client.delete(f"/promotions/{promo['id']}/banner", headers=headers).status_code == 403
+
+    # A promotion that doesn't exist is a 404 on both verbs, not a 500.
+    assert client.post(
+        "/promotions/999999/banner",
+        files={"file": ("wide.png", fake_png, "image/png")},
+        headers=owner_headers,
+    ).status_code == 404
+    assert client.delete("/promotions/999999/banner", headers=owner_headers).status_code == 404
 
 
 def test_order_requires_clinic_phone_address(client, db_session):

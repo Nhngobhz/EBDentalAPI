@@ -431,7 +431,7 @@ class Product(AuditedMixin, Base):
 
 
 class ProductImage(Base):
-    """One extra photo of a product, for the detail page's gallery.
+    """One extra photo OR VIDEO of a product, for the detail page's gallery.
 
     A separate table rather than more `*_image` columns on Product (the shape
     Set uses for its single detail image) because the count isn't fixed - a
@@ -442,6 +442,14 @@ class ProductImage(Base):
     the first frame of the gallery. Rows here are only ever the additional ones,
     so nothing that reads `product_image` had to learn about this table.
 
+    Videos live here too, distinguished by `media_type`, rather than in a table of
+    their own. The gallery is ONE ordered rail on the product page - photo, photo,
+    clip, photo - and a second table would mean a second sort_order sequence with no
+    defined interleaving between them, plus a duplicate of the upload/delete/export
+    path for a row that is otherwise identical. The table name stays `product_images`
+    because renaming it would rewrite every migration, script and query that names it
+    for no behavioural gain.
+
     Not AuditedMixin: a gallery row is created and deleted, never edited, so
     "who last changed it" would only ever repeat who uploaded it."""
 
@@ -451,11 +459,30 @@ class ProductImage(Base):
     product_id = Column(
         Integer, ForeignKey("products.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    # The stored URL/path, whatever kind of media it is - see media_type. Named
+    # `image` because it predates videos and every caller, script and seed file
+    # already says `image`; renaming it would be a migration that changes nothing.
     image = Column(String(500), nullable=False)
+
+    # "image" or "video". What the storefront needs in order to render the row at all:
+    # a video in an <img> is a broken icon, and the two need different thumbnails,
+    # different stage markup and different lightbox behaviour.
+    #
+    # Stored rather than sniffed from the file extension, because the extension is not
+    # ours to rely on: an R2 URL, a hand-entered link, or a future container we accept
+    # would each need the sniffing list widened, and the failure would be a silently
+    # unrenderable gallery row rather than an error. A plain String + Pydantic Literal
+    # rather than a DB enum, same as Product.section and discount_type - widening the
+    # vocabulary later then needs no migration.
+    #
+    # NOT NULL with server_default "image": every row written before videos existed is
+    # a photo, which makes the backfill "all of them".
+    media_type = Column(String(10), nullable=False, server_default="image")
 
     # Display position within the gallery. Assigned by the router as
     # max(existing) + 1 on upload, so images stay in the order they were added
-    # and a delete doesn't renumber the survivors.
+    # and a delete doesn't renumber the survivors. Shared by photos and videos, so
+    # the two interleave in whatever order they were uploaded.
     sort_order = Column(Integer, nullable=False, server_default="0")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -552,7 +579,26 @@ class Promotion(AuditedMixin, Base):
     old_price = Column(Numeric(10, 2), nullable=True)  # fixed: old-price -> old_price
     start_date = Column(DateTime(timezone=True), nullable=False)
     end_date = Column(DateTime(timezone=True), nullable=False)
+    # The deal's card artwork: the square "Special Offers" tiles on the home page, the
+    # Promotions page cards, the materials deal grid, the admin table thumbnail and the
+    # first frame of the deal's own page gallery.
     promotion_image = Column(String(500), nullable=True)
+
+    # The same deal drawn for the full-width hero slide at the top of the home and
+    # catalog pages, and nothing else.
+    #
+    # A second column rather than a second use of promotion_image, because the two
+    # placements are different pictures, not different sizes of one: the card is a
+    # square tile roughly 200px across, the hero is a ~16:6 band spanning the page.
+    # Cropping a square to fit the band throws away most of it and centres whatever
+    # survives, which is how a promotion whose artwork reads perfectly on the
+    # promotions page renders as a headline sliced through the middle up top.
+    #
+    # Nullable, and the storefront falls back to promotion_image when it is unset - so
+    # every promotion that existed before this column keeps the hero slide it already
+    # had, and uploading a banner is an improvement rather than a requirement.
+    banner_image = Column(String(500), nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     items = relationship(

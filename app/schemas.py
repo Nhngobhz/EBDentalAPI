@@ -454,6 +454,10 @@ ProductSection = Literal["machinery", "materials", "spare_parts"]
 # on that endpoint.
 SectionFilter = Literal["machinery", "materials", "spare_parts", "all"]
 
+# What one row of a product's gallery holds. See models.ProductImage.media_type for
+# why the two share a table, and why this is a Literal rather than a DB enum.
+MediaType = Literal["image", "video"]
+
 # How GET /products/ orders what it returns.
 #
 # A closed vocabulary rather than a free-text "order_by" column name, because the
@@ -509,11 +513,17 @@ class BundleItemOut(BaseModel):
 
 
 class ProductImageOut(BaseModel):
-    """An extra gallery photo. `image` is a full URL / store-api-relative path,
-    same as every other *_image field (see app/core/files.py)."""
+    """One extra item in a product's gallery - a photo or a video. `image` is a full
+    URL / store-api-relative path, same as every other *_image field (see
+    app/core/files.py), whichever of the two this row is.
+
+    `media_type` is what a client has to branch on: an <img> pointed at an MP4 renders
+    a broken icon, so this is not a detail a caller can afford to ignore. It is always
+    present (the column is NOT NULL), so there is nothing to default around."""
 
     id: int
     image: str
+    media_type: MediaType = "image"
     sort_order: int
 
     model_config = ConfigDict(from_attributes=True)
@@ -777,6 +787,12 @@ class PromotionOut(PromotionBase):
     price: Union[Decimal, str]
     old_price: Optional[Union[Decimal, str]] = None
     promotion_image: Optional[str] = None
+    # The wide artwork for the storefront's hero slide. NULL means "no banner
+    # uploaded", and the storefront falls back to promotion_image - see
+    # models.Promotion.banner_image. Both are set through their own upload endpoints
+    # (POST /promotions/{id}/image and /banner), which is why neither appears in
+    # PromotionCreate/PromotionUpdate.
+    banner_image: Optional[str] = None
     # The member products, resolved through PromotionItem's read-through
     # properties (see BundleItemMixin in app/models.py). Not price-masked: what a
     # deal contains isn't a price, so everyone can see it.

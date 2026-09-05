@@ -145,9 +145,24 @@ def seed_products(
         product_by_name[name] = product
         print(f"Created product '{product.product_name}' (id={product.id}).")
 
-        for position, image in enumerate(item.get("images") or []):
+        for position, entry in enumerate(item.get("images") or []):
+            # Two accepted shapes. A dict is what export_seed_data writes now
+            # ({"image": ..., "media_type": ...}); a bare string is what every seed
+            # file exported before videos existed holds, and all of those are photos.
+            if isinstance(entry, dict):
+                url = entry.get("image")
+                media_type = entry.get("media_type") or "image"
+            else:
+                url, media_type = entry, "image"
+            if not url:
+                continue
             db.add(
-                ProductImage(product_id=product.id, image=image, sort_order=position)
+                ProductImage(
+                    product_id=product.id,
+                    image=url,
+                    media_type=media_type,
+                    sort_order=position,
+                )
             )
         db.flush()
 
@@ -241,6 +256,9 @@ def seed_promotions(db, product_by_name: dict[str, Product]) -> None:
             start_date=item["start_date"],
             end_date=item["end_date"],
             promotion_image=item.get("promotion_image"),
+            # Absent from seed files exported before the column existed; NULL
+            # there just means the hero slide falls back to promotion_image.
+            banner_image=item.get("banner_image"),
         )
         db.add(promotion)
         db.flush()

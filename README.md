@@ -202,10 +202,11 @@ CRUD → file upload → error handling), not just written from memory - see
       (each parent immediately followed by its own components), not by id,
       since components are physically INSERTed after every parent row.
 
-15. **`ProductImage` (added 2026-08-06):** extra photos for the storefront's
-    product page gallery, as a child table rather than more `*_image`
-    columns on `Product` (the shape `Set` uses for its one detail image) -
-    the number of angles a product is photographed from isn't fixed.
+15. **`ProductImage` (added 2026-08-06; videos 2026-09-05):** extra photos
+    **and videos** for the storefront's product page gallery, as a child
+    table rather than more `*_image` columns on `Product` (the shape `Set`
+    uses for its one detail image) - the number of angles a product is
+    photographed from isn't fixed.
     `products.product_image` is unchanged and stays the **primary** picture:
     it's what the catalog card, the cart, the printed quote and the Telegram
     alert show, and it's the first frame of the gallery, so it is never
@@ -222,6 +223,45 @@ CRUD → file upload → error handling), not just written from memory - see
       isn't pricing data), and the list endpoint loads it with
       `selectinload`, not `joinedload`: `free_items` is already joined, and
       two joined collections multiply each other's rows.
+    - **Videos are rows of this same table**, marked `media_type: "video"`
+      (photos are `"image"`, the column's server default). One table because
+      the product page is ONE ordered rail - photo, photo, clip, photo - and
+      a second table would need a second `sort_order` sequence with no
+      defined interleaving between them. The table keeps its
+      `product_images` name; renaming it would rewrite every migration and
+      script that names it, for nothing. Every client has to branch on
+      `media_type`: an MP4 in an `<img>` is a broken-image icon.
+    - Videos upload through their **own** endpoint,
+      `POST /products/{id}/gallery/videos` (multipart, repeated `files`),
+      because they differ from photos in every way the request cares about:
+      `ALLOWED_VIDEO_TYPES` (MP4 and WebM only - QuickTime is refused, see
+      `app/core/files.py`), `MAX_VIDEO_SIZE_MB` rather than
+      `MAX_IMAGE_SIZE_MB`, `MAX_GALLERY_VIDEOS` (3) rather than
+      `MAX_GALLERY_IMAGES` (12), and no re-encoding on the way in. Nothing
+      here transcodes or even decodes a video - there is no ffmpeg - so the
+      content-type check plus save_upload's extension mapping is the whole
+      of the validation, and the file a customer downloads is byte-for-byte
+      the one that was uploaded. **Removal is the photo endpoint**,
+      `DELETE /products/{id}/gallery/{image_id}`: a gallery row is a gallery
+      row.
+
+16. **`Promotion.banner_image` (added 2026-09-05):** a promotion carries
+    **two** pictures, one per placement. `promotion_image` is the card art
+    (the square "Special Offers" tiles, the Promotions page cards, the
+    materials deal grid, the admin thumbnail, the deal page's gallery);
+    `banner_image` is the wide artwork for the storefront's hero slide and
+    nothing else. Two columns rather than two crops of one file, because a
+    ~200px square scaled into a ~16:6 band keeps about a third of itself
+    centred on whatever happens to be in the middle. Uploaded through
+    `POST /promotions/{id}/banner` and cleared with `DELETE` on the same
+    path - the delete exists because, unlike a primary image, an unset
+    banner has a real meaning: the storefront falls back to
+    `promotion_image`. So every deal predating the column renders exactly
+    as it did, and no backfill was needed (see migration `b5e1c0a94d73`).
+    The banner is stored under `"<name> banner"` rather than `"<name>"`:
+    both are `save_named_image`d off the promotion's name, and a shared name
+    would have one overwrite the other on disk while both columns went on
+    pointing at the survivor.
 
 ---
 

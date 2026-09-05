@@ -205,6 +205,15 @@ class Settings(BaseSettings):
     UPLOAD_DIR: str = "static/uploads"
     MAX_IMAGE_SIZE_MB: int = 5
     MAX_PDF_SIZE_MB: int = 20
+    # Product-gallery videos (see ALLOWED_VIDEO_TYPES in app/core/files.py). An order
+    # of magnitude above the image limit on purpose: a 30-second product clip off a
+    # phone is routinely 30-60 MB, and unlike an image it is never re-encoded on the
+    # way in - Pillow can shrink a photo, nothing here can transcode an MP4.
+    #
+    # Whatever this is set to, the Flask admin's own MAX_CONTENT_LENGTH has to be at
+    # least as large or the upload is rejected a hop earlier, with a 413 that never
+    # reaches this API - see EB Web Project/app.py.
+    MAX_VIDEO_SIZE_MB: int = 100
 
     # --- File storage (Cloudflare R2) ---------------------------------------
     # Leave R2_ACCESS_KEY_ID empty to run in "local disk" mode: uploads are
